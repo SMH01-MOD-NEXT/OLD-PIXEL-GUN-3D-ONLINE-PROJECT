@@ -1,37 +1,34 @@
 #include "il2cpp.h"
 
-#include <dlfcn.h>
 #include <cstring>
 
-#include "log.h"
+#include <shadowhook.h>
 
 namespace il2cpp {
 namespace {
 
 template <typename T>
-bool bind(T& fn, const char* name, bool required) {
+bool bind(T& fn, void* handle, const char* name) {
     if (fn != nullptr) return true;  // уже привязан (resolve() зовём в цикле ожидания)
-    fn = reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
-    if (fn == nullptr && required) {
-        LOGW("il2cpp: символ %s пока недоступен", name);
-    }
+    fn = reinterpret_cast<T>(shadowhook_dlsym(handle, name));
     return fn != nullptr;
 }
 
 } // namespace
 
-bool resolve() {
+bool resolve(void* il2cpp_handle) {
+    if (il2cpp_handle == nullptr) return false;
+
     bool ok = true;
-    ok &= bind(string_new,               "il2cpp_string_new",               true);
-    ok &= bind(domain_get,               "il2cpp_domain_get",               true);
-    ok &= bind(domain_get_assemblies,    "il2cpp_domain_get_assemblies",    true);
-    ok &= bind(assembly_get_image,       "il2cpp_assembly_get_image",       true);
-    ok &= bind(image_get_name,           "il2cpp_image_get_name",           true);
-    ok &= bind(class_from_name,          "il2cpp_class_from_name",          true);
-    ok &= bind(class_get_field_from_name,"il2cpp_class_get_field_from_name",true);
-    ok &= bind(field_static_get_value,   "il2cpp_field_static_get_value",   true);
-    bind(runtime_class_init,  "il2cpp_runtime_class_init",  false);
-    bind(domain_assembly_open,"il2cpp_domain_assembly_open",false);
+    ok &= bind(string_new,                il2cpp_handle, "il2cpp_string_new");
+    ok &= bind(domain_get,                il2cpp_handle, "il2cpp_domain_get");
+    ok &= bind(domain_get_assemblies,     il2cpp_handle, "il2cpp_domain_get_assemblies");
+    ok &= bind(assembly_get_image,        il2cpp_handle, "il2cpp_assembly_get_image");
+    ok &= bind(image_get_name,            il2cpp_handle, "il2cpp_image_get_name");
+    ok &= bind(class_from_name,           il2cpp_handle, "il2cpp_class_from_name");
+    ok &= bind(class_get_field_from_name, il2cpp_handle, "il2cpp_class_get_field_from_name");
+    ok &= bind(field_static_get_value,    il2cpp_handle, "il2cpp_field_static_get_value");
+    bind(runtime_class_init, il2cpp_handle, "il2cpp_runtime_class_init");  // опционально
     return ok;
 }
 
