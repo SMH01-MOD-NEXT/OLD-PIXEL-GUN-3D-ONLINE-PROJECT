@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(opg3d CXX)
+project(opg3d C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Статическая либа shadowhook линкуется в SHARED libopg3d.so -> нужен PIC.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT ANDROID)
     message(FATAL_ERROR "Собирать только Android NDK toolchain'ом (armeabi-v7a)")
@@ -16,25 +18,51 @@ set(PHOTON_SERVER_PORT "5055" CACHE STRING "Порт своего сервера
 set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "Версия ShadowHook (git tag bytedance/android-inline-hook)")
 
 # --- ShadowHook (bytedance) ----------------------------------------------------
+# Качаем исходники, но НЕ используем их CMakeLists, потому что:
+#  1) их таргет собирается как SHARED, а нам нужна одна самодостаточная libopg3d.so;
+#  2) их флаги -Weverything -Werror ломают сборку на свежем Clang (NDK r29).
+# SOURCE_SUBDIR указывает на каталог без CMakeLists.txt -> FetchContent только
+# распаковывает исходники, не добавляя их таргеты в сборку.
 include(FetchContent)
 FetchContent_Declare(
     android_inline_hook
     GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
     GIT_TAG        ${SHADOWHOOK_TAG}
     GIT_SHALLOW    TRUE
-    # У репо нет корневого CMakeLists (Gradle-проект) — скрипт либы лежит глубже.
-    # NB: в их CMakeLists стоит cmake_minimum_required(4.0.2) — CI это учитывает.
-    SOURCE_SUBDIR  shadowhook/src/main/cpp
+    SOURCE_SUBDIR  shadowhook   # там нет CMakeLists.txt — populate-only
 )
 FetchContent_MakeAvailable(android_inline_hook)
 
-if(TARGET shadowhook::shadowhook)
-    set(SHADOWHOOK_LIB shadowhook::shadowhook)
-elseif(TARGET shadowhook)
-    set(SHADOWHOOK_LIB shadowhook)
+# Собираем shadowhook статически сами (множество исходников — как в их CMakeLists)
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    set(SH_ARCH "arm")
+elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(SH_ARCH "arm64")
 else()
-    message(FATAL_ERROR "Не найден CMake-таргет shadowhook")
+    message(FATAL_ERROR "Неподдерживаемый ABI: ${ANDROID_ABI}")
 endif()
+
+set(SH_SRC_DIR ${android_inline_hook_SOURCE_DIR}/shadowhook/src/main/cpp)
+file(GLOB SH_SRC
+    ${SH_SRC_DIR}/*.c
+    ${SH_SRC_DIR}/arch/${SH_ARCH}/*.c
+    ${SH_SRC_DIR}/arch/${SH_ARCH}/*.S
+    ${SH_SRC_DIR}/common/*.c
+    ${SH_SRC_DIR}/third_party/*/*.c
+)
+add_library(shadowhook_static STATIC ${SH_SRC})
+target_compile_features(shadowhook_static PRIVATE c_std_11)
+target_compile_options(shadowhook_static PRIVATE -Os -w)   # чужой код: warnings глушим
+target_include_directories(shadowhook_static
+    PUBLIC  ${SH_SRC_DIR}/include
+    PRIVATE ${SH_SRC_DIR}
+            ${SH_SRC_DIR}/arch/${SH_ARCH}
+            ${SH_SRC_DIR}/common
+            ${SH_SRC_DIR}/third_party/xdl
+            ${SH_SRC_DIR}/third_party/bsd
+            ${SH_SRC_DIR}/third_party/lss
+)
+target_link_libraries(shadowhook_static PUBLIC log dl)
 
 # --- Наша библиотека -----------------------------------------------------------
 add_library(opg3d SHARED
@@ -43,12 +71,7 @@ add_library(opg3d SHARED
     src/photon_hook.cpp
 )
 
-# У таргета shadowhook include-директории объявлены PRIVATE — путь к shadowhook.h
-# добавляем себе сами.
-target_include_directories(opg3d PRIVATE
-    src
-    ${android_inline_hook_SOURCE_DIR}/shadowhook/src/main/cpp/include
-)
+target_include_directories(opg3d PRIVATE src)
 
 target_compile_options(opg3d PRIVATE
     -O2
@@ -71,7 +94,7 @@ if(PHOTON_MODE STREQUAL "selfhosted")
 endif()
 
 target_link_libraries(opg3d PRIVATE
-    ${SHADOWHOOK_LIB}
+    shadowhook_static
     log
     dl
 )
