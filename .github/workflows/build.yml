@@ -15,6 +15,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # В CMakeLists shadowhook v2.0.1 стоит cmake_minimum_required(4.0.2).
+      # Если CMake на раннере старее — ставим свежий через pip.
+      - name: Ensure CMake >= 4.0.2
+        run: |
+          ver=$(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "runner cmake: $ver"
+          if [ "$(printf '%s\n%s\n' "4.0.2" "$ver" | sort -V | head -n1)" = "$ver" ] && [ "$ver" != "4.0.2" ]; then
+            echo "слишком старый, ставлю свежий"
+            python3 -m pip install --upgrade cmake
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+          cmake --version | head -1
+
       # NDK уже предустановлен на раннере (ANDROID_NDK_LATEST_HOME),
       # сторонние action'ы не нужны.
       - name: Configure (CMake + NDK, armeabi-v7a)
