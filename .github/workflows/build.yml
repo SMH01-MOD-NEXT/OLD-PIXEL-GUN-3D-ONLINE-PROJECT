@@ -15,25 +15,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # JDK 17 уже дефолт на раннере, Android SDK/NDK 27.3.13750724/CMake 3.31.5
-      # предустановлены — остаётся только Gradle.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.11.1"
 
-      # AppID приходит из secrets через ORG_GRADLE_PROJECT_* -> gradle property.
-      # Нативная часть собирается полностью оффлайн: внешних зависимостей нет.
+      # PHOTON_APP_ID приходит только из repository secrets. CMake скачивает
+      # исходники Dobby на зафиксированном commit и статически линкует их.
       - name: Build (assembleRelease, armeabi-v7a)
         env:
           ORG_GRADLE_PROJECT_PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
 
-      # Артефакт — ТОЛЬКО готовая libopg3d.so, больше ничего.
+      # Публичный артефакт этапа — ровно одна готовая библиотека.
       - name: Collect libopg3d.so
         run: |
           mkdir -p out
           find opg3d/build/intermediates -path "*armeabi-v7a*" -name "libopg3d.so" -exec cp -v {} out/ \;
+          test "$(find out -maxdepth 1 -type f | wc -l)" -eq 1
           ls -la out/
 
       - name: Upload libopg3d.so
