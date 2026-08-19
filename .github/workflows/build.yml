@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # NDK уже предустановлен на раннере (ANDROID_NDK_LATEST_HOME),
+      # сторонние action'ы не нужны.
+      - name: Configure (CMake + NDK, armeabi-v7a)
+        env:
+          PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPHOTON_APP_ID="$PHOTON_APP_ID"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # В артефакт кладём ТОЛЬКО готовую библиотеку, больше ничего.
+      - name: Upload libopg3d.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libopg3d-armeabi-v7a
+          path: build/libopg3d.so
+          if-no-files-found: error
