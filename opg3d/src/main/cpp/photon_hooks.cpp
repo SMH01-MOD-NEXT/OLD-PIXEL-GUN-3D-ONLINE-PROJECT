@@ -7,8 +7,6 @@
 #include <cstring>
 #include <string>
 
-#include <dobby.h>
-
 #include "config.h"
 #include "hook.h"
 #include "il2cpp.h"
@@ -579,7 +577,7 @@ bool install_hooks() {
 #endif
 
     LOGI("hook: engine %s; resolving targets through IL2CPP metadata",
-         DobbyGetVersion());
+         hook::engine_version());
 
     int installed = 0;
     const bool core = hook::install(
