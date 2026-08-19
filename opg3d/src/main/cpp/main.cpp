@@ -1,103 +1,122 @@
-#include <cstdint>
-#include <cstring>
 #include <cinttypes>
+#include <cstdint>
 
 #include <jni.h>
-#include <link.h>
 #include <pthread.h>
 #include <unistd.h>
 
-#include <shadowhook.h>
-
+#include "elf_sym.h"
 #include "il2cpp.h"
 #include "log.h"
-#include "photon_hook.h"
+#include "photon_patch.h"
 
-// Точка входа: при загрузке библиотеки (constructor / System.loadLibrary)
-// поднимаем фоновый поток: ждём libil2cpp.so, резолвим il2cpp API, ставим хук.
-// Логи — строго по одному сообщению на смену состояния, без спама в циклах.
+// Точка входа: при загрузке библиотеки поднимаем фоновый поток:
+// ждём libil2cpp.so -> резолвим il2cpp API -> ждём рантайм -> держим подмену
+// настроек Photon. Логи — строго по одному сообщению на смену состояния.
+//
+// Инлайн-хук здесь сознательно не используется: мы не меняем код игры, а только
+// данные (поля объекта настроек), а значит не нужны ни перехват функций, ни
+// патчинг линкера, ни перехват сигналов — то есть нечему падать при инициализации.
 namespace {
 
-constexpr int kWaitIterations = 600;          // 600 * 100мс = 60 сек на этап
+constexpr const char* kIl2Cpp = "libil2cpp.so";
+
+constexpr int kWaitSteps = 600;                   // 600 * 100мс = 60 сек на этап
 constexpr useconds_t kWaitStepUs = 100 * 1000;
-
-int phdr_callback(struct dl_phdr_info* info, size_t, void* data) {
-    if (info->dlpi_name && std::strstr(info->dlpi_name, "libil2cpp.so")) {
-        *reinterpret_cast<uintptr_t*>(data) = static_cast<uintptr_t>(info->dlpi_addr);
-        return 1;
-    }
-    return 0;
-}
-
-uintptr_t find_il2cpp_base() {
-    uintptr_t base = 0;
-    dl_iterate_phdr(phdr_callback, &base);
-    return base;
-}
+constexpr useconds_t kPollFastUs = 50 * 1000;     // до первого применения
+constexpr useconds_t kPollSlowUs = 500 * 1000;    // после — просто сторожим
 
 void* init_thread(void*) {
     LOGI("init: поток запущен");
 
-    // ShadowHook нужен уже на этапе резолва символов: shadowhook_dlopen/dlsym
-    // ходят по solist линкера напрямую и пробивают namespace'ы Android 7+
-    // (dlsym(RTLD_DEFAULT) libil2cpp.so НЕ видит — она грузится RTLD_LOCAL).
-    int rc = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
-    if (rc != 0) {
-        LOGE("init: shadowhook_init failed: %d (%s)", rc, shadowhook_to_errmsg(rc));
-        return nullptr;
-    }
-
-    // Этап 1: ждём libil2cpp.so в процессе.
+    // 1. Ждём, пока игра загрузит свой IL2CPP-образ.
     uintptr_t base = 0;
-    for (int i = 0; i < kWaitIterations && base == 0; ++i) {
-        base = find_il2cpp_base();
-        if (base == 0) usleep(kWaitStepUs);
+    bool found = false;
+    for (int i = 0; i < kWaitSteps && !found; ++i) {
+        found = elfsym::find_library(kIl2Cpp, &base);
+        if (!found) usleep(kWaitStepUs);
     }
-    if (base == 0) {
-        LOGE("init: libil2cpp.so НЕ НАЙДЕНА в процессе за %d сек — "
-             "библиотека не загружена в эту игру", kWaitIterations / 10);
+    if (!found) {
+        LOGE("init: %s НЕ НАЙДЕНА в процессе за %d сек — библиотека не загружена в эту игру",
+             kIl2Cpp, kWaitSteps / 10);
         return nullptr;
     }
-    LOGI("init: libil2cpp.so найдена, base = 0x%" PRIxPTR, base);
+    LOGI("init: %s найдена, base = 0x%" PRIxPTR, kIl2Cpp, base);
 
-    // Этап 2: handle на уже загруженную libil2cpp.so.
-    void* handle = nullptr;
-    for (int i = 0; i < kWaitIterations && !handle; ++i) {
-        handle = shadowhook_dlopen("libil2cpp.so");
-        if (!handle) usleep(kWaitStepUs);
-    }
-    if (!handle) {
-        LOGE("init: libil2cpp.so найдена по maps, но shadowhook_dlopen не смог взять handle");
-        return nullptr;
-    }
-
-    // Этап 3: резолвим il2cpp API + ждём готовности домена и Assembly-CSharp.
+    // 2. Резолвим экспорты чтением .dynsym из памяти (dlsym тут бесполезен).
     bool resolved = false;
-    bool ready = false;
-    for (int i = 0; i < kWaitIterations; ++i) {
-        resolved = il2cpp::resolve(handle);
-        if (resolved) {
-            ready = il2cpp::domain_get() != nullptr
-                 && il2cpp::find_image("Assembly-CSharp.dll") != nullptr;
-            if (ready) break;
-        }
-        usleep(kWaitStepUs);
+    for (int i = 0; i < kWaitSteps && !resolved; ++i) {
+        resolved = il2cpp::resolve();
+        if (!resolved) usleep(kWaitStepUs);
     }
     if (!resolved) {
-        LOGE("init: il2cpp_* символы не зарезолвились за %d сек (handle есть!) — "
-             "похоже, в этой сборке игры нет экспорта il2cpp API", kWaitIterations / 10);
+        LOGE("init: экспорты il2cpp_* не найдены в .dynsym за %d сек — неподдерживаемая сборка игры",
+             kWaitSteps / 10);
         return nullptr;
+    }
+    LOGI("init: экспорты il2cpp найдены");
+
+    // 3. Ждём рантайм и игровую сборку.
+    void* domain = nullptr;
+    bool ready = false;
+    for (int i = 0; i < kWaitSteps && !ready; ++i) {
+        domain = il2cpp::domain_get();
+        ready = (domain != nullptr) && (il2cpp::find_image("Assembly-CSharp.dll") != nullptr);
+        if (!ready) usleep(kWaitStepUs);
     }
     if (!ready) {
-        LOGE("init: IL2CPP-домен/Assembly-CSharp не поднялись за %d сек", kWaitIterations / 10);
+        LOGE("init: IL2CPP-домен/Assembly-CSharp не поднялись за %d сек", kWaitSteps / 10);
         return nullptr;
     }
-    LOGI("init: il2cpp API готов");
 
-    // Этап 4: хук.
-    if (photon::install_hook(reinterpret_cast<void*>(base))) {
-        LOGI("init: всё готово, ждём вызова ConnectUsingSettings");
+    // 4. Регистрируем свой поток в рантайме — без этого нельзя создавать
+    // managed-строки (GC просто не знает про чужой поток).
+    if (il2cpp::thread_attach(domain) == nullptr) {
+        LOGE("init: il2cpp_thread_attach не сработал");
+        return nullptr;
     }
+    LOGI("init: рантайм готов, поток присоединён");
+
+    // 5. Сторожим настройки: применяем сразу, как они появятся, и возвращаем
+    // подмену, если игра перезагрузит ассет.
+    bool applied_once = false;
+    bool said_waiting = false;
+    bool said_noclass = false;
+    int reapplies = 0;
+
+    for (;;) {
+        switch (photon::apply()) {
+            case photon::ApplyResult::Applied:
+                if (!applied_once) {
+                    applied_once = true;
+                    LOGI("init: всё готово — настройки Photon подменены");
+                } else {
+                    ++reapplies;
+                    LOGI("watch: игра перезагрузила настройки, подмена возвращена (#%d)", reapplies);
+                }
+                break;
+
+            case photon::ApplyResult::NotReady:
+                if (!said_waiting) {
+                    said_waiting = true;
+                    LOGI("watch: ждём, когда игра создаст PhotonServerSettings");
+                }
+                break;
+
+            case photon::ApplyResult::NoClass:
+                if (!said_noclass) {
+                    said_noclass = true;
+                    LOGE("watch: класс PhotonNetwork или поле PhotonServerSettings не найдены");
+                }
+                break;
+
+            case photon::ApplyResult::AlreadyApplied:
+                break;
+        }
+
+        usleep(applied_once ? kPollSlowUs : kPollFastUs);
+    }
+
     return nullptr;
 }
 
