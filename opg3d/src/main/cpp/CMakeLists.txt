@@ -29,6 +29,11 @@ FetchContent_Declare(
     GIT_TAG 5dfc8546954ce3b3198132ab13fddb89ee92cdd7
     GIT_SHALLOW FALSE
     GIT_PROGRESS TRUE
+    # На зафиксированном коммите апстрим сломан: рефакторинг a588a0df удалил
+    # source/core/arch/Cpu.h, но оставил на него #include в 6 файлах
+    # ('core/arch/Cpu.h' file not found). Чиним исходники сразу после выгрузки;
+    # <SOURCE_DIR> разворачивается ExternalProject в каталог dobby-src.
+    PATCH_COMMAND ${CMAKE_COMMAND} -DDOBBY_SRC=<SOURCE_DIR> -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-dobby-cpu-includes.cmake
 )
 FetchContent_MakeAvailable(dobby)
 
