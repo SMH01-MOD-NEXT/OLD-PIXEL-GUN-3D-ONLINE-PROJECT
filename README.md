@@ -1,151 +1,166 @@
-# OLD-PIXEL-GUN-3D-ONLINE-PROJECT
-Experiment with AI: creating the private server for pg3d old version (12.5.0) arm-v7
+# OLD PIXEL GUN 3D ONLINE PROJECT
 
-# NOTE: We DON'T CREATE A CHEAT OR SOMETHING ILLEGAL
-We just need to make library that can be loaded to the game, functional: ONLY redirecting online battes to MINE photon server, NOT OFFICIAL. Official servers already dead because of old version, so we CAN'T make harm things for other players and NOT PLANNING to do this.
+Открытый GPLv3-проект по восстановлению онлайна Pixel Gun 3D 12.5.0
+(`armeabi-v7a`) через **своё** приложение Photon Cloud. Это не чит: библиотека
+не подключает игрока к официальному онлайну и не меняет игровой баланс.
 
-# We need to make online working and make Pixel Gun Great Again. Happy coding!
+## Что исправляет библиотека
 
----
+В 12.5.0 игра не просто читает `PhotonNetwork.PhotonServerSettings.AppID`.
+При запуске вызывается следующая цепочка:
 
-## Как это работает
-
-Нативная библиотека `libopg3d.so` (C++17, armeabi-v7a, **без единой внешней зависимости**)
-загружается в процесс игры и переписывает поля статического объекта
-`PhotonNetwork.PhotonServerSettings` — того самого, откуда PUN classic (~1.79) берёт
-все данные при подключении:
-
-| Поле | Смещение | Что делаем |
-|---|---|---|
-| `HostType` | `0x0C` | `PhotonCloud` (1) или `SelfHosted` (2) — по режиму сборки |
-| `Protocol` | `0x10` | `Udp` (0) в режиме selfhosted |
-| `ServerAddress` / `ServerPort` | `0x14` / `0x18` | свой сервер (selfhosted / фикс. регион) |
-| `AppID` / `VoiceAppID` | `0x1C` / `0x20` | AppID **своего** Photon Cloud приложения |
-
-Смещения восстановлены из `dump.cs` (IL2CPP metadata v22) и сверены с `libil2cpp.so`.
-
-Порядок работы (фоновый поток, стартует из `__attribute__((constructor))`):
-
-1. ждём, пока в процессе появится `libil2cpp.so`;
-2. резолвим экспорты `il2cpp_*` сами: `dl_iterate_phdr` → `PT_DYNAMIC` → `DT_SYMTAB`/`DT_STRTAB`/`DT_HASH`
-   → линейный проход по `.dynsym` (всего ~741 символ). `dlsym` тут бесполезен из-за
-   linker namespace'ов Android 7+;
-3. ждём IL2CPP-домен и `Assembly-CSharp.dll`, присоединяем свой поток к рантайму
-   (`il2cpp_thread_attach` — без этого нельзя создавать managed-строки);
-4. сторожим настройки: как только игра создаст объект — пишем свои значения,
-   и возвращаем их, если игра перезагрузит ассет.
-
-## Почему без инлайн-хука и без зависимостей
-
-Изначально библиотека хукала `PhotonNetwork.ConnectUsingSettings` через
-[ShadowHook](https://github.com/bytedance/android-inline-hook). На реальном устройстве
-`shadowhook_init()` падал **ещё до первого хука**, причём дважды подряд:
-
-- **ошибка 8 — `Init bytesig mod SIGSEGV failed`.** `bytesig` ставит SIGSEGV-хендлер с флагом
-  `SA_EXPOSE_TAGBITS`, который ядро отклоняет (`EINVAL`) в 32-битных процессах — там нет
-  tagged addresses. Апстрим: [#78](https://github.com/bytedance/android-inline-hook/issues/78);
-- **ошибка 12 — `Init linker mod failed`.** ShadowHook ищет внутренние символы динамического
-  линкера (`soinfo::call_constructors` и т.п.) и, не найдя их на конкретной прошивке,
-  валит инициализацию целиком. Апстрим: [#113](https://github.com/bytedance/android-inline-hook/issues/113),
-  [#91](https://github.com/bytedance/android-inline-hook/issues/91).
-
-Ключевой вывод: **инлайн-хук для этой задачи не нужен вообще.** Мы не меняем код игры,
-а только данные — значит не нужны ни перехват функций, ни патчинг линкера,
-ни перехват сигналов. Побочные плюсы: сборка полностью оффлайновая (нет FetchContent),
-библиотека маленькая и самодостаточная, зависимость от версии Android минимальная.
-
-Сознательно **не** вызываем `il2cpp_runtime_class_init` для `PhotonNetwork`: в его статическом
-конструкторе идёт `Resources.Load`, а Unity запрещает это из фонового потока — типизированное
-исключение сломало бы Photon навсегда. Ждём, пока игра всё инициализирует сама.
-
-## AppID — НЕ хардкодим
-
-AppID — это креды, в репозитории его нет и не будет. Передаётся только на сборке:
-
-- **CI:** GitHub → **Settings → Secrets and variables → Actions → New repository secret** →
-  имя `PHOTON_APP_ID` → workflow подхватывает его через `ORG_GRADLE_PROJECT_PHOTON_APP_ID`.
-- **Локально:** `gradle :opg3d:assembleRelease -PPHOTON_APP_ID=xxxxxxxx-xxxx-...`
-
-Сборка без секрета тоже работает: библиотека компилируется и запускается, но AppID
-не меняется (passthrough + warning в logcat). Удобно для форков и отладки.
-
-Прочие gradle-свойства (опционально): `PHOTON_MODE` (`cloud` по умолчанию / `selfhosted`),
-`PHOTON_SERVER_ADDRESS`, `PHOTON_SERVER_PORT` (5055).
-
-## Структура
-
-```
-├── settings.gradle / build.gradle / gradle.properties   # корневой Gradle-проект (AGP 8.7.3)
-├── opg3d/                                               # Android library-модуль
-│   ├── build.gradle                                     # ABI armeabi-v7a, конфиг -> CMake
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       └── cpp/
-│           ├── CMakeLists.txt                           # без внешних зависимостей, оффлайн
-│           ├── main.cpp                                 # вход: ожидание, резолв, сторож
-│           ├── elf_sym.cpp / elf_sym.h                  # свой резолвер символов по .dynsym
-│           ├── il2cpp.cpp / il2cpp.h                    # минимальный il2cpp C-API
-│           ├── photon_patch.cpp / photon_patch.h        # подмена полей ServerSettings
-│           ├── config.h                                 # конфиг (без секретов в репо)
-│           └── log.h                                    # logcat, тег OPG3D
-├── .github/workflows/build.yml                          # CI: gradle assembleRelease
-└── LICENSE                                              # GPLv3
+```text
+Switcher.SetUpPhoton(HiddenSettings)
+  -> Switcher.SelectPhotonAppId(HiddenSettings)
+  -> ServerSettings.UseCloud(selectedAppId)
 ```
 
-## Сборка
+`HiddenSettings` содержит кодированные варианты AppID, pad/signature и «нулевой»
+вариант. `SelectPhotonAppId` учитывает локальное значение из `Storager` и хеш
+подписи APK. Поэтому поздняя запись в `PhotonServerSettings.AppID` перетиралась
+самой игрой и была недостаточна.
 
-**IDE (основной путь):** открыть корень репозитория в Android Studio → Gradle Sync →
-Build → Assemble ':opg3d'. Готовая либа: `opg3d/build/intermediates/.../armeabi-v7a/libopg3d.so`.
+Новая реализация перехватывает **источник значения** —
+`Switcher.SelectPhotonAppId`. При наличии `PHOTON_APP_ID` исходная ветка выбора
+(включая kill-switch/signature path) не выполняется, а игре возвращается AppID
+своего Photon Cloud приложения. Затем обычная сетевая логика PUN продолжает
+работать штатно.
 
-**CLI:** нужны JDK 17, Android SDK, NDK `27.3.13750724`, CMake `3.31.5` (из SDK):
-```bash
-gradle :opg3d:assembleRelease -PPHOTON_APP_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-(нет локального gradle — один раз `gradle wrapper` или просто собирайте из Android Studio.)
-Сеть при сборке нативной части не нужна вообще — ничего не скачивается.
+Мы **не** форсим глобальные ответы `Storager.getInt`, не подменяем посторонние
+настройки и не загружаем закрытую референсную библиотеку.
 
-**CI (GitHub Actions):** push в `main` → workflow собирает и выкладывает артефакт
-`libopg3d-armeabi-v7a` — внутри **только готовая `libopg3d.so`**, больше ничего.
+## Независимая open-source реализация
 
-## Отладка
+- весь код редиректора написан с нуля и опубликован в этом репозитории;
+- сторонний бинарь, использованный для анализа поведения, не включён, не
+  исполняется, не линкуется и не распространяется проектом;
+- методы находятся через официальный экспортируемый IL2CPP metadata API
+  (`class_get_method_from_name` → `MethodInfo::methodPointer`), а не через
+  хардкод абсолютных адресов;
+- если обязательный метод не найден, патч **fail-closed** и не пишет по
+  предположительному RVA;
+- ARM32 inline-hook выполняет [Dobby](https://github.com/jmpews/Dobby),
+  статически собранный из зафиксированного commit
+  `5dfc8546954ce3b3198132ab13fddb89ee92cdd7` (Apache-2.0);
+- ShadowHook и его linker/bytesig-модули не используются.
+
+Dobby нужен только как небольшой механизм перенаправления ARM-кода. Его shared
+library не попадает в результат: в `libopg3d.so` статически встраивается
+`dobby_static`, поэтому конечный артефакт по-прежнему состоит из **одного файла**.
+Сведения о лицензии: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Фаза 0: полная диагностика подключения
+
+Кроме обязательной подмены источника AppID устанавливаются диагностические хуки:
+
+- `Switcher.SetUpPhoton` и все варианты `ServerSettings.UseCloud/UseMyServer`;
+- `PhotonNetwork.ConnectUsingSettings`, `ConnectToMaster`, `Disconnect`;
+- `GameConnect.GetConnectGameVersion` и `GameConnect.ConnectToPhoton`;
+- `NetworkingPeer.DebugReturn`, `OnStatusChanged`, `OnOperationResponse`;
+- `ConnectionControl.OnFailedToConnect`, `OnDisconnected`,
+  `OnConnectedToMaster`.
+
+Включаются `PhotonLogLevel.Full` и `PhotonPeer.DebugOut = ALL`. Логи показывают:
+
+- реальный путь подключения и числовые состояния клиента;
+- адрес/порт, протокол, регион и AppVersion матчмейкинга;
+- operation code, return code и debug message ответов Photon;
+- причины disconnect/authentication failure;
+- наличие `AuthValues`, токена и UserId **без вывода их содержимого**;
+- AppID только как длину и FNV-1a fingerprint — credential целиком никогда не
+  попадает в logcat.
+
+Просмотр:
 
 ```bash
 adb logcat -s OPG3D
 ```
 
-Логи идут по одному сообщению на смену состояния (без спама):
+Ключевые строки успешной установки:
 
-```
-init: поток запущен
-init: libil2cpp.so найдена, base = 0x...
-init: экспорты il2cpp найдены
-init: рантайм готов, поток присоединён
-patch: режим Cloud, штатный Name Server, меняем только AppID
-patch: AppID подменён (длина 36)
-init: всё готово — настройки Photon подменены
+```text
+init: IL2CPP API resolved
+hook: installed Switcher.SelectPhotonAppId/1
+hook: installed ... managed hooks (core=OK)
+init: phase 0 ready — AppID selection override and connection tracing active
+appid: SelectPhotonAppId #1 -> configured AppID {len=36 fnv1a=...}
+net: ConnectUsingSettings begin ...
+photon-status: 1024 (Connect) ...
 ```
 
-Если что-то не так — одно понятное сообщение по этапу: либа не найдена /
-экспорты не найдены / домен не поднялся / thread_attach не сработал /
-класс PhotonNetwork не найден. Строка `watch: ждём, когда игра создаст
-ПhotonServerSettings` — норма: значит дошли до сторожа и ждём инициализации Photon игрой.
+## AppID не хранится в Git
+
+`PHOTON_APP_ID` является credential. В исходниках и истории Git его быть не
+должно.
+
+### GitHub Actions
+
+Создай repository secret:
+
+```text
+Settings -> Secrets and variables -> Actions -> PHOTON_APP_ID
+```
+
+Workflow передаёт его как `ORG_GRADLE_PROJECT_PHOTON_APP_ID`. GitHub маскирует
+значение в build log, а workflow публикует артефакт
+`libopg3d-armeabi-v7a`, внутри которого только `libopg3d.so`.
+
+### Локальная сборка
+
+Нужны JDK 17, Android SDK, NDK `27.3.13750724`, CMake `3.31.5`:
+
+```bash
+gradle :opg3d:assembleRelease \
+  -PPHOTON_APP_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+Проект можно открыть корнем в Android Studio. ABI зафиксирован на
+`armeabi-v7a`. Во время первого configure CMake скачает ровно зафиксированный
+исходник Dobby; после этого он остаётся в Gradle/CMake cache.
+
+Сборка без секрета допустима: все диагностические хуки ставятся, но
+`SelectPhotonAppId` работает в passthrough-режиме и пишет предупреждение.
+
+Опциональные свойства (экспериментально):
+
+- `PHOTON_MODE=cloud` (по умолчанию) или `selfhosted`;
+- `PHOTON_SERVER_ADDRESS`;
+- `PHOTON_SERVER_PORT` (по умолчанию `5055`).
+
+## Структура
+
+```text
+opg3d/src/main/cpp/
+├── main.cpp                  # ожидание IL2CPP, attach, установка хуков
+├── elf_sym.cpp/.h            # поиск экспортов libil2cpp.so в памяти
+├── il2cpp.cpp/.h             # metadata API, managed strings/fields
+├── hook.cpp/.h               # fail-closed Dobby wrapper
+├── photon_hooks.cpp/.h       # AppID override + сетевой trace
+├── config.h                  # compile-time defaults без credential
+└── CMakeLists.txt            # pinned Dobby static + libopg3d.so
+```
+
+## Ограничения текущей стадии
+
+- целевая сборка: PG3D 12.5.0, Android ARMv7, IL2CPP metadata v22;
+- первая цель — доказать успешный Photon handshake и точно увидеть оставшиеся
+  отказы мёртвого backend;
+- HTTP/backend-эмуляция и manual connect будут добавляться только если новые
+  логи покажут, что корректного AppID и штатного PUN-пути недостаточно;
+- способ загрузки `libopg3d.so` в процесс игры не входит в эту стадию.
 
 ## Roadmap
 
-- [x] Анализ IL2CPP-дампа PG3D 12.5.0, поиск точки вмешательства
-- [x] Библиотека-редиректор (клиентская часть)
-- [x] Отказ от ShadowHook: свой резолвер `.dynsym` + подмена данных вместо хука
-      (лечит ошибки 8 и 12, убирает все внешние зависимости)
-- [ ] Способ внедрения: патч APK (`loadLibrary`) / инжектор — на выбор
-- [ ] Серверная часть: своё Photon Cloud приложение и/или Photon Server OnPremise
-- [ ] Тестирование боя 1х1 на двух устройствах
+- [x] Разбор IL2CPP 12.5.0 и фактической цепочки выбора AppID
+- [x] Независимый hook `SelectPhotonAppId` без Storager-костылей
+- [x] Полная трассировка PUN/Photon connection path
+- [ ] Тест Photon handshake на устройстве
+- [ ] Обход конкретных мёртвых backend-гейтов — только по подтверждённому логу
+- [ ] Тест комнаты/боя 1×1 на двух устройствах
 
-## Дисклеймер
+## Лицензия и дисклеймер
 
-Фан-проект по ревайвлу мёртвой версии игры. Не аффилирован с Cubic Games. Не чит и не вредит
-другим игрокам: онлайн работает только между игроками с этой библиотекой, официальные серверы
-версии 12.5.0 недоступны.
-
-## Лицензия
-
-GPLv3 — см. [LICENSE](LICENSE). Весь код свой, сторонних зависимостей нет.
+Собственный код проекта — GPLv3, см. [LICENSE](LICENSE). Dobby — Apache-2.0.
+Проект не аффилирован с Cubic Games/Photon и предназначен для совместимого
+фанатского онлайна уже отключённой версии игры на инфраструктуре владельца
+сборки.
