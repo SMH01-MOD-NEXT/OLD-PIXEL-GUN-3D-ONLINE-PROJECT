@@ -4,6 +4,8 @@ project(opg3d C CXX ASM)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Статическая libshadowhook линкуется внутрь SHARED libopg3d.so -> нужен PIC.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Конфигурация приходит из Gradle. AppID является credential и никогда не
 # хранится в репозитории.
@@ -11,32 +13,72 @@ set(PHOTON_APP_ID "" CACHE STRING "Photon Cloud AppID (CI secret / local -P)")
 set(PHOTON_MODE "cloud" CACHE STRING "cloud | selfhosted")
 set(PHOTON_SERVER_ADDRESS "" CACHE STRING "Optional fixed/self-hosted address")
 set(PHOTON_SERVER_PORT "5055" CACHE STRING "Optional fixed/self-hosted port")
+set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "ShadowHook version (git tag bytedance/android-inline-hook)")
 
-# Dobby используется только как ARM32 inline-hook engine. Версия зафиксирована
-# полным commit SHA; плагины, тесты и shared target не являются зависимостями
-# libopg3d.so. dobby_static линкуется внутрь единственного артефакта.
+# --- ShadowHook (bytedance): исходники + наш патч -------------------------------
+# ShadowHook — ARM inline-hook движок. Резолв символов il2cpp делает наш
+# собственный elf_sym/.dynsym-резолвер, а shadowhook используется ТОЛЬКО для
+# самого inline-хука по абсолютному адресу (shadowhook_hook_func_addr).
+#
+# Собираем shadowhook статически сами и линкуем внутрь единственного артефакта
+# libopg3d.so (CI требует ровно один .so). Почему НЕ prefab/AAR, как советует
+# апстрим:
+#   1) prefab тянет отдельные libshadowhook.so + libshadowhook_nothing.so и
+#      ломает требование «один .so в артефакте»;
+#   2) на 32-битном armeabi-v7a официальный bytesig ставит SIGSEGV-обработчик с
+#      флагом SA_EXPOSE_TAGBITS, который ядро отклоняет (EINVAL) — из-за этого
+#      shadowhook_init() падал с ошибкой 8 (INIT_SIGSEGV). Флаг убираем патчем,
+#      см. cmake/patch-bytesig.cmake. Апстрим-баг:
+#      https://github.com/bytedance/android-inline-hook/issues/78
+#   3) их таргет собирается с -Weverything -Werror и ломается на свежем Clang.
+# SOURCE_SUBDIR указывает на каталог без CMakeLists.txt -> FetchContent только
+# скачивает и патчит исходники, не подключая таргеты апстрима в нашу сборку.
 include(FetchContent)
-set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
-set(NearBranch ON CACHE BOOL "" FORCE)
-set(Plugin.SymbolResolver OFF CACHE BOOL "" FORCE)
-set(Plugin.ImportTableReplace OFF CACHE BOOL "" FORCE)
-set(Plugin.Android.BionicLinkerUtil OFF CACHE BOOL "" FORCE)
-set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(DOBBY_BUILD_TEST OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-    dobby
-    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG 5dfc8546954ce3b3198132ab13fddb89ee92cdd7
-    GIT_SHALLOW FALSE
-    GIT_PROGRESS TRUE
-    # На зафиксированном коммите апстрим сломан: рефакторинг a588a0df удалил
-    # source/core/arch/Cpu.h, но оставил на него #include в 6 файлах
-    # ('core/arch/Cpu.h' file not found). Чиним исходники сразу после выгрузки;
-    # <SOURCE_DIR> разворачивается ExternalProject в каталог dobby-src.
-    PATCH_COMMAND ${CMAKE_COMMAND} -DDOBBY_SRC=<SOURCE_DIR> -P ${CMAKE_CURRENT_LIST_DIR}/cmake/patch-dobby-cpu-includes.cmake
+    android_inline_hook
+    GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
+    GIT_TAG        ${SHADOWHOOK_TAG}
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+    SOURCE_SUBDIR  shadowhook   # populate-only, таргеты апстрима не подключаем
+    PATCH_COMMAND  ${CMAKE_COMMAND} -E chdir shadowhook/src/main/cpp
+                   ${CMAKE_COMMAND} -DSRC=common/bytesig.c
+                   -P "${CMAKE_CURRENT_LIST_DIR}/cmake/patch-bytesig.cmake"
 )
-FetchContent_MakeAvailable(dobby)
+FetchContent_MakeAvailable(android_inline_hook)
 
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    set(SH_ARCH "arm")
+elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(SH_ARCH "arm64")
+else()
+    message(FATAL_ERROR "Unsupported ABI for shadowhook: ${ANDROID_ABI}")
+endif()
+
+set(SH_SRC_DIR ${android_inline_hook_SOURCE_DIR}/shadowhook/src/main/cpp)
+file(GLOB SH_SRC
+    ${SH_SRC_DIR}/*.c
+    ${SH_SRC_DIR}/arch/${SH_ARCH}/*.c
+    ${SH_SRC_DIR}/arch/${SH_ARCH}/*.S
+    ${SH_SRC_DIR}/common/*.c
+    ${SH_SRC_DIR}/third_party/*/*.c
+)
+add_library(shadowhook_static STATIC ${SH_SRC})
+target_compile_features(shadowhook_static PRIVATE c_std_11)
+# Чужой код: глушим предупреждения и оптимизируем по размеру.
+target_compile_options(shadowhook_static PRIVATE -Os -w)
+target_include_directories(shadowhook_static
+    PUBLIC  ${SH_SRC_DIR}/include
+    PRIVATE ${SH_SRC_DIR}
+            ${SH_SRC_DIR}/arch/${SH_ARCH}
+            ${SH_SRC_DIR}/common
+            ${SH_SRC_DIR}/third_party/xdl
+            ${SH_SRC_DIR}/third_party/bsd
+            ${SH_SRC_DIR}/third_party/lss
+)
+target_link_libraries(shadowhook_static PUBLIC log dl)
+
+# --- Наша библиотека -----------------------------------------------------------
 add_library(opg3d SHARED
     main.cpp
     elf_sym.cpp
@@ -68,12 +110,8 @@ if(PHOTON_MODE STREQUAL "selfhosted")
     target_compile_definitions(opg3d PRIVATE PHOTON_MODE_SELFHOSTED=1)
 endif()
 
-# Не позволяем предупреждениям стороннего проекта ломать нашу сборку на новых
-# версиях Clang; к собственному коду -Wall/-Wextra продолжают применяться.
-target_compile_options(dobby_static PRIVATE -Os -w)
-
 target_link_libraries(opg3d PRIVATE
-    dobby_static
+    shadowhook_static
     log
     dl
 )
