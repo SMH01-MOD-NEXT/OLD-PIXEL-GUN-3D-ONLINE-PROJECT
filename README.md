@@ -10,36 +10,53 @@ We just need to make library that can be loaded to the game, functional: ONLY re
 
 ## Как это работает
 
-Нативная библиотека `libopg3d.so` (C++, armeabi-v7a) загружается в процесс игры и через
-[ShadowHook](https://github.com/bytedance/android-inline-hook) (bytedance, v2.0.1) перехватывает
-`PhotonNetwork.ConnectUsingSettings(string)` — единую точку, через которую PUN classic (~1.79)
-подключается к сети. Перед вызовом оригинала библиотека переписывает поля статического объекта
-`PhotonNetwork.PhotonServerSettings`:
+Нативная библиотека `libopg3d.so` (C++17, armeabi-v7a, **без единой внешней зависимости**)
+загружается в процесс игры и переписывает поля статического объекта
+`PhotonNetwork.PhotonServerSettings` — того самого, откуда PUN classic (~1.79) берёт
+все данные при подключении:
 
 | Поле | Смещение | Что делаем |
 |---|---|---|
 | `HostType` | `0x0C` | `PhotonCloud` (1) или `SelfHosted` (2) — по режиму сборки |
+| `Protocol` | `0x10` | `Udp` (0) в режиме selfhosted |
 | `ServerAddress` / `ServerPort` | `0x14` / `0x18` | свой сервер (selfhosted / фикс. регион) |
 | `AppID` / `VoiceAppID` | `0x1C` / `0x20` | AppID **своего** Photon Cloud приложения |
 
-Адреса и смещения восстановлены из `dump.cs` (IL2CPP metadata v22) и побайтово сверены с
-`libil2cpp.so`: `ConnectUsingSettings` @ RVA `0xC8002C`, код скомпилирован в ARM-режиме
-(thumb-бит при хуке не нужен). Весь используемый il2cpp C-API экспортирован игрой;
-символы резолвятся через `shadowhook_dlopen`/`shadowhook_dlsym` (линкерные namespace'ы
-Android 7+ пробиваем напрямую — `dlsym(RTLD_DEFAULT)` игрушечную либу не видит).
+Смещения восстановлены из `dump.cs` (IL2CPP metadata v22) и сверены с `libil2cpp.so`.
 
-## Почему shadowhook собирается из исходников, а не из prefab/AAR
+Порядок работы (фоновый поток, стартует из `__attribute__((constructor))`):
 
-В официальной либе bytesig (crash-protection) ставит SIGSEGV-хендлер с флагом
-`SA_EXPOSE_TAGBITS`. Ядро отклоняет `sigaction()` с этим флагом (`EINVAL`) в процессах без
-tagged addresses — а 32-битный процесс (наш случай, armeabi-v7a) их не имеет по определению.
-Итог: `shadowhook_init()` падает с ошибкой **8 (Init bytesig mod SIGSEGV failed)**.
-Апстрим-баг, открыт: [android-inline-hook#78](https://github.com/bytedance/android-inline-hook/issues/78).
+1. ждём, пока в процессе появится `libil2cpp.so`;
+2. резолвим экспорты `il2cpp_*` сами: `dl_iterate_phdr` → `PT_DYNAMIC` → `DT_SYMTAB`/`DT_STRTAB`/`DT_HASH`
+   → линейный проход по `.dynsym` (всего ~741 символ). `dlsym` тут бесполезен из-за
+   linker namespace'ов Android 7+;
+3. ждём IL2CPP-домен и `Assembly-CSharp.dll`, присоединяем свой поток к рантайму
+   (`il2cpp_thread_attach` — без этого нельзя создавать managed-строки);
+4. сторожим настройки: как только игра создаст объект — пишем свои значения,
+   и возвращаем их, если игра перезагрузит ассет.
 
-Лечение — патч исходников при сборке: [`opg3d/src/main/cpp/cmake/patch-bytesig.cmake`](opg3d/src/main/cpp/cmake/patch-bytesig.cmake)
-убирает этот флаг (на crash-protection не влияет — флаг нужен только для MTE-диагностики).
-Заодно: shadowhook линкуется **статически**, поэтому на выходе одна самодостаточная `libopg3d.so`,
-без сопутствующих `.so`.
+## Почему без инлайн-хука и без зависимостей
+
+Изначально библиотека хукала `PhotonNetwork.ConnectUsingSettings` через
+[ShadowHook](https://github.com/bytedance/android-inline-hook). На реальном устройстве
+`shadowhook_init()` падал **ещё до первого хука**, причём дважды подряд:
+
+- **ошибка 8 — `Init bytesig mod SIGSEGV failed`.** `bytesig` ставит SIGSEGV-хендлер с флагом
+  `SA_EXPOSE_TAGBITS`, который ядро отклоняет (`EINVAL`) в 32-битных процессах — там нет
+  tagged addresses. Апстрим: [#78](https://github.com/bytedance/android-inline-hook/issues/78);
+- **ошибка 12 — `Init linker mod failed`.** ShadowHook ищет внутренние символы динамического
+  линкера (`soinfo::call_constructors` и т.п.) и, не найдя их на конкретной прошивке,
+  валит инициализацию целиком. Апстрим: [#113](https://github.com/bytedance/android-inline-hook/issues/113),
+  [#91](https://github.com/bytedance/android-inline-hook/issues/91).
+
+Ключевой вывод: **инлайн-хук для этой задачи не нужен вообще.** Мы не меняем код игры,
+а только данные — значит не нужны ни перехват функций, ни патчинг линкера,
+ни перехват сигналов. Побочные плюсы: сборка полностью оффлайновая (нет FetchContent),
+библиотека маленькая и самодостаточная, зависимость от версии Android минимальная.
+
+Сознательно **не** вызываем `il2cpp_runtime_class_init` для `PhotonNetwork`: в его статическом
+конструкторе идёт `Resources.Load`, а Unity запрещает это из фонового потока — типизированное
+исключение сломало бы Photon навсегда. Ждём, пока игра всё инициализирует сама.
 
 ## AppID — НЕ хардкодим
 
@@ -49,8 +66,8 @@ AppID — это креды, в репозитории его нет и не б�
   имя `PHOTON_APP_ID` → workflow подхватывает его через `ORG_GRADLE_PROJECT_PHOTON_APP_ID`.
 - **Локально:** `gradle :opg3d:assembleRelease -PPHOTON_APP_ID=xxxxxxxx-xxxx-...`
 
-Сборка без секрета тоже работает: библиотека компилируется и хук встаёт, но AppID не меняется
-(passthrough + warning в logcat). Удобно для форков и отладки хука.
+Сборка без секрета тоже работает: библиотека компилируется и запускается, но AppID
+не меняется (passthrough + warning в logcat). Удобно для форков и отладки.
 
 Прочие gradle-свойства (опционально): `PHOTON_MODE` (`cloud` по умолчанию / `selfhosted`),
 `PHOTON_SERVER_ADDRESS`, `PHOTON_SERVER_PORT` (5055).
@@ -64,11 +81,11 @@ AppID — это креды, в репозитории его нет и не б�
 │   └── src/main/
 │       ├── AndroidManifest.xml
 │       └── cpp/
-│           ├── CMakeLists.txt                           # FetchContent shadowhook + патч + сборка
-│           ├── cmake/patch-bytesig.cmake                # фикс ошибки 8 (см. выше)
-│           ├── main.cpp                                 # вход: ждём libil2cpp.so, резолв, хук
-│           ├── photon_hook.cpp / photon_hook.h          # хук ConnectUsingSettings
+│           ├── CMakeLists.txt                           # без внешних зависимостей, оффлайн
+│           ├── main.cpp                                 # вход: ожидание, резолв, сторож
+│           ├── elf_sym.cpp / elf_sym.h                  # свой резолвер символов по .dynsym
 │           ├── il2cpp.cpp / il2cpp.h                    # минимальный il2cpp C-API
+│           ├── photon_patch.cpp / photon_patch.h        # подмена полей ServerSettings
 │           ├── config.h                                 # конфиг (без секретов в репо)
 │           └── log.h                                    # logcat, тег OPG3D
 ├── .github/workflows/build.yml                          # CI: gradle assembleRelease
@@ -85,6 +102,7 @@ Build → Assemble ':opg3d'. Готовая либа: `opg3d/build/intermediates
 gradle :opg3d:assembleRelease -PPHOTON_APP_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 (нет локального gradle — один раз `gradle wrapper` или просто собирайте из Android Studio.)
+Сеть при сборке нативной части не нужна вообще — ничего не скачивается.
 
 **CI (GitHub Actions):** push в `main` → workflow собирает и выкладывает артефакт
 `libopg3d-armeabi-v7a` — внутри **только готовая `libopg3d.so`**, больше ничего.
@@ -100,20 +118,24 @@ adb logcat -s OPG3D
 ```
 init: поток запущен
 init: libil2cpp.so найдена, base = 0x...
-init: il2cpp API готов
-init: хук установлен: ConnectUsingSettings @ 0x...
-init: всё готово, ждём вызова ConnectUsingSettings
+init: экспорты il2cpp найдены
+init: рантайм готов, поток присоединён
+patch: режим Cloud, штатный Name Server, меняем только AppID
+patch: AppID подменён (длина 36)
+init: всё готово — настройки Photon подменены
 ```
 
-Если что-то не так — одно понятное сообщение по этапу (либа не найдена / нет handle /
-символы не зарезолвились / домен не поднялся / хук не встал + errno shadowhook).
-У самого shadowhook свой тег `shadowhook` (включить: `shadowhook_init(..., true)` в main.cpp).
+Если что-то не так — одно понятное сообщение по этапу: либа не найдена /
+экспорты не найдены / домен не поднялся / thread_attach не сработал /
+класс PhotonNetwork не найден. Строка `watch: ждём, когда игра создаст
+ПhotonServerSettings` — норма: значит дошли до сторожа и ждём инициализации Photon игрой.
 
 ## Roadmap
 
-- [x] Анализ IL2CPP-дампа PG3D 12.5.0, поиск точки перехвата
+- [x] Анализ IL2CPP-дампа PG3D 12.5.0, поиск точки вмешательства
 - [x] Библиотека-редиректор (клиентская часть)
-- [x] Фикс инициализации shadowhook на 32-бит (патч bytesig, апстрим #78)
+- [x] Отказ от ShadowHook: свой резолвер `.dynsym` + подмена данных вместо хука
+      (лечит ошибки 8 и 12, убирает все внешние зависимости)
 - [ ] Способ внедрения: патч APK (`loadLibrary`) / инжектор — на выбор
 - [ ] Серверная часть: своё Photon Cloud приложение и/или Photon Server OnPremise
 - [ ] Тестирование боя 1х1 на двух устройствах
@@ -126,5 +148,4 @@ init: всё готово, ждём вызова ConnectUsingSettings
 
 ## Лицензия
 
-GPLv3 — см. [LICENSE](LICENSE). ShadowHook — MIT (bytedance), его исходники скачиваются
-при сборке (FetchContent, тег v2.0.1) и патчатся локально.
+GPLv3 — см. [LICENSE](LICENSE). Весь код свой, сторонних зависимостей нет.
