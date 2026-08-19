@@ -1,0 +1,4 @@
+// Корневой build.gradle проекта OLD-PIXEL-GUN-3D-ONLINE-PROJECT
+plugins {
+    id 'com.android.library' version '8.7.3' apply false
+}
