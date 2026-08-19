@@ -1,0 +1,17 @@
+# build output
+build/
+out/
+cmake-*/
+.cxx/
+*.o
+*.d
+compile_commands.json
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
