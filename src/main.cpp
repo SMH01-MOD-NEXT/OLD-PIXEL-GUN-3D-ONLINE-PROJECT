@@ -2,7 +2,6 @@
 #include <cstring>
 #include <cinttypes>
 
-#include <dlfcn.h>
 #include <jni.h>
 #include <link.h>
 #include <pthread.h>
@@ -15,10 +14,12 @@
 #include "photon_hook.h"
 
 // Точка входа: при загрузке библиотеки (constructor / System.loadLibrary)
-// поднимаем фоновый поток, который ждёт появления libil2cpp.so и готовности
-// IL2CPP-домена, затем ставит хук. Библиотека может быть подгружена как до,
-// так и после старта игры — поэтому всё через циклы ожидания.
+// поднимаем фоновый поток: ждём libil2cpp.so, резолвим il2cpp API, ставим хук.
+// Логи — строго по одному сообщению на смену состояния, без спама в циклах.
 namespace {
+
+constexpr int kWaitIterations = 600;          // 600 * 100мс = 60 сек на этап
+constexpr useconds_t kWaitStepUs = 100 * 1000;
 
 int phdr_callback(struct dl_phdr_info* info, size_t, void* data) {
     if (info->dlpi_name && std::strstr(info->dlpi_name, "libil2cpp.so")) {
@@ -37,41 +38,63 @@ uintptr_t find_il2cpp_base() {
 void* init_thread(void*) {
     LOGI("init: поток запущен");
 
-    // 1. Ждём libil2cpp.so в адресном пространстве (до 60 сек).
-    uintptr_t base = 0;
-    for (int i = 0; i < 600 && base == 0; ++i) {
-        base = find_il2cpp_base();
-        if (base == 0) usleep(100 * 1000);
-    }
-    if (base == 0) {
-        LOGE("init: libil2cpp.so не появился в процессе за 60 сек");
-        return nullptr;
-    }
-    LOGI("init: libil2cpp.so base = 0x%" PRIxPTR, base);
-
-    // 2. Ждём, пока поднимется IL2CPP-домен и загрузится Assembly-CSharp (до 60 сек).
-    bool ready = false;
-    for (int i = 0; i < 600 && !ready; ++i) {
-        ready = il2cpp::resolve()
-            && il2cpp::domain_get != nullptr
-            && il2cpp::domain_get() != nullptr
-            && il2cpp::find_image("Assembly-CSharp.dll") != nullptr;
-        if (!ready) usleep(100 * 1000);
-    }
-    if (!ready) {
-        LOGE("init: IL2CPP-домен не инициализировался за 60 сек");
-        return nullptr;
-    }
-    LOGI("init: IL2CPP готов");
-
-    // 3. ShadowHook (одна хук-библиотека в процессе -> MODE_UNIQUE).
+    // ShadowHook нужен уже на этапе резолва символов: shadowhook_dlopen/dlsym
+    // ходят по solist линкера напрямую и пробивают namespace'ы Android 7+
+    // (dlsym(RTLD_DEFAULT) libil2cpp.so НЕ видит — она грузится RTLD_LOCAL).
     int rc = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
     if (rc != 0) {
         LOGE("init: shadowhook_init failed: %d (%s)", rc, shadowhook_to_errmsg(rc));
         return nullptr;
     }
 
-    // 4. Хук.
+    // Этап 1: ждём libil2cpp.so в процессе.
+    uintptr_t base = 0;
+    for (int i = 0; i < kWaitIterations && base == 0; ++i) {
+        base = find_il2cpp_base();
+        if (base == 0) usleep(kWaitStepUs);
+    }
+    if (base == 0) {
+        LOGE("init: libil2cpp.so НЕ НАЙДЕНА в процессе за %d сек — "
+             "библиотека не загружена в эту игру", kWaitIterations / 10);
+        return nullptr;
+    }
+    LOGI("init: libil2cpp.so найдена, base = 0x%" PRIxPTR, base);
+
+    // Этап 2: handle на уже загруженную libil2cpp.so.
+    void* handle = nullptr;
+    for (int i = 0; i < kWaitIterations && !handle; ++i) {
+        handle = shadowhook_dlopen("libil2cpp.so");
+        if (!handle) usleep(kWaitStepUs);
+    }
+    if (!handle) {
+        LOGE("init: libil2cpp.so найдена по maps, но shadowhook_dlopen не смог взять handle");
+        return nullptr;
+    }
+
+    // Этап 3: резолвим il2cpp API + ждём готовности домена и Assembly-CSharp.
+    bool resolved = false;
+    bool ready = false;
+    for (int i = 0; i < kWaitIterations; ++i) {
+        resolved = il2cpp::resolve(handle);
+        if (resolved) {
+            ready = il2cpp::domain_get() != nullptr
+                 && il2cpp::find_image("Assembly-CSharp.dll") != nullptr;
+            if (ready) break;
+        }
+        usleep(kWaitStepUs);
+    }
+    if (!resolved) {
+        LOGE("init: il2cpp_* символы не зарезолвились за %d сек (handle есть!) — "
+             "похоже, в этой сборке игры нет экспорта il2cpp API", kWaitIterations / 10);
+        return nullptr;
+    }
+    if (!ready) {
+        LOGE("init: IL2CPP-домен/Assembly-CSharp не поднялись за %d сек", kWaitIterations / 10);
+        return nullptr;
+    }
+    LOGI("init: il2cpp API готов");
+
+    // Этап 4: хук.
     if (photon::install_hook(reinterpret_cast<void*>(base))) {
         LOGI("init: всё готово, ждём вызова ConnectUsingSettings");
     }
