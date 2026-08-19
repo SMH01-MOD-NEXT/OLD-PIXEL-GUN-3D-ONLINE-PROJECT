@@ -22,7 +22,9 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
     GIT_TAG        ${SHADOWHOOK_TAG}
     GIT_SHALLOW    TRUE
-    SOURCE_SUBDIR  shadowhook   # в репо также есть sample-приложение, оно нам не нужно
+    # У репо нет корневого CMakeLists (Gradle-проект) — скрипт либы лежит глубже.
+    # NB: в их CMakeLists стоит cmake_minimum_required(4.0.2) — CI это учитывает.
+    SOURCE_SUBDIR  shadowhook/src/main/cpp
 )
 FetchContent_MakeAvailable(android_inline_hook)
 
@@ -41,7 +43,12 @@ add_library(opg3d SHARED
     src/photon_hook.cpp
 )
 
-target_include_directories(opg3d PRIVATE src)
+# У таргета shadowhook include-директории объявлены PRIVATE — путь к shadowhook.h
+# добавляем себе сами.
+target_include_directories(opg3d PRIVATE
+    src
+    ${android_inline_hook_SOURCE_DIR}/shadowhook/src/main/cpp/include
+)
 
 target_compile_options(opg3d PRIVATE
     -O2
