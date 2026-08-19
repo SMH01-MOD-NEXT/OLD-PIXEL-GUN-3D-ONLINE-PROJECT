@@ -1,0 +1,38 @@
+plugins {
+    id 'com.android.library'
+}
+
+// Конфиг приходит как gradle-свойства (НЕ из gradle.properties — он в git):
+//   CI:      env ORG_GRADLE_PROJECT_PHOTON_APP_ID=... (GitHub Secrets)
+//   Локально: gradle :opg3d:assembleRelease -PPHOTON_APP_ID=... и т.д.
+def photonAppId = providers.gradleProperty('PHOTON_APP_ID').orElse('').get()
+def photonMode = providers.gradleProperty('PHOTON_MODE').orElse('cloud').get()
+def photonAddr = providers.gradleProperty('PHOTON_SERVER_ADDRESS').orElse('').get()
+def photonPort = providers.gradleProperty('PHOTON_SERVER_PORT').orElse('5055').get()
+
+android {
+    namespace 'com.opg3d.redirect'
+    compileSdk 35
+    ndkVersion '27.3.13750724'   // default NDK на GHA-раннерах
+
+    defaultConfig {
+        minSdk 21
+        ndk { abiFilters 'armeabi-v7a' }
+        externalNativeBuild {
+            cmake {
+                targets 'opg3d'
+                arguments "-DPHOTON_APP_ID=${photonAppId}".toString(),
+                        "-DPHOTON_MODE=${photonMode}".toString(),
+                        "-DPHOTON_SERVER_ADDRESS=${photonAddr}".toString(),
+                        "-DPHOTON_SERVER_PORT=${photonPort}".toString()
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.31.5'   // предустановлен в SDK на GHA-раннерах
+        }
+    }
+}
