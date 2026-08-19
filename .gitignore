@@ -1,8 +1,17 @@
-# build output
+# Gradle / Android Studio
+.gradle/
+local.properties
+.cxx/
+.externalNativeBuild/
 build/
+*/build/
+captures/
+.navigation/
+output-metadata.json
+
+# native build
 out/
 cmake-*/
-.cxx/
 *.o
 *.d
 compile_commands.json
