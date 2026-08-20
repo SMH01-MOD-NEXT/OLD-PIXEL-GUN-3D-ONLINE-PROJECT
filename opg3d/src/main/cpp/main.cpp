@@ -1,4 +1,5 @@
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
 
 #include <jni.h>
@@ -16,8 +17,28 @@ constexpr const char* kIl2Cpp = "libil2cpp.so";
 constexpr int kWaitSteps = 6000;
 constexpr useconds_t kWaitStepUs = 10 * 1000;
 
+// il2cpp_domain_get() начинает отдавать домен задолго до конца il2cpp_init:
+// сборки главный поток регистрирует уже после этого момента. При этом
+// il2cpp_domain_get_assemblies() возвращает указатель прямо на внутренний
+// вектор рантайма, поэтому обход списка во время регистрации читает
+// перевыделенную (то есть уже освобождённую) память и роняет наш фоновый
+// поток. Ждём, пока состав сборок перестанет меняться, и только потом трогаем
+// метаданные.
+constexpr int kStableChecks = 25;            // ~250 мс одинаковых замеров подряд
+constexpr useconds_t kSettleUs = 750 * 1000; // запас после стабилизации
+
+// Безопасный опрос: берём только количество сборок и не разыменовываем сам
+// массив, поэтому гонка с регистрацией не приводит к чтению чужой памяти.
+size_t assembly_count(void* domain) {
+    if (domain == nullptr || il2cpp::domain_get_assemblies == nullptr) return 0u;
+    size_t count = 0u;
+    il2cpp::domain_get_assemblies(domain, &count);
+    if (count > 8192u) return 0u; // рваное чтение — считаем, что ещё не готово
+    return count;
+}
+
 void* init_thread(void*) {
-    LOGI("init: phase 0 thread started");
+    LOGI("init: [0/6] phase 0 thread started");
 
     uintptr_t base = 0;
     bool found = false;
@@ -29,7 +50,7 @@ void* init_thread(void*) {
         LOGE("init: %s not found in process after 60 seconds", kIl2Cpp);
         return nullptr;
     }
-    LOGI("init: %s found, base=0x%" PRIxPTR, kIl2Cpp, base);
+    LOGI("init: [1/6] %s found, base=0x%" PRIxPTR, kIl2Cpp, base);
 
     bool resolved = false;
     for (int i = 0; i < kWaitSteps && !resolved; ++i) {
@@ -40,27 +61,57 @@ void* init_thread(void*) {
         LOGE("init: required il2cpp_* exports were not resolved");
         return nullptr;
     }
-    LOGI("init: IL2CPP API resolved");
+    LOGI("init: [2/6] IL2CPP API resolved");
 
     void* domain = nullptr;
-    bool ready = false;
-    for (int i = 0; i < kWaitSteps && !ready; ++i) {
+    for (int i = 0; i < kWaitSteps && domain == nullptr; ++i) {
         domain = il2cpp::domain_get();
-        ready = domain != nullptr &&
-                il2cpp::find_image("Assembly-CSharp.dll") != nullptr;
-        if (!ready) usleep(kWaitStepUs);
+        if (domain == nullptr) usleep(kWaitStepUs);
     }
-    if (!ready) {
-        LOGE("init: IL2CPP domain/Assembly-CSharp.dll did not become ready");
+    if (domain == nullptr) {
+        LOGE("init: il2cpp_domain_get() stayed null");
         return nullptr;
     }
+    LOGI("init: [3/6] domain=%p", domain);
 
+    size_t last = 0u;
+    int stable = 0;
+    for (int i = 0; i < kWaitSteps && stable < kStableChecks; ++i) {
+        const size_t now = assembly_count(domain);
+        stable = (now != 0u && now == last) ? stable + 1 : 0;
+        last = now;
+        usleep(kWaitStepUs);
+    }
+    if (stable < kStableChecks) {
+        LOGE("init: assembly list never settled (last count=%zu)", last);
+        return nullptr;
+    }
+    LOGI("init: [4/6] assembly list settled at %zu assemblies", last);
+
+    usleep(kSettleUs);
+
+    // Присоединяемся к рантайму ДО любой работы с метаданными: обход сборок и
+    // il2cpp_class_from_name() трогают структуры, которыми управляет GC.
     void* attached_thread = il2cpp::thread_attach(domain);
     if (attached_thread == nullptr) {
         LOGE("init: il2cpp_thread_attach failed");
         return nullptr;
     }
-    LOGI("init: runtime ready; installing independent open-source hooks");
+    LOGI("init: [5/6] thread attached to runtime");
+
+    void* image = nullptr;
+    for (int i = 0; i < kWaitSteps && image == nullptr; ++i) {
+        image = il2cpp::find_image("Assembly-CSharp.dll");
+        if (image == nullptr) usleep(kWaitStepUs);
+    }
+    if (image == nullptr) {
+        LOGE("init: Assembly-CSharp.dll never appeared; nothing to hook");
+        if (il2cpp::thread_detach != nullptr) {
+            il2cpp::thread_detach(attached_thread);
+        }
+        return nullptr;
+    }
+    LOGI("init: [6/6] Assembly-CSharp.dll ready; installing hooks");
 
     const bool installed = photon::install_hooks();
     if (installed) {
@@ -72,6 +123,7 @@ void* init_thread(void*) {
     if (il2cpp::thread_detach != nullptr) {
         il2cpp::thread_detach(attached_thread);
     }
+    LOGI("init: phase 0 thread finished cleanly");
     return nullptr;
 }
 
