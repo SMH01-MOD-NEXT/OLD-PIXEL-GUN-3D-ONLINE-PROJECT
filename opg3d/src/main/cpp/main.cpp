@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "cloud_guard.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
 #include "log.h"
@@ -113,11 +114,23 @@ void* init_thread(void*) {
     }
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing hooks");
 
-    const bool installed = photon::install_hooks();
-    if (installed) {
-        LOGI("init: phase 0 ready — AppID selection override and connection tracing active");
+    // Install tracing first: cloud_guard intentionally calls the already-hooked
+    // ServerSettings.UseCloudBestRegion entry so its before/after state is
+    // visible in the same diagnostic stream.
+    const bool photon_installed = photon::install_hooks();
+    const bool guard_installed = cloud_guard::install_hooks();
+    if (photon_installed && guard_installed) {
+        LOGI("init: phase 0 ready — AppID override, Photon Cloud routing, "
+             "dead-backend guard and connection tracing active");
     } else {
-        LOGE("init: core SelectPhotonAppId hook failed; fail-closed, no unsafe RVA patching attempted");
+        if (!photon_installed) {
+            LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
+                 "no unsafe RVA patching attempted");
+        }
+        if (!guard_installed) {
+            LOGE("init: Photon Cloud/dead-backend guard incomplete; "
+                 "do not treat this build as a successful online fix");
+        }
     }
 
     if (il2cpp::thread_detach != nullptr) {
