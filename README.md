@@ -1,211 +1,94 @@
-# OLD PIXEL GUN 3D ONLINE PROJECT
+# Old Pixel Gun 3D Online Project
 
-Открытый GPLv3-проект по восстановлению онлайна Pixel Gun 3D 13.2.1
-(`armeabi-v7a`) через **своё** приложение Photon Cloud. Официальный backend
-отключён, поэтому проект целиком работает на собственной инфраструктуре и не
-взаимодействует с официальным онлайном. Это не чит для живой игры: прогресс и
-баланс меняются только внутри фанатской среды, общей и одинаковой для всех её
-игроков.
+Open-source (GPLv3) restoration of online multiplayer for **Pixel Gun 3D 13.2.1** (Android, `armeabi-v7a`) running on a self-hosted **Photon Cloud** application. The official backend for this version was shut down long ago; the mod routes the game exclusively to our own Photon infrastructure and never touches the original servers.
 
-## Релизная конфигурация 13.2.1
+This is not a cheat: it does not modify gameplay against other players and does not connect to any official online service. It is a fan-made compatibility layer for a discontinued game version.
 
-Публичная сборка ветки `13.2.1` полностью переведена на собственный
-Photon Cloud и дополнительно фиксирует прогресс игрока:
+## What the mod does
 
-- **Онлайн только через наше приложение Photon Cloud.** AppID подменяется в
-  источнике (`Switcher.SelectPhotonAppId`), регион жёстко закреплён за **EU**
-  и на клиенте (`ServerSettings.UseCloud(appId, CloudRegionCode.eu)` с
-  read-back проверкой), и в панели Photon как единственный allowed region —
-  все игроки гарантированно попадают в один пул комнат.
-- **Мёртвый официальный backend изолирован.** Подтверждённый путь
-  `FriendsController.Update -> PhotonNetwork.Disconnect` глушится, пока
-  активна Photon-сессия; ручные Disconnect и серверные разрывы не трогаются.
-- **Последний уровень игрока.** Геттеры `ExperienceController`
-  (`PlayerLevel`, `GetCurrentLevel`, `currentLevel`) возвращают реальный cap
-  этой сборки: он читается в рантайме из
-  `ExperienceController.MaxExpLevelsDefault.Length` (контрольно сверяется с
-  `HealthByLevel.Length`), а не зашит числом.
-- **999 999 999 монет и гем.** `Storager.getInt("Coins"/"Gems")` всегда
-  возвращает 999 999 999, а `Storager.setInt` по этим ключам клампится к тому
-  же значению: баланс не уменьшается при покупках и не копится сверх лимита.
-  Сейвы напрямую не перезаписываются — пин выполняется на чтении.
+A single native library, `libopg3d.so`, is loaded into the game process and hooks a small set of managed (C#) methods through the IL2CPP metadata API:
 
-Каждая фиксация подтверждается одноразовой строкой в logcat (тег `OPG3D`):
+- **AppID redirect.** At startup the game runs `Switcher.SetUpPhoton -> SelectPhotonAppId -> ServerSettings.UseCloud(...)`. `SelectPhotonAppId` picks one of several encoded AppIDs from `HiddenSettings`, consults a local kill-switch value and the APK signature, so a late write into `PhotonServerSettings.AppID` would simply be overwritten. The mod hooks the **source of the value** instead: when `PHOTON_APP_ID` is compiled in, the original selection path is skipped and the game receives the AppID of our own Photon Cloud application. Everything downstream (PUN logic, matchmaking, rooms, RPC) keeps working unchanged.
+- **Fixed EU routing.** Before every connection attempt, the stock `ServerSettings.UseCloud(appId, CloudRegionCode.eu)` overload is called and the result is verified by read-back (`HostType == PhotonCloud`, `PreferredRegion == eu`, stored AppID matches). This eliminates the cold-start race of `UseCloudBestRegion` (which used to reject first launches with `32756 / Region none is not available`) and guarantees that all players land in the same regional room pool. EU is also the only allowed region on the Photon dashboard side.
+- **Dead-backend guard.** While a Photon session is active, `FriendsController.Update` — which on this build calls `PhotonNetwork.Disconnect` mid-handshake — is quarantined. When PUN is idle, the original method still runs. Manual disconnects, server-side disconnects, callbacks, rooms, RPC and sync are never replaced or faked.
+- **Release progression (13.2.1 branch).** The `ExperienceController` level getters return the build's real level cap, resolved at runtime from `MaxExpLevelsDefault.Length` and cross-checked against `HealthByLevel.Length`. `Storager.getInt("Coins"/"Gems")` always returns `999 999 999`, and writes to those keys are clamped to the same value. Save data is never rewritten — the pin happens at read time.
+- **Full connection tracing.** Every step of the Photon path is logged with sequence numbers, timestamps, thread ids and caller addresses, so any remaining failure is directly attributable.
 
-```text
-boost: player level pinned to cap N (MaxExpLevelsDefault.Length=N, ...)
-boost: Storager.getInt("Coins") pinned to 999999999
-boost: Storager.getInt("Gems") pinned to 999999999
-```
+## How it works
 
-## Что исправляет библиотека
+1. **Early init.** A `__attribute__((constructor))` spawns a detached thread that waits for `libil2cpp.so` to appear in the process.
+2. **Symbol resolution without dlsym.** The game loads `libil2cpp.so` via `System.loadLibrary` (`RTLD_LOCAL` + Android linker namespaces), so its exports are invisible to `dlsym`. A small in-memory ELF parser (`elf_sym`) walks `dl_iterate_phdr` and `.dynsym` directly.
+3. **Safe timing.** The thread waits until the IL2CPP assembly list stops changing, attaches itself to the runtime, and only then touches metadata — the runtime reallocates its internal assembly vector during registration, and reading it mid-registration used to crash the init thread.
+4. **Metadata-driven hooks.** Every target method is found through `il2cpp_class_get_method_from_name` and hooked at its real `MethodInfo::methodPointer` using ShadowHook (UNIQUE mode, so the returned trampoline is directly callable). There are no hardcoded addresses: if a method is missing, installation fails closed and nothing is patched.
+5. **One-file artifact.** ShadowHook v2.0.1 is built from source and linked statically into `libopg3d.so`, with two local build-time patches (`cmake/patch-shadowhook.cmake`): dropping `SA_EXPOSE_TAGBITS` (armeabi-v7a kernels reject it) and disabling the linker module (which needs a helper `.so` we intentionally don't ship).
+6. **Unwinder compatibility.** The library is built with `-fno-exceptions -funwind-tables`: PG3D's `libil2cpp.so` and the statically linked LLVM libc++abi carry two incompatible ARM EHABI unwinders, and a managed exception crossing a hook frame used to crash inside `__unw_set_reg`. The long comment in `CMakeLists.txt` explains the details, and CI asserts our objects never reference `__gxx_personality_v0`.
+7. **Typed field-write ABI.** The old IL2CPP embedding API passes a pointer to the value for value types, but the object pointer itself for managed references. The typed `FieldSetValueApi` adapter in `il2cpp.h` strips one level of indirection for pointer types — a naive `&value` write used to store a native stack address into `ServerSettings.AppID` and crash the GC a second later.
 
-В 13.2.1 игра не просто читает `PhotonNetwork.PhotonServerSettings.AppID`.
-При запуске вызывается следующая цепочка:
+## Building
 
-```text
-Switcher.SetUpPhoton(HiddenSettings)
-  -> Switcher.SelectPhotonAppId(HiddenSettings)
-  -> ServerSettings.UseCloud(selectedAppId)
-```
+The Photon AppID is a credential and is never stored in the repository.
 
-`HiddenSettings` содержит кодированные варианты AppID, pad/signature и «нулевой»
-вариант. `SelectPhotonAppId` учитывает локальное значение из `Storager` и хеш
-подписи APK. Поэтому поздняя запись в `PhotonServerSettings.AppID` перетиралась
-самой игрой и была недостаточна.
+**GitHub Actions:** create the repository secret `PHOTON_APP_ID` (Settings → Secrets and variables → Actions). The workflow passes it as `ORG_GRADLE_PROJECT_PHOTON_APP_ID`, builds the `main` (12.5.0) and `13.2.1` branches, and publishes the `libopg3d-armeabi-v7a` artifact — exactly one `libopg3d.so`.
 
-Новая реализация перехватывает **источник значения** —
-`Switcher.SelectPhotonAppId`. При наличии `PHOTON_APP_ID` исходная ветка выбора
-(включая kill-switch/signature path) не выполняется, а игре возвращается AppID
-своего Photon Cloud приложения. Затем обычная сетевая логика PUN продолжает
-работать штатно.
-
-Мы **не** форсим глобальные ответы `Storager.getInt` вне ключей валюты, не
-подменяем посторонние настройки и не загружаем закрытую референсную библиотеку.
-
-## Независимая open-source реализация
-
-- весь код редиректора написан с нуля и опубликован в этом репозитории;
-- сторонний бинарь, использованный для анализа поведения, не включён, не
-  исполняется, не линкуется и не распространяется проектом;
-- методы находятся через официальный экспортируемый IL2CPP metadata API
-  (`class_get_method_from_name` → `MethodInfo::methodPointer`), а не через
-  хардкод абсолютных адресов;
-- если обязательный метод не найден, патч **fail-closed** и не пишет по
-  предположительному RVA;
-- ARM32 inline-hook выполняет [ShadowHook](https://github.com/bytedance/android-inline-hook),
-  статически собранный из зафиксированного тега `v2.0.1` (MIT), с двумя
-  локальными патчами (см. `opg3d/src/main/cpp/cmake/patch-shadowhook.cmake`);
-- Dobby не используется.
-
-ShadowHook нужен только как механизм перенаправления ARM-кода по уже готовому
-абсолютному адресу (`shadowhook_hook_func_addr`); резолв символов il2cpp
-делает наш собственный `elf_sym`. Shared library ShadowHook не попадает в
-результат: исходники собираются статически внутрь `libopg3d.so`, поэтому
-конечный артефакт по-прежнему состоит из **одного файла**.
-Сведения о лицензии: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## Диагностика подключения
-
-Кроме обязательной подмены источника AppID устанавливаются диагностические хуки:
-
-- `Switcher.SetUpPhoton` и все варианты `ServerSettings.UseCloud/UseMyServer`;
-- `PhotonNetwork.ConnectUsingSettings`, `ConnectToMaster`, `Disconnect`;
-- `GameConnect.GetConnectGameVersion` и `GameConnect.ConnectToPhoton`;
-- `NetworkingPeer.DebugReturn`, `OnStatusChanged`, `OnOperationResponse`;
-- `ConnectionControl.OnFailedToConnect`, `OnDisconnected`,
-  `OnConnectedToMaster`.
-
-Включаются `PhotonLogLevel.Full` и `PhotonPeer.DebugOut = ALL` (в 13.2.1 это
-plain-поле класса `PhotonPeer`, пишется напрямую через metadata). Логи показывают:
-
-- реальный путь подключения и числовые состояния клиента;
-- адрес/порт, протокол, регион и AppVersion матчмейкинга;
-- operation code, return code и debug message ответов Photon;
-- причины disconnect/authentication failure;
-- наличие `AuthValues`, токена и UserId **без вывода их содержимого**;
-- AppID только как длину и FNV-1a fingerprint — credential целиком никогда не
-  попадает в logcat.
-
-Просмотр:
-
-```bash
-adb logcat -s OPG3D
-```
-
-Ключевые строки успешной установки:
-
-```text
-init: IL2CPP API resolved
-hook: installed Switcher.SelectPhotonAppId/1
-hook: installed ... managed hooks (core=OK)
-init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression boost and connection tracing active
-appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
-cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
-net: ConnectUsingSettings begin ...
-photon-status: 1024 (Connect) ...
-```
-
-## AppID не хранится в Git
-
-`PHOTON_APP_ID` является credential. В исходниках и истории Git его быть не
-должно.
-
-### GitHub Actions
-
-Создай repository secret:
-
-```text
-Settings -> Secrets and variables -> Actions -> PHOTON_APP_ID
-```
-
-Workflow передаёт его как `ORG_GRADLE_PROJECT_PHOTON_APP_ID`. GitHub маскирует
-значение в build log, а workflow публикует артефакт
-`libopg3d-armeabi-v7a`, внутри которого только `libopg3d.so`. CI собирает
-ветки `main` и `13.2.1`.
-
-### Локальная сборка
-
-Нужны JDK 17, Android SDK, NDK `27.3.13750724`, CMake `3.31.5`:
+**Local** (JDK 17, Android SDK, NDK `27.3.13750724`, CMake `3.31.5`):
 
 ```bash
 gradle :opg3d:assembleRelease \
   -PPHOTON_APP_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
-Проект можно открыть корнем в Android Studio. ABI зафиксирован на
-`armeabi-v7a`. Во время первого configure CMake скачает ровно зафиксированный
-исходник ShadowHook; после этого он остаётся в Gradle/CMake cache.
+Building without the secret is allowed: all diagnostic hooks are installed, but the AppID hook runs in passthrough mode and logs a warning.
 
-Сборка без секрета допустима: все диагностические хуки ставятся, но
-`SelectPhotonAppId` работает в passthrough-режиме и пишет предупреждение.
+Optional experimental properties: `PHOTON_MODE=cloud` (default) or `selfhosted`, `PHOTON_SERVER_ADDRESS`, `PHOTON_SERVER_PORT` (default `5055`).
 
-Опциональные свойства (экспериментально):
+## Diagnostics
 
-- `PHOTON_MODE=cloud` (по умолчанию) или `selfhosted`;
-- `PHOTON_SERVER_ADDRESS`;
-- `PHOTON_SERVER_PORT` (по умолчанию `5055`).
+All runtime logs go to the `OPG3D` logcat tag:
 
-## Структура
+```bash
+adb logcat -s OPG3D
+```
+
+A healthy startup looks like:
+
+```text
+init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression boost and connection tracing active
+appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
+boost: player level pinned to cap N (MaxExpLevelsDefault.Length=N, ...)
+boost: Storager.getInt("Coins") pinned to 999999999
+cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
+photon-status: 1024 (Connect) ...
+ui: ConnectionControl.OnConnectedToMaster state=16 ...
+```
+
+The AppID is only ever logged as a length + FNV-1a fingerprint, never in plain text. Caller RVAs in the log (`pc=libil2cpp.so+0x...`) can be mapped back to managed methods with `tools/symbolize_log.py` and the matching `dump.cs`:
+
+```bash
+python3 tools/symbolize_log.py --dump dump1321.cs --log logcat.txt
+```
+
+## Project structure
 
 ```text
 opg3d/src/main/cpp/
-├── main.cpp                  # ожидание IL2CPP, attach, установка хуков
-├── elf_sym.cpp/.h            # поиск экспортов libil2cpp.so в памяти
-├── il2cpp.cpp/.h             # metadata API, managed strings/fields
+├── main.cpp                  # init thread: IL2CPP wait, attach, hook installation
+├── elf_sym.cpp/.h            # in-memory ELF dynsym resolver
+├── il2cpp.cpp/.h             # IL2CPP metadata API wrappers (typed field-write ABI)
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
-├── photon_hooks.cpp/.h       # AppID override + сетевой trace
-├── cloud_guard.h             # фиксация Photon Cloud (EU) + карантин FriendsController
-├── player_boost.h            # релизный прогресс: max level + 999 999 999 монет/гем
-├── config.h                  # compile-time defaults без credential
-└── CMakeLists.txt            # pinned ShadowHook static + libopg3d.so
+├── photon_hooks.cpp/.h       # AppID override + network path tracing
+├── cloud_guard.h             # fixed Photon Cloud (EU) routing + FriendsController quarantine
+├── player_boost.h            # release progression: max level + 999,999,999 coins/gems
+├── config.h                  # compile-time defaults, no credentials
+└── CMakeLists.txt            # pinned static ShadowHook + libopg3d.so
 ```
 
-## Статус проекта
+## Status
 
-- целевая сборка: PG3D 13.2.1, Android ARMv7, IL2CPP metadata v22;
-- Photon handshake, подключение к master/game server и бой 1×1 на двух
-  устройствах в разных сетях подтверждены;
-- регион EU зафиксирован для всех клиентов (cold-start BestRegion с ответом
-  `32756 / Region none` устранён);
-- релизный прогресс (последний уровень + 999 999 999 монет/гем) включён и
-  одинаков для всех игроков фанатского онлайна;
-- способ загрузки `libopg3d.so` в процесс игры не входит в репозиторий.
+- Target build: PG3D 13.2.1, Android ARMv7, IL2CPP metadata v22 (the older 12.5.0 target lives on the `main` branch).
+- Verified on devices: full Photon handshake, master/game-server transitions, room creation and a 1v1 match between two devices on different networks.
+- All clients are pinned to the EU region; keep EU as the only allowed region in the Photon dashboard.
+- The way `libopg3d.so` gets loaded into the game process is out of scope for this repository.
 
-## Roadmap
+## License and disclaimer
 
-- [x] Разбор IL2CPP 12.5.0 и фактической цепочки выбора AppID
-- [x] Независимый hook `SelectPhotonAppId` без Storager-костылей
-- [x] Полная трассировка PUN/Photon connection path
-- [x] Порт хуков на 13.2.1 (метаданные/enum'ы/поля сверены по дампу 13.2.1)
-- [x] Тест Photon handshake на устройстве
-- [x] Фиксация региона EU для всех клиентов
-- [x] Тест комнаты/боя 1×1 на двух устройствах в разных сетях
-- [x] Релизный прогресс: последний уровень + 999 999 999 монет/гем
-
-## Лицензия и дисклеймер
-
-Собственный код проекта — GPLv3, см. [LICENSE](LICENSE). ShadowHook — MIT.
-Проект не аффилирован с Cubic Games/Photon и предназначен для совместимого
-фанатского онлайна уже отключённой версии игры на инфраструктуре владельца
-сборки.
+Project code is GPLv3, see [LICENSE](LICENSE). ShadowHook is MIT, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Not affiliated with Cubic Games or Photon. Intended for a compatible fan-run online revival of a discontinued game version, hosted on the build owner's infrastructure.

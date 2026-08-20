@@ -76,11 +76,12 @@ uint32_t fnv1a(const char* data, size_t length) {
     return hash;
 }
 
-// Никогда не логируем credential целиком: только длину и отпечаток.
-// chars= берём у рантайма, потому что to_utf8() обрезает строку до 256 UTF-16
-// code unit, и его size() — это длина УСЕЧЁННОГО UTF-8, а не строки. Раньше в
-// логе было app={len=622}, по которому нельзя отличить 36-символьный GUID от
-// обфусцированного блоба, который расшифровывает Switcher.SelectPhotonAppId.
+// Never log the credential in full: only its length and fingerprint.
+// chars= is taken from the runtime because to_utf8() truncates the string to
+// 256 UTF-16 code units, and its size() is the length of the TRUNCATED UTF-8,
+// not of the string. The log previously showed app={len=622}, which could not
+// distinguish a 36-char GUID from the obfuscated blob that
+// Switcher.SelectPhotonAppId decrypts.
 std::string secret_summary(ManagedString* value) {
     if (value == nullptr) return "<null>";
     const std::string text = il2cpp::to_utf8(value, 256);
@@ -94,8 +95,8 @@ std::string secret_summary(ManagedString* value) {
     return buffer;
 }
 
-// Тот же формат, что и у secret_summary(), чтобы отпечаток нашего AppID и
-// игрового можно было сравнить глазами прямо в логе.
+// Same format as secret_summary(), so the fingerprints of our AppID and the
+// game's one can be compared by eye directly in the log.
 std::string configured_secret_summary() {
     constexpr const char* app_id = PHOTON_APP_ID;
     const size_t length = std::strlen(app_id);
@@ -108,7 +109,7 @@ std::string configured_secret_summary() {
 
 template <typename T>
 bool read_field(void* object, const char* name, T* value) {
-    static_assert(sizeof(T) <= 8, "read_field рассчитан на скаляры и ссылки");
+    static_assert(sizeof(T) <= 8, "read_field supports scalars and references");
     if (object == nullptr || value == nullptr || !il2cpp::object_get_class ||
         !il2cpp::class_get_field_from_name || !il2cpp::field_get_value) {
         return false;
@@ -118,14 +119,15 @@ bool read_field(void* object, const char* name, T* value) {
     void* field = il2cpp::class_get_field_from_name(klass, name);
     if (field == nullptr) return false;
 
-    // il2cpp_field_get_value() копирует РОВНО размер поля из метаданных, а не
-    // sizeof(T). ServerSettings.Protocol — это enum ConnectionProtocol с
-    // базовым типом byte (dump.cs: `public byte value__`), поэтому при чтении
-    // напрямую в int32_t перезаписывался только младший байт, а три старших
-    // оставались от инициализатора -1: лог показывал protocol=-256(unknown)
-    // вместо 0(Udp). Пишем в обнулённый буфер с запасом и забираем младшие
-    // sizeof(T) байт — ARM little-endian. Запас заодно защищает стек, если
-    // поле окажется шире ожидаемого типа.
+    // il2cpp_field_get_value() copies EXACTLY the field size from the
+    // metadata, not sizeof(T). ServerSettings.Protocol is an enum
+    // ConnectionProtocol with a byte underlying type (dump.cs: `public byte
+    // value__`), so reading directly into int32_t used to overwrite only the
+    // lowest byte while the top three kept the -1 initializer: the log showed
+    // protocol=-256(unknown) instead of 0(Udp). Read into a zeroed spare
+    // buffer and take the lowest sizeof(T) bytes — ARM is little-endian. The
+    // spare capacity also protects the stack if a field turns out wider than
+    // the expected type.
     alignas(8) uint8_t scratch[16] = {0};
     il2cpp::field_get_value(object, field, scratch);
     std::memcpy(value, scratch, sizeof(T));
@@ -233,9 +235,9 @@ bool apply_config_to_settings(void* settings, const char* point) {
         changed |= write_field<int32_t>(settings, "ServerPort", PHOTON_SERVER_PORT);
     }
 #else
-    // В Cloud-режиме сохраняем выбранную самой игрой стратегию (обычный
-    // PhotonCloud или BestRegion). Исправляем только credential/опциональный
-    // endpoint и не меняем поведение матчмейкинга.
+    // In Cloud mode this layer only repairs the credential and the optional
+    // endpoint. Routing strategy (fixed EU region) is owned by cloud_guard,
+    // which re-applies it at every connection entry point.
     if (std::strlen(PHOTON_SERVER_ADDRESS) != 0u) {
         ManagedString* address = il2cpp::string_new(PHOTON_SERVER_ADDRESS);
         changed |= write_field(settings, "ServerAddress", address);
@@ -292,11 +294,12 @@ void log_auth_snapshot(const char* point) {
     int32_t type = -1;
     ManagedString* token = nullptr;
     ManagedString* user_id = nullptr;
-    // Token и UserId здесь — auto-property: физические поля называются
-    // <Token>k__BackingField / <UserId>k__BackingField (одинаково в 12.5.0 и
-    // 13.2.1). Сам класс AuthenticationValues в 13.2.1 живёт в глобальном
-    // namespace вместо ExitGames.Client.Photon, но мы читаем поля через
-    // object_get_class() инстанса, поэтому переезд namespace'а нам неважен.
+    // Token and UserId are auto-properties here: the physical fields are
+    // <Token>k__BackingField / <UserId>k__BackingField (identical in 12.5.0
+    // and 13.2.1). The AuthenticationValues class itself moved to the global
+    // namespace in 13.2.1 (from ExitGames.Client.Photon), but we read the
+    // fields through the instance's object_get_class(), so the namespace move
+    // does not matter to us.
     const bool has_type = read_field(auth, "authType", &type);
     const bool has_token = read_field(auth, "<Token>k__BackingField", &token);
     const bool has_user = read_field(auth, "<UserId>k__BackingField", &user_id);
@@ -331,12 +334,13 @@ void enable_verbose_photon_logs() {
         il2cpp::field_static_get_value(peer_field, &peer);
     }
 
-    // В 13.2.1 у PhotonPeer нет метода set_DebugOut — DebugOut это обычное
-    // поле (dump.cs: `public DebugLevel DebugOut; // 0x1C`; сеттер существует
-    // только у ChatClient и к PhotonPeer отношения не имеет). FieldInfo берём
-    // у объявляющего класса PhotonPeer: il2cpp_class_get_field_from_name по
-    // базовым классам не идёт, а offset поля валиден и для инстанса
-    // NetworkingPeer. DebugLevel — byte-backed enum, пишем ровно один байт.
+    // In 13.2.1 PhotonPeer has no set_DebugOut method — DebugOut is a plain
+    // field (dump.cs: `public DebugLevel DebugOut; // 0x1C`; the setter exists
+    // only on ChatClient and is unrelated to PhotonPeer). FieldInfo is taken
+    // from the declaring class PhotonPeer: il2cpp_class_get_field_from_name
+    // does not walk base classes, while the field offset is valid for a
+    // NetworkingPeer instance as well. DebugLevel is a byte-backed enum, so
+    // exactly one byte is written.
     if (debug_out_field == nullptr) {
         debug_out_field = il2cpp::find_field(
             "ExitGames.Client.Photon", "PhotonPeer", "DebugOut");
@@ -351,9 +355,9 @@ void enable_verbose_photon_logs() {
     }
 }
 
-// Имена — по enum StatusCode из 13.2.1. Отличия от 12.5.0: добавились входящие
-// предупреждения 1033/1035, QueueSentWarning переехал 1033 -> 1037, а 1039
-// переименован из InternalReceiveException в ExceptionOnReceive.
+// Names follow the 13.2.1 StatusCode enum. Differences from 12.5.0: incoming
+// warnings 1033/1035 were added, QueueSentWarning moved 1033 -> 1037, and
+// 1039 was renamed from InternalReceiveException to ExceptionOnReceive.
 const char* status_name(int32_t status) {
     switch (status) {
         case 1022: return "SecurityExceptionOnConnect";
@@ -434,8 +438,8 @@ ManagedString* hook_select_app_id(void* settings, const MethodInfo* method) {
 void hook_set_up_photon(void* settings, const MethodInfo* method) {
     LOGI("trace: Switcher.SetUpPhoton begin (HiddenSettings=%p)", settings);
     g_set_up_photon(settings, method);
-    // Только здесь, ПОСЛЕ оригинала, PhotonNetwork гарантированно
-    // инициализирован и его статические поля безопасно читать и писать.
+    // Only here, AFTER the original, is PhotonNetwork guaranteed to be
+    // initialized and its static fields safe to read and write.
     enable_verbose_photon_logs();
     void* server_settings = current_server_settings();
     apply_config_to_settings(server_settings, "SetUpPhoton/end");
@@ -549,11 +553,12 @@ void hook_on_status_changed(void* self, int32_t status,
          status, connection_state(), server_address().c_str());
 }
 
-// OperationResponse в этой сборке Photon — ССЫЛОЧНЫЙ тип
+// OperationResponse is a REFERENCE type in this Photon build
 // (dump.cs 13.2.1 L197596: `public class OperationResponse // TypeDefIndex: 2628`),
-// поэтому параметр приходит обычным Il2CppObject* и read_field() применим.
-// Если апстрим когда-нибудь сделает его struct, тут появится указатель на
-// сырую копию без заголовка объекта и object_get_class() читать будет НЕЛЬЗЯ.
+// so the parameter arrives as a regular Il2CppObject* and read_field()
+// applies. If upstream ever turns it into a struct, this becomes a pointer to
+// a raw copy without an object header, and object_get_class() must NOT be
+// called on it.
 void hook_on_operation_response(void* self, void* response,
                                 const MethodInfo* method) {
     uint8_t operation = 0;
@@ -668,16 +673,18 @@ bool install_hooks() {
 
     LOGI("hook: installed %d managed hooks (core=%s)", installed, core ? "OK" : "FAILED");
 
-    // ВАЖНО: здесь НЕЛЬЗЯ трогать статические поля PhotonNetwork.
-    // install_hooks() выполняется на нашем фоновом потоке сразу после того,
-    // как в домене появился Assembly-CSharp.dll — задолго до того, как
-    // отработает статический конструктор PhotonNetwork.
-    // il2cpp_field_static_(get|set)_value адресует klass->static_fields + offset,
-    // и пока класс не инициализирован эта база равна nullptr: чтение
-    // PhotonServerSettings (+0x10) или запись logLevel (+0x18) вырождаются в
-    // разыменование 0x10/0x18 и роняют процесс прямо на старте игры.
-    // Всю работу с настройками делает хук SetUpPhoton: он вызывается уже из
-    // main-потока игры и строго ПОСЛЕ оригинала, когда PhotonNetwork уже жив.
+    // IMPORTANT: PhotonNetwork static fields must NOT be touched here.
+    // install_hooks() runs on our background thread right after
+    // Assembly-CSharp.dll appears in the domain — long before the
+    // PhotonNetwork static constructor runs.
+    // il2cpp_field_static_(get|set)_value addresses klass->static_fields +
+    // offset, and while the class is uninitialized that base is nullptr:
+    // reading PhotonServerSettings (+0x10) or writing logLevel (+0x18)
+    // degenerates into dereferencing 0x10/0x18 and crashes the process right
+    // at game start.
+    // All settings work is done by the SetUpPhoton hook: it is called from
+    // the game's main thread strictly AFTER the original, when PhotonNetwork
+    // is already alive.
     LOGI("settings[post-install]: deferred to SetUpPhoton hook "
          "(PhotonNetwork statics are not safe to touch yet)");
 
