@@ -14,9 +14,11 @@
 //
 // The original build leaves PUN in SelfHosted mode and points it at the dead
 // rilisoft-us endpoint. It also lets FriendsController.Update disconnect PUN
-// while the peer is authenticating. This layer fixes only those two pieces:
-// it routes PUN through the SDK's own UseCloudBestRegion implementation and
-// quarantines FriendsController.Update while a Photon session is active.
+// while the peer is authenticating. BestRegion additionally depends on an
+// asynchronous ping/cache warm-up and can split clients between regional room
+// pools. This layer fixes those pieces by routing every connection through the
+// SDK's explicit UseCloud(appId, CloudRegionCode.eu) path and quarantining
+// FriendsController.Update while a Photon session is active.
 // Manual disconnects, Photon status callbacks and room/game networking are not
 // replaced or globally faked.
 namespace cloud_guard {
@@ -27,9 +29,15 @@ using ManagedString = void;
 using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
 using ConnectTierFn = bool (*)(int32_t tier, const MethodInfo* method);
 using StaticBoolFn = bool (*)(const MethodInfo* method);
-using UseCloudBestFn = void (*)(void* self, ManagedString* app_id,
-                                const MethodInfo* method);
+using UseCloudRegionFn = void (*)(void* self, ManagedString* app_id,
+                                  int32_t region, const MethodInfo* method);
 using GetIntFn = int32_t (*)(const MethodInfo* method);
+
+// dump1250.cs: ServerSettings.HostingOption.PhotonCloud = 1,
+// CloudRegionCode.eu = 0. Keep this fixed so every client enters the same
+// regional room pool without a first-launch BestRegion warm-up.
+inline constexpr int32_t kPhotonCloudHost = 1;
+inline constexpr int32_t kForcedRegionEu = 0;
 
 inline InstanceVoidFn g_friends_update = nullptr;
 inline InstanceVoidFn g_connect_scene_go = nullptr;
@@ -56,20 +64,6 @@ bool read_field(void* object, const char* name, T* value) {
     alignas(8) uint8_t scratch[16] = {0};
     il2cpp::field_get_value(object, field, scratch);
     std::memcpy(value, scratch, sizeof(T));
-    return true;
-}
-
-template <typename T>
-bool write_field(void* object, const char* name, T value) {
-    if (object == nullptr || !il2cpp::object_get_class ||
-        !il2cpp::class_get_field_from_name || !il2cpp::field_set_value) {
-        return false;
-    }
-    void* klass = il2cpp::object_get_class(object);
-    if (klass == nullptr) return false;
-    void* field = il2cpp::class_get_field_from_name(klass, name);
-    if (field == nullptr) return false;
-    il2cpp::field_set_value(object, field, &value);
     return true;
 }
 
@@ -162,40 +156,34 @@ inline bool force_cloud(const char* point, bool reapply) {
     }
 
     static void* use_cloud_method = nullptr;
-    static UseCloudBestFn use_cloud = nullptr;
+    static UseCloudRegionFn use_cloud = nullptr;
     if (use_cloud == nullptr) {
         use_cloud_method = il2cpp::find_method_info(
-            "", "ServerSettings", "UseCloudBestRegion", 1);
-        use_cloud = reinterpret_cast<UseCloudBestFn>(
+            "", "ServerSettings", "UseCloud", 2);
+        use_cloud = reinterpret_cast<UseCloudRegionFn>(
             il2cpp::method_pointer(use_cloud_method));
     }
 
-    bool called_sdk = false;
-    if (use_cloud != nullptr && use_cloud_method != nullptr) {
-        // This address may already carry the diagnostic hook. Calling it is
-        // intentional: that hook delegates to the original SDK method and
-        // gives us before/after evidence in logcat.
-        use_cloud(settings, app_id, use_cloud_method);
-        called_sdk = true;
-    } else {
-        LOGE("cloud-force[%s]: UseCloudBestRegion unavailable; using field fallback",
+    if (use_cloud == nullptr || use_cloud_method == nullptr) {
+        // dump1250.cs guarantees this overload. If runtime metadata disagrees,
+        // do not guess field ABI or continue through a stale route.
+        LOGE("cloud-force[%s]: UseCloud(appId, eu) unavailable; connection blocked",
              point);
-        write_field<int32_t>(settings, "HostType", 4); // BestRegion
-        write_field(settings, "AppID", app_id);
+        g_cloud_ready.store(false, std::memory_order_release);
+        return false;
     }
+
+    // This address may already carry the diagnostic hook. Calling it is
+    // intentional: that hook delegates to the original SDK method and gives
+    // us before/after evidence in logcat.
+    use_cloud(settings, app_id, kForcedRegionEu, use_cloud_method);
 
     int32_t host = -1;
+    int32_t region = -1;
     ManagedString* stored_app = nullptr;
     const bool have_host = read_field(settings, "HostType", &host);
+    const bool have_region = read_field(settings, "PreferredRegion", &region);
     const bool have_app = read_field(settings, "AppID", &stored_app);
-
-    // A failed SDK call must not silently leave the dead SelfHosted route.
-    if (!have_host || host != 4) {
-        write_field<int32_t>(settings, "HostType", 4);
-        write_field(settings, "AppID", app_id);
-        read_field(settings, "HostType", &host);
-        read_field(settings, "AppID", &stored_app);
-    }
 
     const int32_t chars = il2cpp::string_length != nullptr
                               ? il2cpp::string_length(app_id)
@@ -203,15 +191,17 @@ inline bool force_cloud(const char* point, bool reapply) {
     const bool stored_same = have_app && stored_app == app_id;
     const uint32_t apply = g_cloud_apply_count.fetch_add(
                                1u, std::memory_order_relaxed) + 1u;
-    const bool ready = host == 4;
+    const bool ready = have_host && host == kPhotonCloudHost &&
+                       have_region && region == kForcedRegionEu && stored_same;
     g_cloud_ready.store(ready, std::memory_order_release);
 
     LOGI("cloud-force[%s]: apply#%" PRIu32
-         " sdk=%d host=%d(BestRegion expected=4) appChars=%d storedSame=%d ready=%d",
-         point, apply, called_sdk ? 1 : 0, host, chars,
+         " sdk=1 host=%d(PhotonCloud expected=1) "
+         "region=%d(eu expected=0) appChars=%d storedSame=%d ready=%d",
+         point, apply, host, region, chars,
          stored_same ? 1 : 0, ready ? 1 : 0);
     if (!ready) {
-        LOGE("cloud-force[%s]: FAIL-CLOSED — SelfHosted route was not replaced",
+        LOGE("cloud-force[%s]: FAIL-CLOSED — PhotonCloud/eu route was not applied",
              point);
     }
     return ready;
@@ -219,22 +209,28 @@ inline bool force_cloud(const char* point, bool reapply) {
 }
 
 inline void hook_connect_scene_go(void* self, const MethodInfo* method) {
-    force_cloud("ConnectScene.HandleGoBtnClicked", true);
+    if (!force_cloud("ConnectScene.HandleGoBtnClicked", true)) {
+        LOGE("cloud-force: blocked ConnectScene.HandleGoBtnClicked");
+        return;
+    }
     g_connect_scene_go(self, method);
 }
 
 inline void hook_connection_control_connect(void* self, const MethodInfo* method) {
-    force_cloud("ConnectionControl.ConnectToPhoton", true);
+    if (!force_cloud("ConnectionControl.ConnectToPhoton", true)) {
+        LOGE("cloud-force: blocked ConnectionControl.ConnectToPhoton");
+        return;
+    }
     g_connection_control_connect(self, method);
 }
 
 inline bool hook_game_connect_tier(int32_t tier, const MethodInfo* method) {
-    force_cloud("GameConnect.ConnectToPhoton(tier)", true);
+    if (!force_cloud("GameConnect.ConnectToPhoton(tier)", true)) return false;
     return g_game_connect_tier(tier, method);
 }
 
 inline bool hook_game_connect_squad(const MethodInfo* method) {
-    force_cloud("GameConnect.ConnectToPhotonSquad", true);
+    if (!force_cloud("GameConnect.ConnectToPhotonSquad", true)) return false;
     return g_game_connect_squad(method);
 }
 
