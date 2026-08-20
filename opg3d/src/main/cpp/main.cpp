@@ -11,6 +11,7 @@
 #include "il2cpp.h"
 #include "log.h"
 #include "photon_hooks.h"
+#include "player_boost.h"
 
 namespace {
 
@@ -115,13 +116,15 @@ void* init_thread(void*) {
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing hooks");
 
     // Install tracing first: cloud_guard intentionally calls the already-hooked
-    // ServerSettings.UseCloudBestRegion entry so its before/after state is
-    // visible in the same diagnostic stream.
+    // ServerSettings.UseCloud entry so its before/after state is visible in the
+    // same diagnostic stream. player_boost is independent and simply shares the
+    // same hook engine.
     const bool photon_installed = photon::install_hooks();
     const bool guard_installed = cloud_guard::install_hooks();
-    if (photon_installed && guard_installed) {
+    const bool boost_installed = player_boost::install_hooks();
+    if (photon_installed && guard_installed && boost_installed) {
         LOGI("init: phase 0 ready — AppID override, Photon Cloud routing, "
-             "dead-backend guard and connection tracing active");
+             "dead-backend guard, progression boost and connection tracing active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -130,6 +133,10 @@ void* init_thread(void*) {
         if (!guard_installed) {
             LOGE("init: Photon Cloud/dead-backend guard incomplete; "
                  "do not treat this build as a successful online fix");
+        }
+        if (!boost_installed) {
+            LOGE("init: progression boost incomplete; max-level and/or "
+                 "currency pins are not fully active");
         }
     }
 
