@@ -123,7 +123,7 @@ void* init_thread(void*) {
     const bool boost_installed = player_boost::install_hooks();
     if (photon_installed && guard_installed && boost_installed) {
         LOGI("init: phase 0 ready — AppID override, Photon Cloud routing, "
-             "dead-backend guard, progression boost and connection tracing active");
+             "dead-backend guard, progression grant and connection tracing active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -134,8 +134,8 @@ void* init_thread(void*) {
                  "do not treat this build as a successful online fix");
         }
         if (!boost_installed) {
-            LOGE("init: progression boost incomplete; max-level and/or "
-                 "currency pins are not fully active");
+            LOGE("init: progression grant incomplete; level/currency grant "
+                 "is not active");
         }
     }
 
