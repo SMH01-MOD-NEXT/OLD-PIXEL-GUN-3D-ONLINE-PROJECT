@@ -20,26 +20,26 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
-      # PHOTON_APP_ID приходит только из repository secrets. CMake скачивает
-      # исходники shadowhook на зафиксированном теге, патчит их и статически
-      # линкует внутрь единственного libopg3d.so.
+      # PHOTON_APP_ID comes only from repository secrets. CMake downloads the
+      # shadowhook sources at the pinned tag, patches them and links them
+      # statically into the single libopg3d.so.
       - name: Build (assembleRelease, armeabi-v7a)
         env:
           ORG_GRADLE_PROJECT_PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
 
-      # Гард против регрессии разматывателя стека.
+      # Guard against stack-unwinder regressions.
       #
-      # libil2cpp.so несёт GNU-совместимый ARM EHABI unwinder и поднимает через
-      # него управляемые исключения. Если кадр нашего хука описан generic model
-      # со ссылкой на __gxx_personality_v0 из статически влинкованного LLVM
-      # libc++abi, то первое же исключение, пролетающее сквозь хук, роняет игру
-      # в __unw_set_reg. Подробности — в комментарии к -fno-exceptions в
-      # opg3d/src/main/cpp/CMakeLists.txt.
+      # libil2cpp.so carries a GNU-compatible ARM EHABI unwinder and raises
+      # managed exceptions through it. If a frame of our hook is described in
+      # generic model with a reference to __gxx_personality_v0 from the
+      # statically linked LLVM libc++abi, the first exception flying through
+      # the hook crashes the game in __unw_set_reg. Details are in the
+      # -fno-exceptions comment in opg3d/src/main/cpp/CMakeLists.txt.
       #
-      # Опасность именно в том, что без -fno-exceptions всё собирается молча и
-      # ломается только на устройстве в момент разрыва связи, поэтому проверяем
-      # на CI: в объектниках opg3d ссылок на эту personality быть не должно.
+      # The danger is that without -fno-exceptions everything builds silently
+      # and only breaks on the device when the connection drops, so CI checks
+      # that the opg3d object files never reference that personality.
       - name: Assert no LLVM C++ personality in our frames
         run: |
           set -euo pipefail
@@ -49,22 +49,22 @@ jobs:
           fi
           NM="$(find "$NDK_ROOT" -type f -name 'llvm-nm' | head -n 1)"
           if [ -z "$NM" ]; then
-            echo "::error::llvm-nm не найден под $NDK_ROOT — поправь путь в гарде"
+            echo "::error::llvm-nm not found under $NDK_ROOT — fix the path in this guard"
             exit 1
           fi
           OBJS="$(find . -type f -name '*.cpp.o' -path '*opg3d.dir*')"
           if [ -z "$OBJS" ]; then
-            echo "::error::объектники opg3d не найдены — AGP сменил раскладку, поправь путь в гарде"
+            echo "::error::opg3d object files not found — AGP changed the layout, fix the path in this guard"
             exit 1
           fi
           echo "$OBJS"
           if echo "$OBJS" | xargs "$NM" --undefined-only | grep -q '__gxx_personality_v0'; then
-            echo "::error::кадры libopg3d ссылаются на __gxx_personality_v0 — управляемое исключение уронит игру. Верни -fno-exceptions."
+            echo "::error::libopg3d frames reference __gxx_personality_v0 — a managed exception will crash the game. Restore -fno-exceptions."
             exit 1
           fi
-          echo "ok: generic-model personality в наших кадрах отсутствует"
+          echo "ok: no generic-model personality in our frames"
 
-      # Публичный артефакт этапа — ровно одна готовая библиотека.
+      # The stage's public artifact is exactly one ready library.
       - name: Collect libopg3d.so
         run: |
           mkdir -p out
