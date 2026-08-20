@@ -11,25 +11,27 @@ The project does not connect to Cubic Games services and is not affiliated with 
 - **Photon AppID redirect.** The mod replaces the AppID at the source of the game's selection path, before `ServerSettings.UseCloud(...)` consumes it. The AppID comes from a build secret and is never committed or printed in clear text.
 - **Fixed EU routing.** Every connection uses Photon Cloud region `eu`. This removes the first-launch `32756 / Region none is not available` race and keeps every player in one regional room pool. EU must also remain the only allowed region in the Photon dashboard.
 - **Dead-backend disconnect guard.** The obsolete `FriendsController.Update` disconnect path is quarantined only while Photon is connecting or connected. Normal PUN callbacks, room transitions, RPC, synchronization, and intentional disconnects remain stock.
-- **Persistent release progression.** The game repeatedly runs its own `ExperienceController.AddExperience` path until the real final level, **38**, is reached. Repeated level-up popups are suppressed only during automatic steps. Coins and Gems are maintained at **999,999,999** through the stock bank and Storager paths, so the values persist.
+- **Persistent release progression.** The game repeatedly runs its own `ExperienceController.AddExperience` path until the final level, **38**, is reached. The experience table is indexed from level 0, so its length of 39 is not a level; every computed target is clamped to 38. Repeated level-up popups are suppressed only during automatic steps. Coins and Gems are maintained at **999,999,999** through the stock bank and Storager paths, so the values persist.
 - **Automatic tutorial skip.** The initial training stage is completed before scene routing can send a fresh profile into training. Both the first-match stage and the 12.1+ shop-tutorial flag are written through the game's own persistence APIs, so the skip survives a restart.
-- **Free detail weapons.** Weapons that originally required craft details report **0 required details**, allowing the stock craft flow to grant them immediately. These weapons already have no craft wait in this client. The override covers the weapon craft, event craft, and set craft armory groups while excluding avatars and unrelated categories.
+- **Free detail weapons.** Every craft recipe reports **0 required details** and the craft gate is answered positively, so the stock craft flow grants the weapon immediately. These weapons already have no craft wait in this client. There is no category filtering.
 - **Offline-safe weapon upgrades.** When the retired server-time endpoint returns an invalid value, the client receives local Unix UTC seconds instead. The fallback is monotonic, so a device-clock rollback cannot strand an active item. The normal craft/upgrade timers, inventory provisioning, save routines, and UI refreshes remain responsible for state.
-- **Connection and compatibility diagnostics.** Runtime decisions are logged under one `OPG3D` logcat tag with sequence numbers, timestamps, thread IDs, and caller addresses where useful.
+- **Build stamp and diagnostics.** The first init line prints the source tag and compile timestamp of the running library, so a stale `libopg3d.so` is recognisable immediately. Runtime decisions are logged under one `OPG3D` logcat tag with sequence numbers, timestamps, thread IDs, and caller addresses where useful.
 
 ## How the armory compatibility works
 
 The supplied PG3D 13.2.1 dump, metadata, and ARMv7 `libil2cpp.so` were used as local analysis inputs. They are not part of the repository and must not be committed.
 
-The managed targets are:
+Rewriting a single balance value is not sufficient in this client: the craft flow asks several independent managed helpers about details. All three inputs are therefore neutralised:
 
-1. `BalanceController.NumOfDetailsForCraft(string)` identifies items whose stock configuration requires details.
-2. `ItemDb.GetItemCategory(string)` returns the armory presentation category. Detail weapons appear under `WeaponCraftCategory` (`110000`), `EventCraftCategory` (`135000`), or `SetsCraftCategory` (`140000`) instead of their ordinary loadout slot.
-3. For detail-based items in those three craft groups, and ordinary weapon categories `0` through `5`, the compatibility hook reports a requirement of `0`.
-4. `AvatarCategory` (`150000`) and all unrelated categories retain their stock detail requirements.
-5. The original craft button, inventory provisioning, persistence, and UI refresh paths remain in control of granting the weapon.
+1. `BalanceController.NumOfDetailsForCraft(string)` — the configured requirement of a recipe, forced to `0`.
+2. `CraftSetsManager.IsEnoughDetailsForCraftItem(string, string)` — the decision the craft button makes, forced to `true`.
+3. `WeaponCraftDetailsInfo.GetDetailsCount(string)` — the owned-detail count read by the armory UI, reported as a large value.
 
-This replaces the previous Gem-price conversion, which did not work reliably in the legacy client. No synthetic premium-currency transaction or server response is required.
+Only the first hook is mandatory. The other two install when their class is present, so a metadata mismatch degrades gracefully instead of disabling the library, and each path logs the first decisions it makes with the real item id. If crafting is ever refused again, logcat shows which of the three paths the client consulted instead of leaving it to guesswork.
+
+Earlier revisions restricted the override to guessed armory categories and additionally overrode the craft duration. Both were wrong for this client: category values did not match the craftable items, and detail weapons have no craft wait at all. Category filtering and the craft-time hook have been removed.
+
+The original craft button, inventory provisioning, persistence, and UI refresh paths still grant the weapon. No synthetic premium-currency transaction or server response is involved.
 
 ## Technical design
 
@@ -37,7 +39,7 @@ This replaces the previous Gem-price conversion, which did not work reliably in 
 2. **Symbol resolution without `dlsym`.** Android linker namespaces and `RTLD_LOCAL` hide the game's exports from `dlsym(RTLD_DEFAULT)`. `elf_sym` reads the already-mapped ELF dynamic symbol table directly.
 3. **Metadata-driven, fail-closed hooks.** Targets are found with the IL2CPP metadata API and hooked at their actual `MethodInfo::methodPointer` using ShadowHook in UNIQUE mode. No managed method RVA is compiled into the project. If a required class, method, or trampoline is unavailable, the module reports failure instead of patching an assumed address.
 4. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, upgrades, and saves go through original game methods. Hooks provide missing decisions or inputs rather than replacing the persistence model.
-5. **Category-scoped detail override.** The original detail requirement is checked first, then the stock armory category restricts the zero requirement to weapon and weapon-craft groups. Non-weapon content remains unchanged.
+5. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
 6. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Every hook and stock-call signature models that layout explicitly. A `long` return such as server time uses the ARM32 `r0:r1` pair.
 7. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
 8. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
@@ -52,6 +54,8 @@ Create the repository Actions secret `PHOTON_APP_ID`. The workflow exposes it as
 
 - `13.2.1` — PG3D 13.2.1, including the release progression and legacy gameplay compatibility described above.
 - `12.5.0` — the older PG3D 12.5.0 target.
+
+When starting the workflow manually, select the branch explicitly: the default branch is `12.5.0` and does not contain the 13.2.1 compatibility modules. Always confirm the build stamp of the artifact you install.
 
 ### Local build
 
@@ -75,19 +79,20 @@ adb logcat -s OPG3D
 Relevant healthy-startup lines include:
 
 ```text
+init: libopg3d build 13.2.1 detail-craft-rework (armory v3) built ...
 init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons and upgrade timers active
 legacy: tutorial skipped automatically; stage 3 and shop tutorial completion saved
-legacy: retired server-time endpoint unavailable; using local UTC seconds for crafting and upgrades
-legacy: tutorial auto-skip and local upgrade/crafting time armed
-free-details: zero-detail weapon crafting armed
-free-details: detail weapons now require 0 details (first category=110000, stock requirement=...)
+free-details: armed (required=0 for every recipe, craft gate=forced, owned count=synthetic); no category filtering
+free-details: required details for '<item id>': 25 -> 0
 boost: persisted grant armed (trigger=MainMenuController.Update, level target=38, currency target=999999999, level-up UI=skipped)
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 photon-status: 1024 (Connect) ...
 ui: ConnectionControl.OnConnectedToMaster state=16 ...
 ```
 
-If a detail-bearing non-weapon item is encountered, one diagnostic line records the preserved category and requirement. AppIDs are logged only as a length and FNV-1a fingerprint.
+If those `free-details:` and `legacy:` lines are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
+
+AppIDs are logged only as a length and FNV-1a fingerprint.
 
 Caller RVAs can be mapped to managed methods with the matching private `dump.cs` file. Dumps, metadata, and `libil2cpp.so` are analysis inputs and must not be committed:
 
@@ -99,25 +104,25 @@ python3 tools/symbolize_log.py --dump dump1321.cs --log logcat.txt
 
 ```text
 opg3d/src/main/cpp/
-├── main.cpp                  # IL2CPP wait/attach and module installation
+├── main.cpp                  # IL2CPP wait/attach, build stamp and module installation
 ├── elf_sym.cpp/.h            # in-memory ELF export resolver
 ├── il2cpp.cpp/.h             # metadata and managed-value helpers
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override and connection tracing
 ├── cloud_guard.h             # fixed-EU routing and obsolete disconnect guard
-├── player_boost.h            # stock level steps and verified bank top-up
+├── player_boost.h            # stock level steps (cap 38) and verified bank top-up
 ├── legacy_gameplay.h         # tutorials and upgrade clock fallback
 ├── free_detail_weapons.h     # zero-detail weapon crafting
-├── config.h                  # build-time defaults; no credentials
+├── config.h                  # build-time defaults and build tag; no credentials
 └── CMakeLists.txt            # pinned static ShadowHook and libopg3d.so
 ```
 
 ## Verification status
 
 - Target: PG3D 13.2.1, Android ARMv7, IL2CPP metadata v22.
-- The detail-count and category targets were verified against the supplied 13.2.1 analysis files.
+- The detail requirement, craft gate and owned-count targets were verified against the supplied 13.2.1 analysis files.
 - Photon handshake, master/game-server transitions, room creation, and a 1v1 match have been verified between two devices on different networks.
-- The corrected craft-category matching still requires an on-device check with the target client before release.
+- The reworked armory path still requires an on-device check with a build that prints the `armory v3` stamp.
 - All clients must use EU, with EU configured as the only allowed Photon region.
 - The mechanism used to load `libopg3d.so` into the game process is outside this repository.
 
