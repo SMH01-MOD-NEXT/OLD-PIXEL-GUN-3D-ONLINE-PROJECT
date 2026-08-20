@@ -15,10 +15,12 @@
 // The shipped PhotonServerSettings point at infrastructure that no longer
 // exists (on 12.5.0 the runtime-proven route was SelfHosted to the dead
 // rilisoft-us endpoint; the exact default differs per build, but is just as
-// dead). The build also lets FriendsController.Update disconnect PUN while
-// the peer is authenticating. This layer fixes only those two pieces: it
-// routes PUN through the SDK's own UseCloudBestRegion implementation and
-// quarantines FriendsController.Update while a Photon session is active.
+// dead). The old BestRegion path also has a cold-start race: before its async
+// ping coroutine stores PUNCloudBestRegion, Authenticate can be sent with
+// region=none and Photon rejects it with return code 32756. This layer fixes
+// both pieces by routing every connection through the SDK's explicit
+// UseCloud(appId, CloudRegionCode.eu) path and quarantining
+// FriendsController.Update while a Photon session is active.
 // Manual disconnects, Photon status callbacks and room/game networking are
 // not replaced or globally faked.
 namespace cloud_guard {
@@ -29,9 +31,15 @@ using ManagedString = void;
 using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
 using ConnectTierFn = bool (*)(int32_t tier, const MethodInfo* method);
 using StaticBoolFn = bool (*)(const MethodInfo* method);
-using UseCloudBestFn = void (*)(void* self, ManagedString* app_id,
-                                const MethodInfo* method);
+using UseCloudRegionFn = void (*)(void* self, ManagedString* app_id,
+                                  int32_t region, const MethodInfo* method);
 using GetIntFn = int32_t (*)(const MethodInfo* method);
+
+// dump1321.cs: ServerSettings.HostingOption.PhotonCloud = 1,
+// CloudRegionCode.eu = 0. Keeping these constants local makes the routing
+// invariant explicit and prevents a first-launch BestRegion warm-up.
+inline constexpr int32_t kPhotonCloudHost = 1;
+inline constexpr int32_t kForcedRegionEu = 0;
 
 inline InstanceVoidFn g_friends_update = nullptr;
 inline InstanceVoidFn g_connect_scene_go = nullptr;
@@ -166,11 +174,11 @@ inline bool force_cloud(const char* point, bool reapply) {
     }
 
     static void* use_cloud_method = nullptr;
-    static UseCloudBestFn use_cloud = nullptr;
+    static UseCloudRegionFn use_cloud = nullptr;
     if (use_cloud == nullptr) {
         use_cloud_method = il2cpp::find_method_info(
-            "", "ServerSettings", "UseCloudBestRegion", 1);
-        use_cloud = reinterpret_cast<UseCloudBestFn>(
+            "", "ServerSettings", "UseCloud", 2);
+        use_cloud = reinterpret_cast<UseCloudRegionFn>(
             il2cpp::method_pointer(use_cloud_method));
     }
 
@@ -179,26 +187,34 @@ inline bool force_cloud(const char* point, bool reapply) {
         // This address may already carry the diagnostic hook. Calling it is
         // intentional: that hook delegates to the original SDK method and
         // gives us before/after evidence in logcat.
-        use_cloud(settings, app_id, use_cloud_method);
+        use_cloud(settings, app_id, kForcedRegionEu, use_cloud_method);
         called_sdk = true;
     } else {
-        LOGE("cloud-force[%s]: UseCloudBestRegion unavailable; using field fallback",
+        LOGE("cloud-force[%s]: UseCloud(appId, eu) unavailable; using field fallback",
              point);
-        write_field<int32_t>(settings, "HostType", 4); // BestRegion
+        write_field<int32_t>(settings, "HostType", kPhotonCloudHost);
         write_field(settings, "AppID", app_id);
+        write_field<int32_t>(settings, "PreferredRegion", kForcedRegionEu);
     }
 
     int32_t host = -1;
+    int32_t region = -1;
     ManagedString* stored_app = nullptr;
-    const bool have_host = read_field(settings, "HostType", &host);
-    const bool have_app = read_field(settings, "AppID", &stored_app);
+    bool have_host = read_field(settings, "HostType", &host);
+    bool have_region = read_field(settings, "PreferredRegion", &region);
+    bool have_app = read_field(settings, "AppID", &stored_app);
 
-    // A failed SDK call must not silently leave the dead SelfHosted route.
-    if (!have_host || host != 4) {
-        write_field<int32_t>(settings, "HostType", 4);
+    // A failed or intercepted SDK call must not silently leave BestRegion,
+    // SelfHosted, a stale region, or a stale AppID in place.
+    if (!have_host || host != kPhotonCloudHost ||
+        !have_region || region != kForcedRegionEu ||
+        !have_app || stored_app != app_id) {
+        write_field<int32_t>(settings, "HostType", kPhotonCloudHost);
         write_field(settings, "AppID", app_id);
-        read_field(settings, "HostType", &host);
-        read_field(settings, "AppID", &stored_app);
+        write_field<int32_t>(settings, "PreferredRegion", kForcedRegionEu);
+        have_host = read_field(settings, "HostType", &host);
+        have_region = read_field(settings, "PreferredRegion", &region);
+        have_app = read_field(settings, "AppID", &stored_app);
     }
 
     const int32_t chars = il2cpp::string_length != nullptr
@@ -207,15 +223,17 @@ inline bool force_cloud(const char* point, bool reapply) {
     const bool stored_same = have_app && stored_app == app_id;
     const uint32_t apply = g_cloud_apply_count.fetch_add(
                                1u, std::memory_order_relaxed) + 1u;
-    const bool ready = host == 4;
+    const bool ready = have_host && host == kPhotonCloudHost &&
+                       have_region && region == kForcedRegionEu && stored_same;
     g_cloud_ready.store(ready, std::memory_order_release);
 
     LOGI("cloud-force[%s]: apply#%" PRIu32
-         " sdk=%d host=%d(BestRegion expected=4) appChars=%d storedSame=%d ready=%d",
-         point, apply, called_sdk ? 1 : 0, host, chars,
+         " sdk=%d host=%d(PhotonCloud expected=1) "
+         "region=%d(eu expected=0) appChars=%d storedSame=%d ready=%d",
+         point, apply, called_sdk ? 1 : 0, host, region, chars,
          stored_same ? 1 : 0, ready ? 1 : 0);
     if (!ready) {
-        LOGE("cloud-force[%s]: FAIL-CLOSED — SelfHosted route was not replaced",
+        LOGE("cloud-force[%s]: FAIL-CLOSED — PhotonCloud/eu route was not applied",
              point);
     }
     return ready;
