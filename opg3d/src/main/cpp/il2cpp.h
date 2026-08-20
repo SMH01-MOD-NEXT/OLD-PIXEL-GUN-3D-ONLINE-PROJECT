@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 // Минимальная обёртка над экспортируемым C API IL2CPP из PG3D 13.2.1
 // (metadata v22 — та же major-версия, что и у 12.5.0).
@@ -24,7 +25,36 @@ inline void*       (*class_get_method_from_name)(void* klass, const char* name,
 inline void*       (*class_get_field_from_name)(void* klass, const char* name) = nullptr;
 inline void*       (*object_get_class)(void* object) = nullptr;
 inline void        (*field_get_value)(void* object, void* field, void* value) = nullptr;
-inline void        (*field_set_value)(void* object, void* field, void* value) = nullptr;
+
+// В старом embedding API IL2CPP третий аргумент il2cpp_field_set_value имеет
+// асимметричный ABI: для value type он указывает на значение, а для managed
+// reference (string/class/object/array) является самим object pointer.
+//
+// Наши write_field<T>() передают адрес локального T. Адаптер оставляет адрес
+// для чисел/enum/bool, но для T, который сам является указателем, снимает один
+// уровень косвенности. Без этого в string-поле записывался адрес native-stack
+// local: после возврата ссылка протухала и следующий обход heap падал в GC.
+struct FieldSetValueApi {
+    using RawFn = void (*)(void* object, void* field, void* value);
+    RawFn raw = nullptr;
+
+    explicit operator bool() const noexcept { return raw != nullptr; }
+    bool operator==(std::nullptr_t) const noexcept { return raw == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return raw != nullptr; }
+
+    template <typename T>
+    void operator()(void* object, void* field, T* value) const noexcept {
+        if (raw == nullptr || value == nullptr) return;
+        if constexpr (std::is_pointer_v<T>) {
+            raw(object, field,
+                const_cast<void*>(static_cast<const void*>(*value)));
+        } else {
+            raw(object, field, value);
+        }
+    }
+};
+inline FieldSetValueApi field_set_value{};
+
 inline void        (*field_static_get_value)(void* field, void* value) = nullptr;
 inline void        (*field_static_set_value)(void* field, void* value) = nullptr;
 inline void*       (*thread_attach)(void* domain) = nullptr;
