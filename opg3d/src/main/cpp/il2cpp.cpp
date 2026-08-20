@@ -55,7 +55,7 @@ bool resolve() {
     ok &= bind(class_get_field_from_name, "il2cpp_class_get_field_from_name");
     ok &= bind(object_get_class,          "il2cpp_object_get_class");
     ok &= bind(field_get_value,           "il2cpp_field_get_value");
-    ok &= bind(field_set_value,           "il2cpp_field_set_value");
+    ok &= bind(field_set_value.raw,       "il2cpp_field_set_value");
     ok &= bind(field_static_get_value,    "il2cpp_field_static_get_value");
     ok &= bind(field_static_set_value,    "il2cpp_field_static_set_value");
     ok &= bind(thread_attach,             "il2cpp_thread_attach");
