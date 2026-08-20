@@ -1,27 +1,26 @@
 # Photon Cloud routing and dead-backend guard
 
-## Подтверждённая причина цикла
+## Confirmed disconnect chain
 
-Расширенная трассировка 12.5.0 показала одну и ту же цепочку на каждой
-попытке:
+Extended tracing on 12.5.0 showed the same chain on every attempt:
 
 ```text
 ConnectUsingSettings -> StatusCode.Connect -> ClientState.Authenticating
 -> FriendsController.Update+0x310 -> PhotonNetwork.Disconnect
 ```
 
-`FriendsController.Update+0x310` определён по `dump1250.cs` из runtime
-call-site `libil2cpp.so+0xAA23FC`. Это локальный вызов игры, а не разрыв со
-стороны Photon.
+`FriendsController.Update+0x310` was located via `dump1250.cs` from the runtime
+call site `libil2cpp.so+0xAA23FC`. This is a local game call, not a server-side
+disconnect.
 
-Одновременно `ServerSettings` после `Switcher.SetUpPhoton` оставался в режиме
-`SelfHosted` с адресом `rilisoft-us.exitgamescloud.com:5055`. Режим сборки
-`PHOTON_MODE=cloud` раньше менял только AppID и ошибочно сохранял выбранный
-игрой маршрут.
+At the same time, `ServerSettings` stayed in `SelfHosted` mode after
+`Switcher.SetUpPhoton`, pointing at `rilisoft-us.exitgamescloud.com:5055`. The
+`PHOTON_MODE=cloud` build mode used to change only the AppID and wrongly kept
+the game-selected route.
 
-## Фиксированный регион
+## Fixed region
 
-`dump1250.cs` подтверждает:
+`dump1250.cs` confirms:
 
 ```text
 ServerSettings.HostingOption.PhotonCloud = 1
@@ -30,31 +29,33 @@ CloudRegionCode.none = 4
 ServerSettings.UseCloud(string, CloudRegionCode) // RVA 0x8FF47C
 ```
 
-`BestRegion` не используется: он зависит от асинхронного ping/cache и может
-как задержать первый connect, так и распределить клиентов по разным
-региональным пулам комнат. Для общего онлайна 12.5.0 все клиенты фиксируются
-на EU. На стороне Photon Cloud для соответствующего AppID также следует
-оставить EU единственным allowed region.
+`BestRegion` is not used: it depends on an asynchronous ping/cache and can both
+delay the first connect and spread clients across different regional room
+pools. For a shared 12.5.0 online environment all clients are pinned to EU. On
+the Photon Cloud side, EU should also remain the only allowed region for the
+corresponding AppID.
 
-## Что делает guard
+## What the guard does
 
-1. Перед каждым известным входом в подключение вызывает штатный overload PUN
+1. Before every known connection entry point it calls the stock PUN overload
    `ServerSettings.UseCloud(PHOTON_APP_ID, CloudRegionCode.eu)`.
-2. Проверяет read-back трёх инвариантов: `HostType == PhotonCloud (1)`,
-   `PreferredRegion == eu (0)` и сохранён тот же AppID.
-3. Если метод отсутствует или read-back не совпал, подключение блокируется.
-   Guard не угадывает offsets и не объявляет ложный успех.
-4. Пока PUN находится в активном или переходном состоянии, не запускает
-   `FriendsController.Update`. Это изолирует только владельца мёртвого
-   HTTP/social backend и гарантированно убирает подтверждённый call-site
-   Disconnect. В состоянии `PeerCreated`/`Disconnected` оригинальный Update
-   продолжает работать для локальной инициализации.
-5. Ручной `PhotonNetwork.Disconnect`, серверные причины Disconnect, Photon
-   callbacks, комнаты, RPC и синхронизация не подменяются.
+2. It reads back three invariants: `HostType == PhotonCloud (1)`,
+   `PreferredRegion == eu (0)`, and the stored AppID matches the configured
+   one.
+3. If the method is missing or the read-back does not match, the connection
+   is blocked. The guard never guesses offsets and never reports a fake
+   success.
+4. While PUN is in an active or transitioning state, it does not run
+   `FriendsController.Update`. This isolates only the owner of the dead
+   HTTP/social backend and provably removes the Disconnect call site. In the
+   `PeerCreated`/`Disconnected` states the original Update still runs, so
+   local initialization and UI state are preserved.
+5. Manual `PhotonNetwork.Disconnect`, server-side disconnect reasons, Photon
+   callbacks, rooms, RPC and sync are never replaced.
 
-## Ожидаемые логи
+## Expected logs
 
-Перед подключением:
+Before connecting:
 
 ```text
 trace: ServerSettings.UseCloud(region=0) ...
@@ -62,18 +63,19 @@ settings[UseCloud(region)/end]: host=1(PhotonCloud) ... region=0 ...
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 ```
 
-Во время handshake допустимы строки:
+During the handshake these lines are normal:
 
 ```text
 backend-guard: skipped FriendsController.Update ... state=20(Authenticating)
 ```
 
-Затем ожидаются успешный Authenticate и переход в master/game server:
+Then a successful Authenticate and a master/game-server transition are
+expected:
 
 ```text
 photon-op: code=230 return=0
 ui: ConnectionControl.OnConnectedToMaster ...
 ```
 
-Старое значение `ServerAddress` может оставаться сериализованным в asset, но
-при `HostType=PhotonCloud` ветка SelfHosted его не использует.
+The old `ServerAddress` value may remain serialized in the asset, but with
+`HostType=PhotonCloud` the SelfHosted branch never uses it.
