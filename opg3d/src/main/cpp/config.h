@@ -15,3 +15,13 @@
 #ifndef PHOTON_SERVER_PORT
 #define PHOTON_SERVER_PORT 5055
 #endif
+
+// Human-readable identity of the source revision this library was compiled
+// from. It is printed as the first line of the init log so a stale
+// libopg3d.so can be recognised immediately instead of being mistaken for a
+// failing hook. Bump the feature tag whenever runtime behaviour changes.
+#ifndef OPG3D_BUILD_TAG
+#define OPG3D_BUILD_TAG "13.2.1 detail-craft-rework (armory v3)"
+#endif
+
+#define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
