@@ -396,6 +396,8 @@ ManagedString* hook_select_app_id(void* settings, const MethodInfo* method) {
 void hook_set_up_photon(void* settings, const MethodInfo* method) {
     LOGI("trace: Switcher.SetUpPhoton begin (HiddenSettings=%p)", settings);
     g_set_up_photon(settings, method);
+    // Только здесь, ПОСЛЕ оригинала, PhotonNetwork гарантированно
+    // инициализирован и его статические поля безопасно читать и писать.
     enable_verbose_photon_logs();
     void* server_settings = current_server_settings();
     apply_config_to_settings(server_settings, "SetUpPhoton/end");
@@ -623,14 +625,18 @@ bool install_hooks() {
 
     LOGI("hook: installed %d managed hooks (core=%s)", installed, core ? "OK" : "FAILED");
 
-    void* settings = current_server_settings();
-    if (settings != nullptr) {
-        apply_config_to_settings(settings, "post-install fallback");
-        log_settings("post-install fallback", settings);
-    } else {
-        LOGI("settings[post-install]: PhotonServerSettings not created yet; SetUpPhoton hook will handle it");
-    }
-    enable_verbose_photon_logs();
+    // ВАЖНО: здесь НЕЛЬЗЯ трогать статические поля PhotonNetwork.
+    // install_hooks() выполняется на нашем фоновом потоке сразу после того,
+    // как в домене появился Assembly-CSharp.dll — задолго до того, как
+    // отработает статический конструктор PhotonNetwork.
+    // il2cpp_field_static_(get|set)_value адресует klass->static_fields + offset,
+    // и пока класс не инициализирован эта база равна nullptr: чтение
+    // PhotonServerSettings (+0x10) или запись logLevel (+0x18) вырождаются в
+    // разыменование 0x10/0x18 и роняют процесс прямо на старте игры.
+    // Всю работу с настройками делает хук SetUpPhoton: он вызывается уже из
+    // main-потока игры и строго ПОСЛЕ оригинала, когда PhotonNetwork уже жив.
+    LOGI("settings[post-install]: deferred to SetUpPhoton hook "
+         "(PhotonNetwork statics are not safe to touch yet)");
 
     if (std::strlen(PHOTON_APP_ID) == 0u) {
         LOGW("appid: build has no PHOTON_APP_ID secret; hook is diagnostic passthrough");
