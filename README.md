@@ -11,7 +11,7 @@ A single native library, `libopg3d.so`, is loaded into the game process and hook
 - **AppID redirect.** At startup the game runs `Switcher.SetUpPhoton -> SelectPhotonAppId -> ServerSettings.UseCloud(...)`. `SelectPhotonAppId` picks one of several encoded AppIDs from `HiddenSettings`, consults a local kill-switch value and the APK signature, so a late write into `PhotonServerSettings.AppID` would simply be overwritten. The mod hooks the **source of the value** instead: when `PHOTON_APP_ID` is compiled in, the original selection path is skipped and the game receives the AppID of our own Photon Cloud application. Everything downstream (PUN logic, matchmaking, rooms, RPC) keeps working unchanged.
 - **Fixed EU routing.** Before every connection attempt, the stock `ServerSettings.UseCloud(appId, CloudRegionCode.eu)` overload is called and the result is verified by read-back (`HostType == PhotonCloud`, `PreferredRegion == eu`, stored AppID matches). This eliminates the cold-start race of `UseCloudBestRegion` (which used to reject first launches with `32756 / Region none is not available`) and guarantees that all players land in the same regional room pool. EU is also the only allowed region on the Photon dashboard side.
 - **Dead-backend guard.** While a Photon session is active, `FriendsController.Update` — which on this build calls `PhotonNetwork.Disconnect` mid-handshake — is quarantined. When PUN is idle, the original method still runs. Manual disconnects, server-side disconnects, callbacks, rooms, RPC and sync are never replaced or faked.
-- **Release progression grant (13.2.1 branch).** Once the main menu is up, the mod calls the game's own progression write paths: `ExperienceController.AddExperience` with the full exp-table total — the stock progression loop itself computes and saves the resulting level — and `BankController.AddCoins`/`AddGems`, which top Coins and Gems up to `999 999 999` through the stock bank code. Because the game writes the values into its own save, progress persists across restarts and survives removal of the library. Each currency top-up is verified by a read-back: if the balance does not move (storage layout changed), the grant marks a flag in Storager and disables itself instead of stacking invisible grants on every launch.
+- **Release progression grant (13.2.1 branch).** The stock `ExperienceController.AddExperience` intentionally advances no more than one level per call, regardless of the XP amount. The mod therefore invokes it once every few menu frames until the real final level (`38`, derived from `MaxExpLevelsDefault.Length - 1` and cross-checked against `HealthByLevel`) is reached. Only `ExpController`'s level-up UI subscriber is suppressed during these calls, so the modal panel and its coroutines do not accumulate; the game's own level calculation, rewards and Storager writes still run and persist normally. Coins and Gems are topped up to `999 999 999` through `BankController.AddCoins`/`AddGems`. Their canonical Storager keys are discovered from the bank methods' own zero-delta read path rather than guessed, and the real stored balances are periodically verified and topped up again after spending.
 - **Full connection tracing.** Every step of the Photon path is logged with sequence numbers, timestamps, thread ids and caller addresses, so any remaining failure is directly attributable.
 
 ## How it works
@@ -23,6 +23,7 @@ A single native library, `libopg3d.so`, is loaded into the game process and hook
 5. **One-file artifact.** ShadowHook v2.0.1 is built from source and linked statically into `libopg3d.so`, with two local build-time patches (`cmake/patch-shadowhook.cmake`): dropping `SA_EXPOSE_TAGBITS` (armeabi-v7a kernels reject it) and disabling the linker module (which needs a helper `.so` we intentionally don't ship).
 6. **Unwinder compatibility.** The library is built with `-fno-exceptions -funwind-tables`: PG3D's `libil2cpp.so` and the statically linked LLVM libc++abi carry two incompatible ARM EHABI unwinders, and a managed exception crossing a hook frame used to crash inside `__unw_set_reg`. The long comment in `CMakeLists.txt` explains the details, and CI asserts our objects never reference `__gxx_personality_v0`.
 7. **Typed field-write ABI.** The old IL2CPP embedding API passes a pointer to the value for value types, but the object pointer itself for managed references. The typed `FieldSetValueApi` adapter in `il2cpp.h` strips one level of indirection for pointer types — a naive `&value` write used to store a native stack address into `ServerSettings.AppID` and crash the GC a second later.
+8. **ARM32 static-method ABI.** In this IL2CPP build, static generated methods receive a hidden `null` slot in `r0`; their first managed argument begins in `r1`, and `MethodInfo*` follows the managed arguments. The progression code models that layout explicitly. Without the hidden slot, `BankController.AddCoins/AddGems` receive zero as their `count`, which looks like a failed backend sync even though no currency write was attempted.
 
 ## Building
 
@@ -54,11 +55,15 @@ A healthy startup looks like:
 ```text
 init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression grant and connection tracing active
 appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
-boost: progression grant armed (trigger=MainMenuController.Update, currency target=999999999, level via AddExperience)
-boost: player level 1 -> 38 via AddExperience(+... exp, cap 38, exp table read)
+boost: persisted grant armed (trigger=MainMenuController.Update, level target=38, currency target=999999999, level-up UI=skipped)
+boost: automatic level-up UI suppression active
+boost: player level 7 -> 8 (target 38, +... exp per stock one-level step, table read)
+boost: final player level reached and saved (38)
+boost: discovered canonical coins key '...' through BankController
 boost: coins 15 -> 999999999 via BankController (target 999999999)
+boost: discovered canonical gems key '...' through BankController
 boost: gems 10 -> 999999999 via BankController (target 999999999)
-cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
+cloud-force[...]: ... ready=1
 photon-status: 1024 (Connect) ...
 ui: ConnectionControl.OnConnectedToMaster state=16 ...
 ```
@@ -79,7 +84,7 @@ opg3d/src/main/cpp/
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override + network path tracing
 ├── cloud_guard.h             # fixed Photon Cloud (EU) routing + FriendsController quarantine
-├── player_boost.h            # release progression grant: stock AddExperience + bank top-up
+├── player_boost.h            # repeated stock level steps + verified bank top-up
 ├── config.h                  # compile-time defaults, no credentials
 └── CMakeLists.txt            # pinned static ShadowHook + libopg3d.so
 ```
