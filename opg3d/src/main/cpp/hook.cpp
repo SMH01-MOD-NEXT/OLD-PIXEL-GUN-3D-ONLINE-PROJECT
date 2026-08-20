@@ -83,6 +83,18 @@ bool install(const ManagedMethod& target, void* replacement, void** original,
         return false;
     }
 
+    // Fail-closed. Прокси в photon_hooks.cpp вызывают оригинал безусловно, так
+    // что установленный хук с пустым orig_addr — это гарантированный SIGSEGV при
+    // первом же вызове перехваченного метода (для Switcher.SetUpPhoton это
+    // происходит прямо на старте игры). Лучше откатить хук и остаться без
+    // трассировки, чем уронить процесс.
+    if (*original == nullptr) {
+        LOGE("hook: engine gave no trampoline for %s.%s/%d @ %p; rolling back",
+             target.klass, target.method, target.args_count, address);
+        shadowhook_unhook(stub);
+        return false;
+    }
+
     LOGI("hook: installed %s.%s/%d @ %p",
          target.klass, target.method, target.args_count, address);
     return true;
