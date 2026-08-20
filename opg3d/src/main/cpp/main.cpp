@@ -19,23 +19,22 @@ constexpr const char* kIl2Cpp = "libil2cpp.so";
 constexpr int kWaitSteps = 6000;
 constexpr useconds_t kWaitStepUs = 10 * 1000;
 
-// il2cpp_domain_get() начинает отдавать домен задолго до конца il2cpp_init:
-// сборки главный поток регистрирует уже после этого момента. При этом
-// il2cpp_domain_get_assemblies() возвращает указатель прямо на внутренний
-// вектор рантайма, поэтому обход списка во время регистрации читает
-// перевыделенную (то есть уже освобождённую) память и роняет наш фоновый
-// поток. Ждём, пока состав сборок перестанет меняться, и только потом трогаем
-// метаданные.
-constexpr int kStableChecks = 25;            // ~250 мс одинаковых замеров подряд
-constexpr useconds_t kSettleUs = 750 * 1000; // запас после стабилизации
+// il2cpp_domain_get() starts returning a domain long before il2cpp_init
+// finishes: the main thread keeps registering assemblies after that point.
+// il2cpp_domain_get_assemblies() returns a pointer straight into the runtime's
+// internal vector, so walking the list during registration reads reallocated
+// (already freed) memory and crashes our background thread. Wait until the
+// assembly set stops changing before touching any metadata.
+constexpr int kStableChecks = 25;            // ~250 ms of identical samples in a row
+constexpr useconds_t kSettleUs = 750 * 1000; // headroom after stabilization
 
-// Безопасный опрос: берём только количество сборок и не разыменовываем сам
-// массив, поэтому гонка с регистрацией не приводит к чтению чужой памяти.
+// Race-safe polling: read only the assembly count and never dereference the
+// array itself, so the registration race cannot make us read freed memory.
 size_t assembly_count(void* domain) {
     if (domain == nullptr || il2cpp::domain_get_assemblies == nullptr) return 0u;
     size_t count = 0u;
     il2cpp::domain_get_assemblies(domain, &count);
-    if (count > 8192u) return 0u; // рваное чтение — считаем, что ещё не готово
+    if (count > 8192u) return 0u; // torn read — treat as not ready yet
     return count;
 }
 
@@ -92,8 +91,8 @@ void* init_thread(void*) {
 
     usleep(kSettleUs);
 
-    // Присоединяемся к рантайму ДО любой работы с метаданными: обход сборок и
-    // il2cpp_class_from_name() трогают структуры, которыми управляет GC.
+    // Attach to the runtime BEFORE any metadata work: walking assemblies and
+    // il2cpp_class_from_name() touch GC-owned structures.
     void* attached_thread = il2cpp::thread_attach(domain);
     if (attached_thread == nullptr) {
         LOGE("init: il2cpp_thread_attach failed");
@@ -116,9 +115,9 @@ void* init_thread(void*) {
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing hooks");
 
     // Install tracing first: cloud_guard intentionally calls the already-hooked
-    // ServerSettings.UseCloud entry so its before/after state is visible in the
-    // same diagnostic stream. player_boost is independent and simply shares the
-    // same hook engine.
+    // ServerSettings.UseCloud(appId, eu) entry so its before/after state is
+    // visible in the same diagnostic stream. player_boost is independent and
+    // simply shares the same hook engine.
     const bool photon_installed = photon::install_hooks();
     const bool guard_installed = cloud_guard::install_hooks();
     const bool boost_installed = player_boost::install_hooks();

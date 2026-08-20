@@ -5,10 +5,10 @@
 #include <string>
 #include <type_traits>
 
-// Минимальная обёртка над экспортируемым C API IL2CPP из PG3D 13.2.1
-// (metadata v22 — та же major-версия, что и у 12.5.0).
-// Символы резолвятся напрямую из уже загруженной libil2cpp.so: Android linker
-// namespace не обязан делать их видимыми обычному dlsym().
+// Minimal wrapper over the exported IL2CPP C API of PG3D 13.2.1
+// (metadata v22 — same major version as 12.5.0).
+// Symbols are resolved directly from the already loaded libil2cpp.so: the
+// Android linker namespace is not required to make them visible to dlsym().
 namespace il2cpp {
 
 inline void*       (*string_new)(const char* str) = nullptr;
@@ -26,14 +26,16 @@ inline void*       (*class_get_field_from_name)(void* klass, const char* name) =
 inline void*       (*object_get_class)(void* object) = nullptr;
 inline void        (*field_get_value)(void* object, void* field, void* value) = nullptr;
 
-// В старом embedding API IL2CPP третий аргумент il2cpp_field_set_value имеет
-// асимметричный ABI: для value type он указывает на значение, а для managed
-// reference (string/class/object/array) является самим object pointer.
+// In the old embedding IL2CPP API the third argument of
+// il2cpp_field_set_value has an asymmetric ABI: for value types it is a
+// pointer to the value, while for managed references (string/class/object/
+// array) it IS the object pointer itself.
 //
-// Наши write_field<T>() передают адрес локального T. Адаптер оставляет адрес
-// для чисел/enum/bool, но для T, который сам является указателем, снимает один
-// уровень косвенности. Без этого в string-поле записывался адрес native-stack
-// local: после возврата ссылка протухала и следующий обход heap падал в GC.
+// Our write_field<T>() passes the address of a local T. This adapter keeps
+// passing the address for numbers/enums/bools, but strips one level of
+// indirection when T is itself a pointer. Without it, a string field would be
+// written with the address of a native stack local: the reference goes stale
+// after return, and the next heap walk crashes inside the GC.
 struct FieldSetValueApi {
     using RawFn = void (*)(void* object, void* field, void* value);
     RawFn raw = nullptr;
@@ -60,10 +62,10 @@ inline void        (*field_static_set_value)(void* field, void* value) = nullptr
 inline void*       (*thread_attach)(void* domain) = nullptr;
 inline void        (*thread_detach)(void* thread) = nullptr;
 
-// Резолвит обязательный набор экспортов. Идемпотентно.
+// Resolves the required set of exports. Idempotent.
 bool resolve();
 
-// Поиск metadata-объектов без запуска managed-статических конструкторов.
+// Metadata lookup without running managed static constructors.
 void* find_image(const char* name);
 void* find_class(const char* namespaze, const char* name);
 void* find_method_info(const char* namespaze, const char* klass,
@@ -71,8 +73,8 @@ void* find_method_info(const char* namespaze, const char* klass,
 void* method_pointer(void* method_info);
 void* find_field(const char* namespaze, const char* klass, const char* field);
 
-// Безопасное диагностическое преобразование managed UTF-16 строки.
-// max_code_units ограничивает размер logcat-сообщений.
+// Safe diagnostic conversion of a managed UTF-16 string.
+// max_code_units caps logcat message size.
 std::string to_utf8(void* managed_string, size_t max_code_units = 512);
 
 } // namespace il2cpp
