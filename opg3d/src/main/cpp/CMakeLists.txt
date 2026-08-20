@@ -15,7 +15,7 @@ set(PHOTON_SERVER_ADDRESS "" CACHE STRING "Optional fixed/self-hosted address")
 set(PHOTON_SERVER_PORT "5055" CACHE STRING "Optional fixed/self-hosted port")
 set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "ShadowHook version (git tag bytedance/android-inline-hook)")
 
-# --- ShadowHook (bytedance): исходники + наш патч -------------------------------
+# --- ShadowHook (bytedance): исходники + наши патчи -----------------------------
 # ShadowHook — ARM inline-hook движок. Резолв символов il2cpp делает наш
 # собственный elf_sym/.dynsym-резолвер, а shadowhook используется ТОЛЬКО для
 # самого inline-хука по абсолютному адресу (shadowhook_hook_func_addr).
@@ -27,10 +27,25 @@ set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "ShadowHook version (git tag bytedance/
 #      ломает требование «один .so в артефакте»;
 #   2) на 32-битном armeabi-v7a официальный bytesig ставит SIGSEGV-обработчик с
 #      флагом SA_EXPOSE_TAGBITS, который ядро отклоняет (EINVAL) — из-за этого
-#      shadowhook_init() падал с ошибкой 8 (INIT_SIGSEGV). Флаг убираем патчем,
-#      см. cmake/patch-bytesig.cmake. Апстрим-баг:
-#      https://github.com/bytedance/android-inline-hook/issues/78
+#      shadowhook_init() падал с ошибкой 8 (INIT_SIGSEGV);
 #   3) их таргет собирается с -Weverything -Werror и ломается на свежем Clang.
+#
+# Плата за «один .so» — два патча апстрима, оба в cmake/patch-shadowhook.cmake:
+#   * common/bytesig.c — снять SA_EXPOSE_TAGBITS  (ошибка 8,  INIT_SIGSEGV);
+#   * shadowhook.c     — отключить linker-модуль  (ошибка 12, INIT_LINKER).
+#
+# Про ошибку 12 подробнее. sh_linker_init() хукает soinfo::call_constructors()
+# и затем делает dlopen("libshadowhook_nothing.so"), чтобы на свежезагруженной
+# библиотеке просканировать раскладку полей struct soinfo. Этот служебный .so мы
+# намеренно не поставляем (см. п.1), поэтому dlopen всегда возвращает NULL,
+# sh_linker_init() всегда -1, shadowhook_init() всегда отдаёт INIT_LINKER, и
+# дальше каждый hook-вызов отбивается внутри shadowhook_check_avail().
+# Linker-модуль нужен ровно для двух вещей: pending-хуки по имени символа
+# (shadowhook_hook_sym_name для ещё не загруженных .so) и dl_init/dl_fini-
+# колбэки. Мы не используем ни то, ни другое — только shadowhook_hook_func_addr
+# по готовому адресу внутри уже загруженной libil2cpp.so, — поэтому просто не
+# инициализируем этот модуль.
+#
 # SOURCE_SUBDIR указывает на каталог без CMakeLists.txt -> FetchContent только
 # скачивает и патчит исходники, не подключая таргеты апстрима в нашу сборку.
 include(FetchContent)
@@ -42,8 +57,7 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
     SOURCE_SUBDIR  shadowhook   # populate-only, таргеты апстрима не подключаем
     PATCH_COMMAND  ${CMAKE_COMMAND} -E chdir shadowhook/src/main/cpp
-                   ${CMAKE_COMMAND} -DSRC=common/bytesig.c
-                   -P "${CMAKE_CURRENT_LIST_DIR}/cmake/patch-bytesig.cmake"
+                   ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_LIST_DIR}/cmake/patch-shadowhook.cmake"
 )
 FetchContent_MakeAvailable(android_inline_hook)
 
