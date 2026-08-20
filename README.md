@@ -11,7 +11,7 @@ A single native library, `libopg3d.so`, is loaded into the game process and hook
 - **AppID redirect.** At startup the game runs `Switcher.SetUpPhoton -> SelectPhotonAppId -> ServerSettings.UseCloud(...)`. `SelectPhotonAppId` picks one of several encoded AppIDs from `HiddenSettings`, consults a local kill-switch value and the APK signature, so a late write into `PhotonServerSettings.AppID` would simply be overwritten. The mod hooks the **source of the value** instead: when `PHOTON_APP_ID` is compiled in, the original selection path is skipped and the game receives the AppID of our own Photon Cloud application. Everything downstream (PUN logic, matchmaking, rooms, RPC) keeps working unchanged.
 - **Fixed EU routing.** Before every connection attempt, the stock `ServerSettings.UseCloud(appId, CloudRegionCode.eu)` overload is called and the result is verified by read-back (`HostType == PhotonCloud`, `PreferredRegion == eu`, stored AppID matches). This eliminates the cold-start race of `UseCloudBestRegion` (which used to reject first launches with `32756 / Region none is not available`) and guarantees that all players land in the same regional room pool. EU is also the only allowed region on the Photon dashboard side.
 - **Dead-backend guard.** While a Photon session is active, `FriendsController.Update` — which on this build calls `PhotonNetwork.Disconnect` mid-handshake — is quarantined. When PUN is idle, the original method still runs. Manual disconnects, server-side disconnects, callbacks, rooms, RPC and sync are never replaced or faked.
-- **Release progression (13.2.1 branch).** The `ExperienceController` level getters return the build's real level cap, resolved at runtime from `MaxExpLevelsDefault.Length` and cross-checked against `HealthByLevel.Length`. `Storager.getInt("Coins"/"Gems")` always returns `999 999 999`, and writes to those keys are clamped to the same value. Save data is never rewritten — the pin happens at read time.
+- **Release progression grant (13.2.1 branch).** Once the main menu is up, the mod calls the game's own progression write paths: `ExperienceController.AddExperience` with the full exp-table total — the stock progression loop itself computes and saves the resulting level — and `BankController.AddCoins`/`AddGems`, which top Coins and Gems up to `999 999 999` through the stock bank code. Because the game writes the values into its own save, progress persists across restarts and survives removal of the library. Each currency top-up is verified by a read-back: if the balance does not move (storage layout changed), the grant marks a flag in Storager and disables itself instead of stacking invisible grants on every launch.
 - **Full connection tracing.** Every step of the Photon path is logged with sequence numbers, timestamps, thread ids and caller addresses, so any remaining failure is directly attributable.
 
 ## How it works
@@ -52,10 +52,12 @@ adb logcat -s OPG3D
 A healthy startup looks like:
 
 ```text
-init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression boost and connection tracing active
+init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression grant and connection tracing active
 appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
-boost: player level pinned to cap N (MaxExpLevelsDefault.Length=N, ...)
-boost: Storager.getInt("Coins") pinned to 999999999
+boost: progression grant armed (trigger=MainMenuController.Update, currency target=999999999, level via AddExperience)
+boost: player level 1 -> 38 via AddExperience(+... exp, cap 38, exp table read)
+boost: coins 15 -> 999999999 via BankController (target 999999999)
+boost: gems 10 -> 999999999 via BankController (target 999999999)
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 photon-status: 1024 (Connect) ...
 ui: ConnectionControl.OnConnectedToMaster state=16 ...
@@ -77,7 +79,7 @@ opg3d/src/main/cpp/
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override + network path tracing
 ├── cloud_guard.h             # fixed Photon Cloud (EU) routing + FriendsController quarantine
-├── player_boost.h            # release progression: max level + 999,999,999 coins/gems
+├── player_boost.h            # release progression grant: stock AddExperience + bank top-up
 ├── config.h                  # compile-time defaults, no credentials
 └── CMakeLists.txt            # pinned static ShadowHook + libopg3d.so
 ```
