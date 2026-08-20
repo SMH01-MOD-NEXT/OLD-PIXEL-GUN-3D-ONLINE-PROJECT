@@ -9,6 +9,7 @@
 #include "cloud_guard.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
+#include "legacy_gameplay.h"
 #include "log.h"
 #include "photon_hooks.h"
 #include "player_boost.h"
@@ -116,14 +117,16 @@ void* init_thread(void*) {
 
     // Install tracing first: cloud_guard intentionally calls the already-hooked
     // ServerSettings.UseCloud(appId, eu) entry so its before/after state is
-    // visible in the same diagnostic stream. player_boost is independent and
-    // simply shares the same hook engine.
+    // visible in the same diagnostic stream. The progression and legacy
+    // gameplay modules are independent and share only the hook engine.
     const bool photon_installed = photon::install_hooks();
     const bool guard_installed = cloud_guard::install_hooks();
     const bool boost_installed = player_boost::install_hooks();
-    if (photon_installed && guard_installed && boost_installed) {
-        LOGI("init: phase 0 ready — AppID override, Photon Cloud routing, "
-             "dead-backend guard, progression grant and connection tracing active");
+    const bool gameplay_installed = legacy_gameplay::install_hooks();
+    if (photon_installed && guard_installed && boost_installed &&
+        gameplay_installed) {
+        LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
+             "tutorial skip, local armory economy and upgrade timers active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -136,6 +139,10 @@ void* init_thread(void*) {
         if (!boost_installed) {
             LOGE("init: progression grant incomplete; level/currency grant "
                  "is not active");
+        }
+        if (!gameplay_installed) {
+            LOGE("init: legacy gameplay module incomplete; tutorial skip, "
+                 "detail-weapon purchases or upgrades may be unavailable");
         }
     }
 
