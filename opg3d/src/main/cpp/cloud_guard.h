@@ -241,12 +241,9 @@ inline bool hook_game_connect_squad(const MethodInfo* method) {
 inline void hook_friends_update(void* self, const MethodInfo* method) {
     const int32_t state = connection_state();
 
-    // Lazy application covers non-ConnectScene entry paths without touching
-    // PhotonNetwork statics during the early initialization thread.
-    if ((state == 1 || state == 15) &&
-        !g_cloud_ready.load(std::memory_order_acquire)) {
-        force_cloud("FriendsController.Update/idle", false);
-    }
+    // Do not touch PhotonNetwork settings from this callback while idle: this
+    // component can start before Switcher.SetUpPhoton initializes static fields.
+    // Cloud routing is re-applied by the explicit connection-entry hooks below.
 
     if (should_quarantine_friends_update(state)) {
         const uint32_t count = g_quarantined_updates.fetch_add(
