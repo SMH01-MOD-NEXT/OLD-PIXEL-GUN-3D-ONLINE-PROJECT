@@ -66,7 +66,12 @@ inline void* g_max_exp_levels_field = nullptr;
 inline void* g_health_by_level_field = nullptr;
 
 inline constexpr int32_t kCurrencyTarget = 999999999;
-inline constexpr int32_t kFallbackLevelCap = 38;
+
+// 38 is the last real player level in this release. The experience table is
+// indexed from level 0, so its length is 39 and must never be used as a level
+// target: asking for 39 makes the grant loop forever on a level that cannot
+// be reached. Every computed cap is clamped to this value.
+inline constexpr int32_t kLevelCap = 38;
 inline constexpr int32_t kFallbackExpGrant = 9999999;
 inline constexpr int32_t kMaxExpGrant = 0x3FFFFFFF;
 inline constexpr uint32_t kLevelIntervalFrames = 5;
@@ -110,9 +115,10 @@ int32_t read_array_length(void* array) {
     return length;
 }
 
-// MaxExpLevelsDefault contains entries for levels 0..38, hence a length of 39
-// means the final valid player level is 38. HealthByLevel is used as a safety
-// cross-check because gameplay indexes it with the current level.
+// MaxExpLevelsDefault contains entries for levels 0..38, so a length of 39
+// still means the final valid player level is 38. HealthByLevel is used as a
+// safety cross-check because gameplay indexes it with the current level, and
+// the result is finally clamped to kLevelCap.
 bool exp_table_info(int32_t* out_cap, int32_t* out_grant) {
     void* exp_array = read_static_field(g_max_exp_levels_field);
     const int32_t exp_length = read_array_length(exp_array);
@@ -124,7 +130,9 @@ bool exp_table_info(int32_t* out_cap, int32_t* out_grant) {
     if (health_length > 1 && health_length < safe_length) {
         safe_length = health_length;
     }
-    *out_cap = safe_length - 1;
+    int32_t cap = safe_length - 1;
+    if (cap > kLevelCap) cap = kLevelCap;
+    *out_cap = cap;
 
     int64_t total = 0;
     const char* elements = static_cast<const char*>(exp_array) + 0x10;
@@ -175,9 +183,10 @@ int32_t current_level() {
 void grant_level() {
     if (g_level_done) return;
 
-    int32_t cap = kFallbackLevelCap;
+    int32_t cap = kLevelCap;
     int32_t grant = kFallbackExpGrant;
     const bool have_table = exp_table_info(&cap, &grant);
+    if (cap > kLevelCap) cap = kLevelCap;
     const int32_t before = current_level();
     if (before >= cap) {
         g_level_done = true;
@@ -350,7 +359,7 @@ inline bool install_hooks() {
     }
     if (detail::g_max_exp_levels_field == nullptr) {
         LOGW("boost: MaxExpLevelsDefault not found; level cap will use %d",
-             detail::kFallbackLevelCap);
+             detail::kLevelCap);
     }
     if (!ok) {
         LOGE("boost: progression targets incomplete; grant disabled");
@@ -390,7 +399,7 @@ inline bool install_hooks() {
 
     LOGI("boost: persisted grant armed (trigger=%s.Update, level target=%d, "
          "currency target=%d, level-up UI=skipped)",
-         chosen, detail::kFallbackLevelCap, detail::kCurrencyTarget);
+         chosen, detail::kLevelCap, detail::kCurrencyTarget);
     return true;
 }
 
