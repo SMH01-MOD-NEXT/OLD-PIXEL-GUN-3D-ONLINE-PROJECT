@@ -2,21 +2,25 @@
 
 ## Подтверждённая причина цикла
 
-Расширенная трассировка показала одну и ту же цепочку на каждой попытке:
+Расширенная трассировка на 12.5.0 показала одну и ту же цепочку на каждой
+попытке:
 
 ```text
 ConnectUsingSettings -> StatusCode.Connect -> ClientState.Authenticating
--> FriendsController.Update+0x310 -> PhotonNetwork.Disconnect
+-> FriendsController.Update -> PhotonNetwork.Disconnect
 ```
 
-`FriendsController.Update+0x310` определён по `dump.cs` из runtime call-site
-`libil2cpp.so+0xAA23FC`. Это локальный вызов игры, а не разрыв со стороны
-Photon.
+На 12.5.0 call-site был определён по `dump.cs` из runtime-адреса
+`libil2cpp.so+0xAA23FC` как `FriendsController.Update+0x310`. Абсолютные
+смещения относятся к конкретной сборке; в 13.2.1 они иные, поэтому гард
+ставит хук на метод `FriendsController.Update` целиком и от смещения не
+зависит. Это локальный вызов игры, а не разрыв со стороны Photon.
 
-Одновременно `ServerSettings` после `Switcher.SetUpPhoton` оставался в режиме
-`SelfHosted` с адресом `rilisoft-us.exitgamescloud.com:5055`. Режим сборки
-`PHOTON_MODE=cloud` раньше менял только AppID и ошибочно сохранял выбранный
-игрой маршрут.
+Одновременно на 12.5.0 `ServerSettings` после `Switcher.SetUpPhoton` оставался
+в режиме `SelfHosted` с мёртвым адресом `rilisoft-us.exitgamescloud.com:5055`
+(в бинаре 13.2.1 этой строки уже нет — дефолтный маршрут другой, но официальный
+бэкенд этой версии так же отключён). Режим сборки `PHOTON_MODE=cloud` раньше
+менял только AppID и ошибочно сохранял выбранный игрой маршрут.
 
 ## Что делает guard
 

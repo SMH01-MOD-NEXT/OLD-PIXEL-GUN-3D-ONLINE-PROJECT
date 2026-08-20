@@ -4,7 +4,8 @@
 #include <cstdint>
 #include <string>
 
-// Минимальная обёртка над экспортируемым C API IL2CPP из PG3D 12.5.0.
+// Минимальная обёртка над экспортируемым C API IL2CPP из PG3D 13.2.1
+// (metadata v22 — та же major-версия, что и у 12.5.0).
 // Символы резолвятся напрямую из уже загруженной libil2cpp.so: Android linker
 // namespace не обязан делать их видимыми обычному dlsym().
 namespace il2cpp {

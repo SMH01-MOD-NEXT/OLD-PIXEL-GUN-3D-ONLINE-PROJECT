@@ -1,12 +1,12 @@
 # OLD PIXEL GUN 3D ONLINE PROJECT
 
-Открытый GPLv3-проект по восстановлению онлайна Pixel Gun 3D 12.5.0
+Открытый GPLv3-проект по восстановлению онлайна Pixel Gun 3D 13.2.1
 (`armeabi-v7a`) через **своё** приложение Photon Cloud. Это не чит: библиотека
 не подключает игрока к официальному онлайну и не меняет игровой баланс.
 
 ## Что исправляет библиотека
 
-В 12.5.0 игра не просто читает `PhotonNetwork.PhotonServerSettings.AppID`.
+В 13.2.1 игра не просто читает `PhotonNetwork.PhotonServerSettings.AppID`.
 При запуске вызывается следующая цепочка:
 
 ```text
@@ -39,14 +39,16 @@ Switcher.SetUpPhoton(HiddenSettings)
   хардкод абсолютных адресов;
 - если обязательный метод не найден, патч **fail-closed** и не пишет по
   предположительному RVA;
-- ARM32 inline-hook выполняет [Dobby](https://github.com/jmpews/Dobby),
-  статически собранный из зафиксированного commit
-  `5dfc8546954ce3b3198132ab13fddb89ee92cdd7` (Apache-2.0);
-- ShadowHook и его linker/bytesig-модули не используются.
+- ARM32 inline-hook выполняет [ShadowHook](https://github.com/bytedance/android-inline-hook),
+  статически собранный из зафиксированного тега `v2.0.1` (MIT), с двумя
+  локальными патчами (см. `opg3d/src/main/cpp/cmake/patch-shadowhook.cmake`);
+- Dobby не используется.
 
-Dobby нужен только как небольшой механизм перенаправления ARM-кода. Его shared
-library не попадает в результат: в `libopg3d.so` статически встраивается
-`dobby_static`, поэтому конечный артефакт по-прежнему состоит из **одного файла**.
+ShadowHook нужен только как механизм перенаправления ARM-кода по уже готовому
+абсолютному адресу (`shadowhook_hook_func_addr`); резолв символов il2cpp
+делает наш собственный `elf_sym`. Shared library ShadowHook не попадает в
+результат: исходники собираются статически внутрь `libopg3d.so`, поэтому
+конечный артефакт по-прежнему состоит из **одного файла**.
 Сведения о лицензии: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Фаза 0: полная диагностика подключения
@@ -60,7 +62,8 @@ library не попадает в результат: в `libopg3d.so` стати
 - `ConnectionControl.OnFailedToConnect`, `OnDisconnected`,
   `OnConnectedToMaster`.
 
-Включаются `PhotonLogLevel.Full` и `PhotonPeer.DebugOut = ALL`. Логи показывают:
+Включаются `PhotonLogLevel.Full` и `PhotonPeer.DebugOut = ALL` (в 13.2.1 это
+plain-поле класса `PhotonPeer`, пишется напрямую через metadata). Логи показывают:
 
 - реальный путь подключения и числовые состояния клиента;
 - адрес/порт, протокол, регион и AppVersion матчмейкинга;
@@ -82,8 +85,8 @@ adb logcat -s OPG3D
 init: IL2CPP API resolved
 hook: installed Switcher.SelectPhotonAppId/1
 hook: installed ... managed hooks (core=OK)
-init: phase 0 ready — AppID selection override and connection tracing active
-appid: SelectPhotonAppId #1 -> configured AppID {len=36 fnv1a=...}
+init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard and connection tracing active
+appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
 net: ConnectUsingSettings begin ...
 photon-status: 1024 (Connect) ...
 ```
@@ -103,7 +106,8 @@ Settings -> Secrets and variables -> Actions -> PHOTON_APP_ID
 
 Workflow передаёт его как `ORG_GRADLE_PROJECT_PHOTON_APP_ID`. GitHub маскирует
 значение в build log, а workflow публикует артефакт
-`libopg3d-armeabi-v7a`, внутри которого только `libopg3d.so`.
+`libopg3d-armeabi-v7a`, внутри которого только `libopg3d.so`. CI собирает
+ветки `main` и `13.2.1`.
 
 ### Локальная сборка
 
@@ -116,7 +120,7 @@ gradle :opg3d:assembleRelease \
 
 Проект можно открыть корнем в Android Studio. ABI зафиксирован на
 `armeabi-v7a`. Во время первого configure CMake скачает ровно зафиксированный
-исходник Dobby; после этого он остаётся в Gradle/CMake cache.
+исходник ShadowHook; после этого он остаётся в Gradle/CMake cache.
 
 Сборка без секрета допустима: все диагностические хуки ставятся, но
 `SelectPhotonAppId` работает в passthrough-режиме и пишет предупреждение.
@@ -134,15 +138,15 @@ opg3d/src/main/cpp/
 ├── main.cpp                  # ожидание IL2CPP, attach, установка хуков
 ├── elf_sym.cpp/.h            # поиск экспортов libil2cpp.so в памяти
 ├── il2cpp.cpp/.h             # metadata API, managed strings/fields
-├── hook.cpp/.h               # fail-closed Dobby wrapper
+├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override + сетевой trace
 ├── config.h                  # compile-time defaults без credential
-└── CMakeLists.txt            # pinned Dobby static + libopg3d.so
+└── CMakeLists.txt            # pinned ShadowHook static + libopg3d.so
 ```
 
 ## Ограничения текущей стадии
 
-- целевая сборка: PG3D 12.5.0, Android ARMv7, IL2CPP metadata v22;
+- целевая сборка: PG3D 13.2.1, Android ARMv7, IL2CPP metadata v22;
 - первая цель — доказать успешный Photon handshake и точно увидеть оставшиеся
   отказы мёртвого backend;
 - HTTP/backend-эмуляция и manual connect будут добавляться только если новые
@@ -154,13 +158,14 @@ opg3d/src/main/cpp/
 - [x] Разбор IL2CPP 12.5.0 и фактической цепочки выбора AppID
 - [x] Независимый hook `SelectPhotonAppId` без Storager-костылей
 - [x] Полная трассировка PUN/Photon connection path
+- [x] Порт хуков на 13.2.1 (метаданные/enum'ы/поля сверены по дампу 13.2.1)
 - [ ] Тест Photon handshake на устройстве
 - [ ] Обход конкретных мёртвых backend-гейтов — только по подтверждённому логу
 - [ ] Тест комнаты/боя 1×1 на двух устройствах
 
 ## Лицензия и дисклеймер
 
-Собственный код проекта — GPLv3, см. [LICENSE](LICENSE). Dobby — Apache-2.0.
+Собственный код проекта — GPLv3, см. [LICENSE](LICENSE). ShadowHook — MIT.
 Проект не аффилирован с Cubic Games/Photon и предназначен для совместимого
 фанатского онлайна уже отключённой версии игры на инфраструктуре владельца
 сборки.

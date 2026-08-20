@@ -45,7 +45,6 @@ using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
 using GetIntFn = int32_t (*)(const MethodInfo* method);
 using GetStringFn = ManagedString* (*)(const MethodInfo* method);
 using GetObjectFn = void* (*)(const MethodInfo* method);
-using SetDebugOutFn = void (*)(void* self, int32_t level, const MethodInfo* method);
 
 SelectPhotonAppIdFn g_select_app_id = nullptr;
 SetUpPhotonFn g_set_up_photon = nullptr;
@@ -293,9 +292,14 @@ void log_auth_snapshot(const char* point) {
     int32_t type = -1;
     ManagedString* token = nullptr;
     ManagedString* user_id = nullptr;
+    // Token и UserId здесь — auto-property: физические поля называются
+    // <Token>k__BackingField / <UserId>k__BackingField (одинаково в 12.5.0 и
+    // 13.2.1). Сам класс AuthenticationValues в 13.2.1 живёт в глобальном
+    // namespace вместо ExitGames.Client.Photon, но мы читаем поля через
+    // object_get_class() инстанса, поэтому переезд namespace'а нам неважен.
     const bool has_type = read_field(auth, "authType", &type);
-    const bool has_token = read_field(auth, "token", &token);
-    const bool has_user = read_field(auth, "userId", &user_id);
+    const bool has_token = read_field(auth, "<Token>k__BackingField", &token);
+    const bool has_user = read_field(auth, "<UserId>k__BackingField", &user_id);
     const int32_t token_len = (has_token && token != nullptr && il2cpp::string_length)
                                   ? il2cpp::string_length(token) : 0;
     const int32_t user_len = (has_user && user_id != nullptr && il2cpp::string_length)
@@ -309,8 +313,7 @@ void log_auth_snapshot(const char* point) {
 void enable_verbose_photon_logs() {
     static void* log_level_field = nullptr;
     static void* peer_field = nullptr;
-    static SetDebugOutFn set_debug = nullptr;
-    static void* set_debug_method = nullptr;
+    static void* debug_out_field = nullptr;
 
     if (log_level_field == nullptr) {
         log_level_field = il2cpp::find_field("", "PhotonNetwork", "logLevel");
@@ -328,20 +331,29 @@ void enable_verbose_photon_logs() {
         il2cpp::field_static_get_value(peer_field, &peer);
     }
 
-    if (set_debug == nullptr) {
-        set_debug_method = il2cpp::find_method_info(
-            "ExitGames.Client.Photon", "PhotonPeer", "set_DebugOut", 1);
-        set_debug = reinterpret_cast<SetDebugOutFn>(
-            il2cpp::method_pointer(set_debug_method));
+    // В 13.2.1 у PhotonPeer нет метода set_DebugOut — DebugOut это обычное
+    // поле (dump.cs: `public DebugLevel DebugOut; // 0x1C`; сеттер существует
+    // только у ChatClient и к PhotonPeer отношения не имеет). FieldInfo берём
+    // у объявляющего класса PhotonPeer: il2cpp_class_get_field_from_name по
+    // базовым классам не идёт, а offset поля валиден и для инстанса
+    // NetworkingPeer. DebugLevel — byte-backed enum, пишем ровно один байт.
+    if (debug_out_field == nullptr) {
+        debug_out_field = il2cpp::find_field(
+            "ExitGames.Client.Photon", "PhotonPeer", "DebugOut");
     }
-    if (peer != nullptr && set_debug != nullptr) {
-        set_debug(peer, 5, set_debug_method);
+    if (peer != nullptr && debug_out_field != nullptr &&
+        il2cpp::field_set_value != nullptr) {
+        uint8_t all = 5; // DebugLevel.ALL
+        il2cpp::field_set_value(peer, debug_out_field, &all);
         if (!g_verbose_ready.exchange(true)) {
             LOGI("trace: PhotonLogLevel=Full, PhotonPeer.DebugOut=ALL");
         }
     }
 }
 
+// Имена — по enum StatusCode из 13.2.1. Отличия от 12.5.0: добавились входящие
+// предупреждения 1033/1035, QueueSentWarning переехал 1033 -> 1037, а 1039
+// переименован из InternalReceiveException в ExceptionOnReceive.
 const char* status_name(int32_t status) {
     switch (status) {
         case 1022: return "SecurityExceptionOnConnect";
@@ -353,8 +365,10 @@ const char* status_name(int32_t status) {
         case 1029: return "QueueOutgoingUnreliableWarning";
         case 1030: return "SendError";
         case 1031: return "QueueOutgoingAcksWarning";
-        case 1033: return "QueueSentWarning";
-        case 1039: return "InternalReceiveException";
+        case 1033: return "QueueIncomingReliableWarning";
+        case 1035: return "QueueIncomingUnreliableWarning";
+        case 1037: return "QueueSentWarning";
+        case 1039: return "ExceptionOnReceive";
         case 1040: return "TimeoutDisconnect";
         case 1041: return "DisconnectByServer";
         case 1042: return "DisconnectByServerUserLimit";
@@ -536,7 +550,7 @@ void hook_on_status_changed(void* self, int32_t status,
 }
 
 // OperationResponse в этой сборке Photon — ССЫЛОЧНЫЙ тип
-// (dump.cs L186143: `public class OperationResponse // TypeDefIndex: 2621`),
+// (dump.cs 13.2.1 L197596: `public class OperationResponse // TypeDefIndex: 2628`),
 // поэтому параметр приходит обычным Il2CppObject* и read_field() применим.
 // Если апстрим когда-нибудь сделает его struct, тут появится указатель на
 // сырую копию без заголовка объекта и object_get_class() читать будет НЕЛЬЗЯ.
@@ -604,7 +618,7 @@ bool optional(const hook::ManagedMethod& target, void* replace, void** original,
 
 bool install_hooks() {
 #if defined(__ANDROID__)
-    static_assert(sizeof(void*) == 4, "PG3D 12.5.0 target must be armeabi-v7a");
+    static_assert(sizeof(void*) == 4, "PG3D 13.2.1 target must be armeabi-v7a");
 #endif
 
     LOGI("hook: engine %s; resolving targets through IL2CPP metadata",
