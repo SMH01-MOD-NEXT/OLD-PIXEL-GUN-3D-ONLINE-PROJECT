@@ -2,8 +2,8 @@
 
 namespace photon {
 
-// Ставит обязательный хук выбора AppID и диагностические хуки сетевого пути.
-// Вызывать один раз из потока, присоединённого к IL2CPP runtime.
+// Installs the mandatory AppID-selection hook plus the network-path
+// diagnostic hooks. Call once from a thread attached to the IL2CPP runtime.
 bool install_hooks();
 
 } // namespace photon

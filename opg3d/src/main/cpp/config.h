@@ -1,9 +1,9 @@
 #pragma once
 
-// Значения приходят только на этапе сборки:
-// GitHub Actions: ORG_GRADLE_PROJECT_PHOTON_APP_ID из repository secret.
-// Локально:       gradle ... -PPHOTON_APP_ID=...
-// Credential никогда не хранится в исходниках и никогда целиком не логируется.
+// Values are provided at build time only:
+// GitHub Actions: ORG_GRADLE_PROJECT_PHOTON_APP_ID from a repository secret.
+// Local:          gradle ... -PPHOTON_APP_ID=...
+// The credential is never stored in the sources and never logged in full.
 #ifndef PHOTON_APP_ID
 #define PHOTON_APP_ID ""
 #endif

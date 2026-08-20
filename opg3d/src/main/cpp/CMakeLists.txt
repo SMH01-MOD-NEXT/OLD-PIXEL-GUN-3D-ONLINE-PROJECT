@@ -4,50 +4,51 @@ project(opg3d C CXX ASM)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Статическая libshadowhook линкуется внутрь SHARED libopg3d.so -> нужен PIC.
+# Static libshadowhook is linked into the SHARED libopg3d.so -> PIC is required.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Конфигурация приходит из Gradle. AppID является credential и никогда не
-# хранится в репозитории.
+# Configuration comes from Gradle. The AppID is a credential and is never
+# stored in the repository.
 set(PHOTON_APP_ID "" CACHE STRING "Photon Cloud AppID (CI secret / local -P)")
 set(PHOTON_MODE "cloud" CACHE STRING "cloud | selfhosted")
 set(PHOTON_SERVER_ADDRESS "" CACHE STRING "Optional fixed/self-hosted address")
 set(PHOTON_SERVER_PORT "5055" CACHE STRING "Optional fixed/self-hosted port")
 set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "ShadowHook version (git tag bytedance/android-inline-hook)")
 
-# --- ShadowHook (bytedance): исходники + наши патчи -----------------------------
-# ShadowHook — ARM inline-hook движок. Резолв символов il2cpp делает наш
-# собственный elf_sym/.dynsym-резолвер, а shadowhook используется ТОЛЬКО для
-# самого inline-хука по абсолютному адресу (shadowhook_hook_func_addr).
+# --- ShadowHook (bytedance): sources + our patches ----------------------------
+# ShadowHook is the ARM inline-hook engine. IL2CPP symbol resolution is done
+# by our own elf_sym/.dynsym resolver; shadowhook is used ONLY for the inline
+# hook itself at an absolute address (shadowhook_hook_func_addr).
 #
-# Собираем shadowhook статически сами и линкуем внутрь единственного артефакта
-# libopg3d.so (CI требует ровно один .so). Почему НЕ prefab/AAR, как советует
-# апстрим:
-#   1) prefab тянет отдельные libshadowhook.so + libshadowhook_nothing.so и
-#      ломает требование «один .so в артефакте»;
-#   2) на 32-битном armeabi-v7a официальный bytesig ставит SIGSEGV-обработчик с
-#      флагом SA_EXPOSE_TAGBITS, который ядро отклоняет (EINVAL) — из-за этого
-#      shadowhook_init() падал с ошибкой 8 (INIT_SIGSEGV);
-#   3) их таргет собирается с -Weverything -Werror и ломается на свежем Clang.
+# We build shadowhook statically ourselves and link it into the single
+# libopg3d.so artifact (CI requires exactly one .so). Why NOT the upstream
+# prefab/AAR:
+#   1) prefab pulls in separate libshadowhook.so + libshadowhook_nothing.so
+#      and breaks the "one .so in the artifact" requirement;
+#   2) on 32-bit armeabi-v7a the official bytesig installs a SIGSEGV handler
+#      with the SA_EXPOSE_TAGBITS flag, which the kernel rejects (EINVAL) —
+#      that's why shadowhook_init() used to fail with error 8 (INIT_SIGSEGV);
+#   3) their target builds with -Weverything -Werror and breaks on newer Clang.
 #
-# Плата за «один .so» — два патча апстрима, оба в cmake/patch-shadowhook.cmake:
-#   * common/bytesig.c — снять SA_EXPOSE_TAGBITS  (ошибка 8,  INIT_SIGSEGV);
-#   * shadowhook.c     — отключить linker-модуль  (ошибка 12, INIT_LINKER).
+# The price for "one .so" is two upstream patches, both in
+# cmake/patch-shadowhook.cmake:
+#   * common/bytesig.c — drop SA_EXPOSE_TAGBITS  (error 8,  INIT_SIGSEGV);
+#   * shadowhook.c     — disable the linker module (error 12, INIT_LINKER).
 #
-# Про ошибку 12 подробнее. sh_linker_init() хукает soinfo::call_constructors()
-# и затем делает dlopen("libshadowhook_nothing.so"), чтобы на свежезагруженной
-# библиотеке просканировать раскладку полей struct soinfo. Этот служебный .so мы
-# намеренно не поставляем (см. п.1), поэтому dlopen всегда возвращает NULL,
-# sh_linker_init() всегда -1, shadowhook_init() всегда отдаёт INIT_LINKER, и
-# дальше каждый hook-вызов отбивается внутри shadowhook_check_avail().
-# Linker-модуль нужен ровно для двух вещей: pending-хуки по имени символа
-# (shadowhook_hook_sym_name для ещё не загруженных .so) и dl_init/dl_fini-
-# колбэки. Мы не используем ни то, ни другое — только shadowhook_hook_func_addr
-# по готовому адресу внутри уже загруженной libil2cpp.so, — поэтому просто не
-# инициализируем этот модуль.
+# More on error 12. sh_linker_init() hooks soinfo::call_constructors() and
+# then dlopen()s "libshadowhook_nothing.so" to scan the field layout of struct
+# soinfo on a freshly loaded library. We deliberately do not ship that helper
+# .so (see 1), so dlopen always returns NULL, sh_linker_init() always returns
+# -1, shadowhook_init() always reports INIT_LINKER, and every hook call is then
+# rejected inside shadowhook_check_avail().
+# The linker module exists for exactly two things: pending hooks by symbol name
+# (shadowhook_hook_sym_name on not-yet-loaded .so) and dl_init/dl_fini
+# callbacks. We use neither — only shadowhook_hook_func_addr on a ready address
+# inside the already loaded libil2cpp.so — so we simply never init that module.
 #
-# SOURCE_SUBDIR указывает на каталог без CMakeLists.txt -> FetchContent только
-# скачивает и патчит исходники, не подключая таргеты апстрима в нашу сборку.
+# SOURCE_SUBDIR points at a directory without CMakeLists.txt -> FetchContent
+# only downloads and patches the sources without adding upstream targets to
+# our build.
 include(FetchContent)
 FetchContent_Declare(
     android_inline_hook
@@ -55,7 +56,7 @@ FetchContent_Declare(
     GIT_TAG        ${SHADOWHOOK_TAG}
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   TRUE
-    SOURCE_SUBDIR  shadowhook   # populate-only, таргеты апстрима не подключаем
+    SOURCE_SUBDIR  shadowhook   # populate-only, upstream targets stay out
     PATCH_COMMAND  ${CMAKE_COMMAND} -E chdir shadowhook/src/main/cpp
                    ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_LIST_DIR}/cmake/patch-shadowhook.cmake"
 )
@@ -79,7 +80,7 @@ file(GLOB SH_SRC
 )
 add_library(shadowhook_static STATIC ${SH_SRC})
 target_compile_features(shadowhook_static PRIVATE c_std_11)
-# Чужой код: глушим предупреждения и оптимизируем по размеру.
+# Third-party code: silence warnings and optimize for size.
 target_compile_options(shadowhook_static PRIVATE -Os -w)
 target_include_directories(shadowhook_static
     PUBLIC  ${SH_SRC_DIR}/include
@@ -92,7 +93,7 @@ target_include_directories(shadowhook_static
 )
 target_link_libraries(shadowhook_static PUBLIC log dl)
 
-# --- Наша библиотека -----------------------------------------------------------
+# --- Our library --------------------------------------------------------------
 add_library(opg3d SHARED
     main.cpp
     elf_sym.cpp
@@ -103,37 +104,38 @@ add_library(opg3d SHARED
 
 target_include_directories(opg3d PRIVATE .)
 
-# -fno-exceptions здесь не про размер бинарника, а про совместимость
-# разматывателей стека. Не убирать.
+# -fno-exceptions is not about binary size but about stack-unwinder
+# compatibility. Do not remove it.
 #
-# В одном процессе живут ДВА разных ARM EHABI unwinder'а:
-#   * libil2cpp.so несёт GNU-совместимый (___Unwind_RaiseException ->
-#     __gnu_Unwind_RaiseException). Управляемые исключения IL2CPP реализует
-#     через C++ исключения, поэтому любой NullReference/SocketException внутри
-#     игрового метода поднимает именно его;
-#   * мы статически линкуем LLVM libc++abi + libunwind, иначе не выйдет
-#     «один .so» в артефакте.
+# ONE process hosts TWO different ARM EHABI unwinders:
+#   * libil2cpp.so carries the GNU-compatible one (___Unwind_RaiseException ->
+#     __gnu_Unwind_RaiseException). IL2CPP implements managed exceptions via
+#     C++ exceptions, so any NullReference/SocketException inside a game method
+#     is raised through exactly that unwinder;
+#   * we statically link LLVM libc++abi + libunwind, otherwise the "one .so"
+#     artifact would not be possible.
 #
-# Их _Unwind_Context* несовместимы между собой. Пока в наших функциях есть
-# landing pad'ы (а они появляются от любого объекта с деструктором — например
-# std::string в хуках), Clang выдаёт для кадра exidx-запись в generic model со
-# ссылкой PREL31 на НАШ __gxx_personality_v0. Разматыватель libil2cpp доходит
-# до кадра хука, читает эту ссылку и зовёт нашу personality со СВОИМ
-# контекстом; LLVM-овый _Unwind_VRS_Set принимает его за unw_cursor_t ->
-# SIGSEGV в __unw_set_reg (в логе: fault addr 0x7).
+# Their _Unwind_Context* are mutually incompatible. While our functions have
+# landing pads (and any object with a destructor creates one — e.g. std::string
+# in the hooks), Clang emits an exidx entry for the frame in generic model with
+# a PREL31 reference to OUR __gxx_personality_v0. The libil2cpp unwinder
+# reaches the hook frame, reads that reference and calls our personality with
+# ITS context; LLVM's _Unwind_VRS_Set mistakes it for an unw_cursor_t ->
+# SIGSEGV in __unw_set_reg (in the log: fault addr 0x7).
 #
-# Ни try/catch в хуке, ни проверки указателей это не лечат: падение происходит
-# в фазе поиска обработчика, ДО того как какой-либо catch мог бы отработать.
+# Neither try/catch in the hook nor pointer checks fix this: the crash happens
+# during the handler-search phase, BEFORE any catch could run.
 #
-# С -fno-exceptions landing pad'ов и LSDA нет, поэтому наши кадры описываются
-# compact model, а её personality (__aeabi_unwind_cpp_pr0/1/2) разматыватель
-# libil2cpp резолвит внутри себя и вызывает со своим же контекстом —
-# исключение проходит сквозь кадр хука корректно, как сквозь обычный C-код.
+# With -fno-exceptions there are no landing pads and no LSDA, so our frames are
+# described by the compact model, whose personality (__aeabi_unwind_cpp_pr0/1/2)
+# the libil2cpp unwinder resolves inside itself and calls with its own
+# context — the exception passes through the hook frame correctly, like through
+# plain C code.
 #
-# -funwind-tables обязателен явно: без таблиц кадры получили бы
-# EXIDX_CANTUNWIND, разматывание упёрлось бы в наш кадр и упало уже в
-# std::terminate. Регрессию стережёт шаг "Assert no LLVM C++ personality"
-# в .github/workflows/build.yml.
+# -funwind-tables is required explicitly: without tables the frames would get
+# EXIDX_CANTUNWIND, unwinding would stop at our frame and fail in
+# std::terminate. The regression is guarded by the "Assert no LLVM C++
+# personality" step in .github/workflows/build.yml.
 target_compile_options(opg3d PRIVATE
     -O2
     -fno-exceptions

@@ -2,20 +2,21 @@
 
 #include <cstdint>
 
-// Поиск экспортов уже загруженной библиотеки без dlopen/dlsym.
+// Finds exports of an already loaded library without dlopen/dlsym.
 //
-// Зачем своё, а не dlsym: игра грузит libil2cpp.so через System.loadLibrary
-// (RTLD_LOCAL + линкерные namespace'ы Android 7+), поэтому dlsym(RTLD_DEFAULT) её
-// символов не видит, а dlopen из чужого namespace может вернуть отказ.
-// Образ библиотеки уже отображён в наше адресное пространство, так что таблицу
-// символов можно прочитать напрямую — это надёжнее и без внешних зависимостей.
+// Why not dlsym: the game loads libil2cpp.so via System.loadLibrary
+// (RTLD_LOCAL + Android 7+ linker namespaces), so dlsym(RTLD_DEFAULT) cannot
+// see its symbols, and dlopen from a foreign namespace may be refused. The
+// library image is already mapped into our address space, so its symbol table
+// can simply be read directly — more reliable and with no external
+dependencies.
 namespace elfsym {
 
-// Ищет загруженную библиотеку по имени файла (например "libil2cpp.so").
-// При успехе кладёт в base_out адрес загрузки (load bias).
+// Finds a loaded library by file name (e.g. "libil2cpp.so").
+// On success, writes the load address (load bias) to base_out.
 bool find_library(const char* soname, uintptr_t* base_out);
 
-// Резолвит экспортируемый символ библиотеки. nullptr, если не найден.
+// Resolves an exported symbol of the library. nullptr if not found.
 void* find_symbol(const char* soname, const char* symbol);
 
 } // namespace elfsym

@@ -12,11 +12,12 @@
 namespace hook {
 namespace {
 
-// shadowhook инициализируется один раз на процесс. UNIQUE-режим выбран
-// осознанно: каждый адрес хукается ровно один раз, а orig_addr в этом режиме —
-// это напрямую вызываемый трамплин к оригиналу (как было у DobbyHook). Поэтому
-// прокси-функции в photon_hooks.cpp вызывают оригинал напрямую, без обёрток
-// SHADOWHOOK_CALL_PREV / SHADOWHOOK_STACK_SCOPE, которые нужны в SHARED-режиме.
+// shadowhook is initialized once per process. UNIQUE mode is a deliberate
+// choice: each address is hooked exactly once, and in this mode orig_addr is
+// a directly callable trampoline to the original (the same contract DobbyHook
+// used to have). That's why the proxy functions in photon_hooks.cpp call the
+// original directly, without the SHADOWHOOK_CALL_PREV / SHADOWHOOK_STACK_SCOPE
+// wrappers that SHARED mode would require.
 std::once_flag g_engine_once;
 bool g_engine_ready = false;
 
@@ -83,11 +84,11 @@ bool install(const ManagedMethod& target, void* replacement, void** original,
         return false;
     }
 
-    // Fail-closed. Прокси в photon_hooks.cpp вызывают оригинал безусловно, так
-    // что установленный хук с пустым orig_addr — это гарантированный SIGSEGV при
-    // первом же вызове перехваченного метода (для Switcher.SetUpPhoton это
-    // происходит прямо на старте игры). Лучше откатить хук и остаться без
-    // трассировки, чем уронить процесс.
+    // Fail-closed: the proxies in photon_hooks.cpp call the original
+    // unconditionally, so an installed hook with a null orig_addr is a
+    // guaranteed SIGSEGV on the first intercepted call (for
+    // Switcher.SetUpPhoton that's right at game start). Rolling back and
+    // losing one hook is better than crashing the process.
     if (*original == nullptr) {
         LOGE("hook: engine gave no trampoline for %s.%s/%d @ %p; rolling back",
              target.klass, target.method, target.args_count, address);
