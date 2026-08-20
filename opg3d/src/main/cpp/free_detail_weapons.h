@@ -75,9 +75,8 @@ bool is_detail_weapon(ManagedString* item_id) {
 void log_first_override() {
     bool expected = false;
     if (g_first_override_logged.compare_exchange_strong(expected, true)) {
-        LOGI("free-details: detail weapon '%s' now requires 0 details and 0 "
-             "craft seconds",
-             "matched");
+        LOGI("free-details: detail weapons now require 0 details and 0 craft "
+             "seconds");
     }
 }
 
