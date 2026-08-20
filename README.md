@@ -1,8 +1,42 @@
 # OLD PIXEL GUN 3D ONLINE PROJECT
 
 Открытый GPLv3-проект по восстановлению онлайна Pixel Gun 3D 13.2.1
-(`armeabi-v7a`) через **своё** приложение Photon Cloud. Это не чит: библиотека
-не подключает игрока к официальному онлайну и не меняет игровой баланс.
+(`armeabi-v7a`) через **своё** приложение Photon Cloud. Официальный backend
+отключён, поэтому проект целиком работает на собственной инфраструктуре и не
+взаимодействует с официальным онлайном. Это не чит для живой игры: прогресс и
+баланс меняются только внутри фанатской среды, общей и одинаковой для всех её
+игроков.
+
+## Релизная конфигурация 13.2.1
+
+Публичная сборка ветки `13.2.1` полностью переведена на собственный
+Photon Cloud и дополнительно фиксирует прогресс игрока:
+
+- **Онлайн только через наше приложение Photon Cloud.** AppID подменяется в
+  источнике (`Switcher.SelectPhotonAppId`), регион жёстко закреплён за **EU**
+  и на клиенте (`ServerSettings.UseCloud(appId, CloudRegionCode.eu)` с
+  read-back проверкой), и в панели Photon как единственный allowed region —
+  все игроки гарантированно попадают в один пул комнат.
+- **Мёртвый официальный backend изолирован.** Подтверждённый путь
+  `FriendsController.Update -> PhotonNetwork.Disconnect` глушится, пока
+  активна Photon-сессия; ручные Disconnect и серверные разрывы не трогаются.
+- **Последний уровень игрока.** Геттеры `ExperienceController`
+  (`PlayerLevel`, `GetCurrentLevel`, `currentLevel`) возвращают реальный cap
+  этой сборки: он читается в рантайме из
+  `ExperienceController.MaxExpLevelsDefault.Length` (контрольно сверяется с
+  `HealthByLevel.Length`), а не зашит числом.
+- **999 999 999 монет и гем.** `Storager.getInt("Coins"/"Gems")` всегда
+  возвращает 999 999 999, а `Storager.setInt` по этим ключам клампится к тому
+  же значению: баланс не уменьшается при покупках и не копится сверх лимита.
+  Сейвы напрямую не перезаписываются — пин выполняется на чтении.
+
+Каждая фиксация подтверждается одноразовой строкой в logcat (тег `OPG3D`):
+
+```text
+boost: player level pinned to cap N (MaxExpLevelsDefault.Length=N, ...)
+boost: Storager.getInt("Coins") pinned to 999999999
+boost: Storager.getInt("Gems") pinned to 999999999
+```
 
 ## Что исправляет библиотека
 
@@ -26,8 +60,8 @@ Switcher.SetUpPhoton(HiddenSettings)
 своего Photon Cloud приложения. Затем обычная сетевая логика PUN продолжает
 работать штатно.
 
-Мы **не** форсим глобальные ответы `Storager.getInt`, не подменяем посторонние
-настройки и не загружаем закрытую референсную библиотеку.
+Мы **не** форсим глобальные ответы `Storager.getInt` вне ключей валюты, не
+подменяем посторонние настройки и не загружаем закрытую референсную библиотеку.
 
 ## Независимая open-source реализация
 
@@ -51,7 +85,7 @@ ShadowHook нужен только как механизм перенаправ�
 конечный артефакт по-прежнему состоит из **одного файла**.
 Сведения о лицензии: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Фаза 0: полная диагностика подключения
+## Диагностика подключения
 
 Кроме обязательной подмены источника AppID устанавливаются диагностические хуки:
 
@@ -85,8 +119,9 @@ adb logcat -s OPG3D
 init: IL2CPP API resolved
 hook: installed Switcher.SelectPhotonAppId/1
 hook: installed ... managed hooks (core=OK)
-init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard and connection tracing active
+init: phase 0 ready — AppID override, Photon Cloud routing, dead-backend guard, progression boost and connection tracing active
 appid: SelectPhotonAppId #1 -> configured AppID {chars=36 utf8=36 fnv1a=...}
+cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 net: ConnectUsingSettings begin ...
 photon-status: 1024 (Connect) ...
 ```
@@ -140,18 +175,22 @@ opg3d/src/main/cpp/
 ├── il2cpp.cpp/.h             # metadata API, managed strings/fields
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override + сетевой trace
+├── cloud_guard.h             # фиксация Photon Cloud (EU) + карантин FriendsController
+├── player_boost.h            # релизный прогресс: max level + 999 999 999 монет/гем
 ├── config.h                  # compile-time defaults без credential
 └── CMakeLists.txt            # pinned ShadowHook static + libopg3d.so
 ```
 
-## Ограничения текущей стадии
+## Статус проекта
 
 - целевая сборка: PG3D 13.2.1, Android ARMv7, IL2CPP metadata v22;
-- первая цель — доказать успешный Photon handshake и точно увидеть оставшиеся
-  отказы мёртвого backend;
-- HTTP/backend-эмуляция и manual connect будут добавляться только если новые
-  логи покажут, что корректного AppID и штатного PUN-пути недостаточно;
-- способ загрузки `libopg3d.so` в процесс игры не входит в эту стадию.
+- Photon handshake, подключение к master/game server и бой 1×1 на двух
+  устройствах в разных сетях подтверждены;
+- регион EU зафиксирован для всех клиентов (cold-start BestRegion с ответом
+  `32756 / Region none` устранён);
+- релизный прогресс (последний уровень + 999 999 999 монет/гем) включён и
+  одинаков для всех игроков фанатского онлайна;
+- способ загрузки `libopg3d.so` в процесс игры не входит в репозиторий.
 
 ## Roadmap
 
@@ -159,9 +198,10 @@ opg3d/src/main/cpp/
 - [x] Независимый hook `SelectPhotonAppId` без Storager-костылей
 - [x] Полная трассировка PUN/Photon connection path
 - [x] Порт хуков на 13.2.1 (метаданные/enum'ы/поля сверены по дампу 13.2.1)
-- [ ] Тест Photon handshake на устройстве
-- [ ] Обход конкретных мёртвых backend-гейтов — только по подтверждённому логу
-- [ ] Тест комнаты/боя 1×1 на двух устройствах
+- [x] Тест Photon handshake на устройстве
+- [x] Фиксация региона EU для всех клиентов
+- [x] Тест комнаты/боя 1×1 на двух устройствах в разных сетях
+- [x] Релизный прогресс: последний уровень + 999 999 999 монет/гем
 
 ## Лицензия и дисклеймер
 
