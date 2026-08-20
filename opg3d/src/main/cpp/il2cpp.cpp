@@ -10,6 +10,10 @@ namespace {
 
 constexpr const char* kSo = "libil2cpp.so";
 
+// Вменяемый потолок для количества managed-сборок. Если рантайм отдал больше,
+// значит мы прочитали вектор в момент перевыделения — обходить его нельзя.
+constexpr size_t kMaxAssemblies = 8192u;
+
 template <typename T>
 bool bind(T& fn, const char* name) {
     if (fn != nullptr) return true;
@@ -70,9 +74,12 @@ void* find_image(const char* name) {
 
     size_t count = 0;
     void** assemblies = domain_get_assemblies(domain, &count);
-    if (assemblies == nullptr) return nullptr;
+    if (assemblies == nullptr || count == 0u || count > kMaxAssemblies) {
+        return nullptr;
+    }
 
     for (size_t i = 0; i < count; ++i) {
+        if (assemblies[i] == nullptr) continue;
         void* image = assembly_get_image(assemblies[i]);
         if (image == nullptr) continue;
         const char* image_name = image_get_name(image);
@@ -94,11 +101,14 @@ void* find_class(const char* namespaze, const char* name) {
 
     size_t count = 0;
     void** assemblies = domain_get_assemblies(domain, &count);
-    if (assemblies == nullptr) return nullptr;
+    if (assemblies == nullptr || count == 0u || count > kMaxAssemblies) {
+        return nullptr;
+    }
 
     // Ищем во всех managed-сборках: старые PUN-плагины могли быть собраны как
     // Assembly-CSharp, Assembly-CSharp-firstpass или отдельный Photon assembly.
     for (size_t i = 0; i < count; ++i) {
+        if (assemblies[i] == nullptr) continue;
         void* image = assembly_get_image(assemblies[i]);
         if (image == nullptr) continue;
         void* klass = class_from_name(image, namespaze, name);
