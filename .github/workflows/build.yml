@@ -21,11 +21,48 @@ jobs:
           gradle-version: "8.11.1"
 
       # PHOTON_APP_ID приходит только из repository secrets. CMake скачивает
-      # исходники Dobby на зафиксированном commit и статически линкует их.
+      # исходники shadowhook на зафиксированном теге, патчит их и статически
+      # линкует внутрь единственного libopg3d.so.
       - name: Build (assembleRelease, armeabi-v7a)
         env:
           ORG_GRADLE_PROJECT_PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
+
+      # Гард против регрессии разматывателя стека.
+      #
+      # libil2cpp.so несёт GNU-совместимый ARM EHABI unwinder и поднимает через
+      # него управляемые исключения. Если кадр нашего хука описан generic model
+      # со ссылкой на __gxx_personality_v0 из статически влинкованного LLVM
+      # libc++abi, то первое же исключение, пролетающее сквозь хук, роняет игру
+      # в __unw_set_reg. Подробности — в комментарии к -fno-exceptions в
+      # opg3d/src/main/cpp/CMakeLists.txt.
+      #
+      # Опасность именно в том, что без -fno-exceptions всё собирается молча и
+      # ломается только на устройстве в момент разрыва связи, поэтому проверяем
+      # на CI: в объектниках opg3d ссылок на эту personality быть не должно.
+      - name: Assert no LLVM C++ personality in our frames
+        run: |
+          set -euo pipefail
+          NDK_ROOT="${ANDROID_NDK_HOME:-}"
+          if [ -z "$NDK_ROOT" ]; then
+            NDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/ndk"
+          fi
+          NM="$(find "$NDK_ROOT" -type f -name 'llvm-nm' | head -n 1)"
+          if [ -z "$NM" ]; then
+            echo "::error::llvm-nm не найден под $NDK_ROOT — поправь путь в гарде"
+            exit 1
+          fi
+          OBJS="$(find . -type f -name '*.cpp.o' -path '*opg3d.dir*')"
+          if [ -z "$OBJS" ]; then
+            echo "::error::объектники opg3d не найдены — AGP сменил раскладку, поправь путь в гарде"
+            exit 1
+          fi
+          echo "$OBJS"
+          if echo "$OBJS" | xargs "$NM" --undefined-only | grep -q '__gxx_personality_v0'; then
+            echo "::error::кадры libopg3d ссылаются на __gxx_personality_v0 — управляемое исключение уронит игру. Верни -fno-exceptions."
+            exit 1
+          fi
+          echo "ok: generic-model personality в наших кадрах отсутствует"
 
       # Публичный артефакт этапа — ровно одна готовая библиотека.
       - name: Collect libopg3d.so

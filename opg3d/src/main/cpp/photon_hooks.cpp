@@ -77,26 +77,39 @@ uint32_t fnv1a(const char* data, size_t length) {
     return hash;
 }
 
+// Никогда не логируем credential целиком: только длину и отпечаток.
+// chars= берём у рантайма, потому что to_utf8() обрезает строку до 256 UTF-16
+// code unit, и его size() — это длина УСЕЧЁННОГО UTF-8, а не строки. Раньше в
+// логе было app={len=622}, по которому нельзя отличить 36-символьный GUID от
+// обфусцированного блоба, который расшифровывает Switcher.SelectPhotonAppId.
 std::string secret_summary(ManagedString* value) {
     if (value == nullptr) return "<null>";
     const std::string text = il2cpp::to_utf8(value, 256);
-    char buffer[96];
-    std::snprintf(buffer, sizeof(buffer), "len=%zu fnv1a=%08" PRIx32,
-                  text.size(), fnv1a(text.data(), text.size()));
+    const int32_t chars = il2cpp::string_length != nullptr
+                              ? il2cpp::string_length(value)
+                              : -1;
+    char buffer[128];
+    std::snprintf(buffer, sizeof(buffer),
+                  "chars=%" PRId32 " utf8=%zu fnv1a=%08" PRIx32,
+                  chars, text.size(), fnv1a(text.data(), text.size()));
     return buffer;
 }
 
+// Тот же формат, что и у secret_summary(), чтобы отпечаток нашего AppID и
+// игрового можно было сравнить глазами прямо в логе.
 std::string configured_secret_summary() {
     constexpr const char* app_id = PHOTON_APP_ID;
     const size_t length = std::strlen(app_id);
-    char buffer[96];
-    std::snprintf(buffer, sizeof(buffer), "len=%zu fnv1a=%08" PRIx32,
-                  length, fnv1a(app_id, length));
+    char buffer[128];
+    std::snprintf(buffer, sizeof(buffer),
+                  "chars=%zu utf8=%zu fnv1a=%08" PRIx32,
+                  length, length, fnv1a(app_id, length));
     return buffer;
 }
 
 template <typename T>
 bool read_field(void* object, const char* name, T* value) {
+    static_assert(sizeof(T) <= 8, "read_field рассчитан на скаляры и ссылки");
     if (object == nullptr || value == nullptr || !il2cpp::object_get_class ||
         !il2cpp::class_get_field_from_name || !il2cpp::field_get_value) {
         return false;
@@ -105,7 +118,18 @@ bool read_field(void* object, const char* name, T* value) {
     if (klass == nullptr) return false;
     void* field = il2cpp::class_get_field_from_name(klass, name);
     if (field == nullptr) return false;
-    il2cpp::field_get_value(object, field, value);
+
+    // il2cpp_field_get_value() копирует РОВНО размер поля из метаданных, а не
+    // sizeof(T). ServerSettings.Protocol — это enum ConnectionProtocol с
+    // базовым типом byte (dump.cs: `public byte value__`), поэтому при чтении
+    // напрямую в int32_t перезаписывался только младший байт, а три старших
+    // оставались от инициализатора -1: лог показывал protocol=-256(unknown)
+    // вместо 0(Udp). Пишем в обнулённый буфер с запасом и забираем младшие
+    // sizeof(T) байт — ARM little-endian. Запас заодно защищает стек, если
+    // поле окажется шире ожидаемого типа.
+    alignas(8) uint8_t scratch[16] = {0};
+    il2cpp::field_get_value(object, field, scratch);
+    std::memcpy(value, scratch, sizeof(T));
     return true;
 }
 
@@ -511,6 +535,11 @@ void hook_on_status_changed(void* self, int32_t status,
          status, connection_state(), server_address().c_str());
 }
 
+// OperationResponse в этой сборке Photon — ССЫЛОЧНЫЙ тип
+// (dump.cs L186143: `public class OperationResponse // TypeDefIndex: 2621`),
+// поэтому параметр приходит обычным Il2CppObject* и read_field() применим.
+// Если апстрим когда-нибудь сделает его struct, тут появится указатель на
+// сырую копию без заголовка объекта и object_get_class() читать будет НЕЛЬЗЯ.
 void hook_on_operation_response(void* self, void* response,
                                 const MethodInfo* method) {
     uint8_t operation = 0;

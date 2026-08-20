@@ -102,8 +102,42 @@ add_library(opg3d SHARED
 )
 
 target_include_directories(opg3d PRIVATE .)
+
+# -fno-exceptions здесь не про размер бинарника, а про совместимость
+# разматывателей стека. Не убирать.
+#
+# В одном процессе живут ДВА разных ARM EHABI unwinder'а:
+#   * libil2cpp.so несёт GNU-совместимый (___Unwind_RaiseException ->
+#     __gnu_Unwind_RaiseException). Управляемые исключения IL2CPP реализует
+#     через C++ исключения, поэтому любой NullReference/SocketException внутри
+#     игрового метода поднимает именно его;
+#   * мы статически линкуем LLVM libc++abi + libunwind, иначе не выйдет
+#     «один .so» в артефакте.
+#
+# Их _Unwind_Context* несовместимы между собой. Пока в наших функциях есть
+# landing pad'ы (а они появляются от любого объекта с деструктором — например
+# std::string в хуках), Clang выдаёт для кадра exidx-запись в generic model со
+# ссылкой PREL31 на НАШ __gxx_personality_v0. Разматыватель libil2cpp доходит
+# до кадра хука, читает эту ссылку и зовёт нашу personality со СВОИМ
+# контекстом; LLVM-овый _Unwind_VRS_Set принимает его за unw_cursor_t ->
+# SIGSEGV в __unw_set_reg (в логе: fault addr 0x7).
+#
+# Ни try/catch в хуке, ни проверки указателей это не лечат: падение происходит
+# в фазе поиска обработчика, ДО того как какой-либо catch мог бы отработать.
+#
+# С -fno-exceptions landing pad'ов и LSDA нет, поэтому наши кадры описываются
+# compact model, а её personality (__aeabi_unwind_cpp_pr0/1/2) разматыватель
+# libil2cpp резолвит внутри себя и вызывает со своим же контекстом —
+# исключение проходит сквозь кадр хука корректно, как сквозь обычный C-код.
+#
+# -funwind-tables обязателен явно: без таблиц кадры получили бы
+# EXIDX_CANTUNWIND, разматывание упёрлось бы в наш кадр и упало уже в
+# std::terminate. Регрессию стережёт шаг "Assert no LLVM C++ personality"
+# в .github/workflows/build.yml.
 target_compile_options(opg3d PRIVATE
     -O2
+    -fno-exceptions
+    -funwind-tables
     -fvisibility=hidden
     -ffunction-sections
     -fdata-sections
