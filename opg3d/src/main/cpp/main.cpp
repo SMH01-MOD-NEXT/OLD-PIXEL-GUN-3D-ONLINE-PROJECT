@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "cloud_guard.h"
+#include "config.h"
 #include "elf_sym.h"
 #include "free_detail_weapons.h"
 #include "il2cpp.h"
@@ -41,6 +42,11 @@ size_t assembly_count(void* domain) {
 }
 
 void* init_thread(void*) {
+    // Printed first so a report can be matched to the exact library that
+    // produced it. A missing or older stamp means the device is running a
+    // stale libopg3d.so and no runtime conclusion should be drawn from the
+    // rest of the log.
+    LOGI("init: libopg3d build %s", OPG3D_BUILD_STAMP);
     LOGI("init: [0/6] phase 0 thread started");
 
     uintptr_t base = 0;
