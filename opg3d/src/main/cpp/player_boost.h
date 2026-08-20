@@ -56,7 +56,7 @@ inline GetStaticLevelFn g_get_current_level_static = nullptr;
 inline GetInstanceLevelFn g_get_current_level = nullptr;
 
 inline constexpr int32_t kCurrencyValue = 999999999;
-inline constexpr int32_t kFallbackMaxLevel = 55; // известный level cap PG3D 13.x
+inline constexpr int32_t kFallbackMaxLevel = 55; // known PG3D 13.x level cap
 
 inline std::atomic<int32_t> g_max_level{0};
 inline std::atomic<bool> g_coins_logged{false};
@@ -76,10 +76,10 @@ bool key_equals(ManagedString* key, const char* ascii, int32_t length) {
     return true;
 }
 
-// Storager keys для мягкой валюты в PG3D 12.5.0/13.2.1 — ровно "Coins" и
-// "Gems" (подтверждены строками в global-metadata и годами моддинга этой
-// ветки). Сравнение идёт по UTF-16 chars без аллокаций: getInt вызывается
-// часто, поэтому сначала дешёво отсекаем по длине.
+// Storager keys for the soft currencies in PG3D 12.5.0/13.2.1 are exactly
+// "Coins" and "Gems" (confirmed by global-metadata strings and years of
+// modding this branch). Comparison runs over UTF-16 chars without
+// allocations: getInt is called often, so we cheaply reject by length first.
 bool currency_key_name(ManagedString* key, const char** name) {
     if (key_equals(key, "Coins", 5)) {
         *name = "Coins";
@@ -97,8 +97,8 @@ bool should_log_pin(const char* name) {
     return !flag.exchange(true);
 }
 
-// Il2CppArray layout в этом рантайме (metadata v22, ARM32): klass 0x0,
-// monitor 0x4, bounds 0x8 (NULL для SZArray), max_length 0xC.
+// Il2CppArray layout in this runtime (metadata v22, ARM32): klass 0x0,
+// monitor 0x4, bounds 0x8 (NULL for SZArray), max_length 0xC.
 int32_t read_szarray_length(void* array) {
     if (array == nullptr) return -1;
     int32_t length = -1;
@@ -118,18 +118,16 @@ int32_t read_static_array_length(void* klass, const char* field_name) {
     return read_szarray_length(array);
 }
 
-// Вызывается только из хуков методов ExperienceController, а IL2CPP
-// гарантированно инициализирует класс (и его static fields) до первого вызова
-// любого его метода — поэтому чтение static-массивов здесь безопасно.
+// Called only from hooks on ExperienceController methods, and IL2CPP
+// guarantees a class (and its static fields) is initialized before any of its
+// methods run — so reading the static arrays here is safe.
 int32_t max_level() {
     const int32_t cached = g_max_level.load(std::memory_order_acquire);
     if (cached > 0) return cached;
 
     int32_t exp_len = -1;
     int32_t health_len = -1;
-    void* klass = il2cpp::find_class != nullptr
-                      ? il2cpp::find_class("", "ExperienceController")
-                      : nullptr;
+    void* klass = il2cpp::find_class("", "ExperienceController");
     if (klass != nullptr) {
         exp_len = read_static_array_length(klass, "MaxExpLevelsDefault");
         health_len = read_static_array_length(klass, "HealthByLevel");
@@ -222,8 +220,8 @@ inline bool install_optional(const hook::ManagedMethod& target, void* replace,
 inline bool install_hooks() {
     int installed = 0;
 
-    // Валюта — обязательная часть релизной фичи: без getInt-пина баланс не
-    // будет бесконечным, поэтому fail-closed с явным логом.
+    // Currency is the mandatory part of the release feature: without the
+    // getInt pin the balance is not infinite, so fail closed with a clear log.
     const bool currency_read = hook::install(
         {"", "Storager", "getInt", 4},
         detail::replacement(&detail::hook_storager_get_int),

@@ -9,7 +9,7 @@
 // see its symbols, and dlopen from a foreign namespace may be refused. The
 // library image is already mapped into our address space, so its symbol table
 // can simply be read directly — more reliable and with no external
-dependencies.
+// dependencies.
 namespace elfsym {
 
 // Finds a loaded library by file name (e.g. "libil2cpp.so").
