@@ -8,6 +8,7 @@
 
 #include "cloud_guard.h"
 #include "elf_sym.h"
+#include "free_detail_weapons.h"
 #include "il2cpp.h"
 #include "legacy_gameplay.h"
 #include "log.h"
@@ -115,18 +116,18 @@ void* init_thread(void*) {
     }
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing hooks");
 
-    // Install tracing first: cloud_guard intentionally calls the already-hooked
-    // ServerSettings.UseCloud(appId, eu) entry so its before/after state is
-    // visible in the same diagnostic stream. The progression and legacy
-    // gameplay modules are independent and share only the hook engine.
+    // Every target below was verified against the supplied 13.2.1 metadata
+    // dump. Runtime resolution remains metadata-driven and fail-closed; no RVA
+    // from the analysis files is compiled into the library.
     const bool photon_installed = photon::install_hooks();
     const bool guard_installed = cloud_guard::install_hooks();
     const bool boost_installed = player_boost::install_hooks();
     const bool gameplay_installed = legacy_gameplay::install_hooks();
+    const bool free_details_installed = free_detail_weapons::install_hooks();
     if (photon_installed && guard_installed && boost_installed &&
-        gameplay_installed) {
+        gameplay_installed && free_details_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
-             "tutorial skip, local armory economy and upgrade timers active");
+             "tutorial skip, free detail weapons and upgrade timers active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -141,8 +142,11 @@ void* init_thread(void*) {
                  "is not active");
         }
         if (!gameplay_installed) {
-            LOGE("init: legacy gameplay module incomplete; tutorial skip, "
-                 "detail-weapon purchases or upgrades may be unavailable");
+            LOGE("init: legacy gameplay module incomplete; tutorial skip or "
+                 "upgrade time may be unavailable");
+        }
+        if (!free_details_installed) {
+            LOGE("init: free detail-weapon compatibility is unavailable");
         }
     }
 
