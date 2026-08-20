@@ -10,15 +10,17 @@
 #include "il2cpp.h"
 #include "log.h"
 
-// Compatibility layer for the dead PG3D 12.5.0 backend.
+// Compatibility layer for the dead PG3D 13.2.1 backend.
 //
-// The original build leaves PUN in SelfHosted mode and points it at the dead
-// rilisoft-us endpoint. It also lets FriendsController.Update disconnect PUN
-// while the peer is authenticating. This layer fixes only those two pieces:
-// it routes PUN through the SDK's own UseCloudBestRegion implementation and
+// The shipped PhotonServerSettings point at infrastructure that no longer
+// exists (on 12.5.0 the runtime-proven route was SelfHosted to the dead
+// rilisoft-us endpoint; the exact default differs per build, but is just as
+// dead). The build also lets FriendsController.Update disconnect PUN while
+// the peer is authenticating. This layer fixes only those two pieces: it
+// routes PUN through the SDK's own UseCloudBestRegion implementation and
 // quarantines FriendsController.Update while a Photon session is active.
-// Manual disconnects, Photon status callbacks and room/game networking are not
-// replaced or globally faked.
+// Manual disconnects, Photon status callbacks and room/game networking are
+// not replaced or globally faked.
 namespace cloud_guard {
 namespace detail {
 
@@ -122,11 +124,13 @@ inline const char* state_name(int32_t state) {
     }
 }
 
-// FriendsController is the dead HTTP/social backend owner. Its Update method
-// contains the proven call site FriendsController.Update+0x310 that repeatedly
-// calls PhotonNetwork.Disconnect. Quarantine only while PUN has an active or
-// transitioning session; when PUN is idle/disconnected, the original Update
-// still runs so local initialization and UI state are preserved.
+// FriendsController is the dead HTTP/social backend owner. On 12.5.0 its
+// Update method contained the runtime-proven call site (Update+0x310) that
+// repeatedly calls PhotonNetwork.Disconnect; the hook covers the whole
+// method, so no per-version offset is needed. Quarantine only while PUN has
+// an active or transitioning session; when PUN is idle/disconnected, the
+// original Update still runs so local initialization and UI state are
+// preserved.
 inline bool should_quarantine_friends_update(int32_t state) {
     return state >= 2 && state != 15;
 }
@@ -250,7 +254,7 @@ inline void hook_friends_update(void* self, const MethodInfo* method) {
                                    1u, std::memory_order_relaxed) + 1u;
         if (count <= 8u || count % 120u == 0u) {
             LOGW("backend-guard: skipped FriendsController.Update #%" PRIu32
-                 " state=%d(%s); blocks proven Disconnect call site +0x310",
+                 " state=%d(%s); blocks the proven Disconnect call path",
                  count, state, state_name(state));
         }
         return;

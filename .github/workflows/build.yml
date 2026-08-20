@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "13.2.1"]
   workflow_dispatch:
 
 permissions:
