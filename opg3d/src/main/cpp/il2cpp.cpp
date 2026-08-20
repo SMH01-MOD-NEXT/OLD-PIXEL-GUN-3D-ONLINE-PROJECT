@@ -10,8 +10,8 @@ namespace {
 
 constexpr const char* kSo = "libil2cpp.so";
 
-// Вменяемый потолок для количества managed-сборок. Если рантайм отдал больше,
-// значит мы прочитали вектор в момент перевыделения — обходить его нельзя.
+// A sane upper bound for the number of managed assemblies. If the runtime
+// reports more, we have read the vector mid-reallocation and must not walk it.
 constexpr size_t kMaxAssemblies = 8192u;
 
 template <typename T>
@@ -105,8 +105,8 @@ void* find_class(const char* namespaze, const char* name) {
         return nullptr;
     }
 
-    // Ищем во всех managed-сборках: старые PUN-плагины могли быть собраны как
-    // Assembly-CSharp, Assembly-CSharp-firstpass или отдельный Photon assembly.
+    // Search all managed assemblies: old PUN plugins could be built as
+    // Assembly-CSharp, Assembly-CSharp-firstpass or a separate Photon assembly.
     for (size_t i = 0; i < count; ++i) {
         if (assemblies[i] == nullptr) continue;
         void* image = assembly_get_image(assemblies[i]);
@@ -127,8 +127,8 @@ void* find_method_info(const char* namespaze, const char* klass,
 
 void* method_pointer(void* method_info) {
     if (method_info == nullptr) return nullptr;
-    // В metadata v22 первый элемент MethodInfo — Il2CppMethodPointer.
-    // memcpy избегает нарушений strict-aliasing.
+    // In metadata v22 the first member of MethodInfo is Il2CppMethodPointer.
+    // memcpy avoids strict-aliasing violations.
     void* pointer = nullptr;
     std::memcpy(&pointer, method_info, sizeof(pointer));
     return pointer;

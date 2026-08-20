@@ -30,11 +30,11 @@ int iterate_cb(struct dl_phdr_info* info, size_t, void* data) {
     found->phdr = info->dlpi_phdr;
     found->phnum = info->dlpi_phnum;
     found->ok = true;
-    return 1;  // останавливаем обход
+    return 1;  // stop iterating
 }
 
-// В .dynamic адреса хранятся как vaddr и требуют сдвига на load bias,
-// но часть линкеров записывает туда уже абсолютный адрес.
+// .dynamic entries store addresses as vaddr values that need a load-bias
+// shift, but some linkers write already-absolute addresses there.
 uintptr_t fix_addr(uintptr_t value, uintptr_t base) {
     return (value < base) ? (base + value) : value;
 }
@@ -71,15 +71,15 @@ void* lookup(const Found& lib, const char* symbol) {
     }
     if (strtab == nullptr || symtab == nullptr || hash == nullptr) return nullptr;
 
-    // В SysV-хеше nchain равно полному числу записей в .dynsym.
-    // У libil2cpp.so это ~741 символ, линейный проход — копейки.
+    // In the SysV hash, nchain equals the total number of .dynsym entries.
+    // For libil2cpp.so that's ~741 symbols — a linear scan is cheap.
     const uint32_t nchain = hash[1];
     for (uint32_t i = 0; i < nchain; ++i) {
         const ElfW(Sym)& sym = symtab[i];
         if (sym.st_name == 0 || sym.st_value == 0) continue;
         if (sym.st_shndx == SHN_UNDEF) continue;
         if (std::strcmp(strtab + sym.st_name, symbol) == 0) {
-            // Бит 0 у Thumb-функций не сбрасываем: для вызова он нужен.
+            // Keep bit 0 set on Thumb functions: callers need it.
             return reinterpret_cast<void*>(lib.base + sym.st_value);
         }
     }
