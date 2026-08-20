@@ -1,7 +1,5 @@
 #pragma once
 
-#include <atomic>
-#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 
@@ -9,25 +7,34 @@
 #include "il2cpp.h"
 #include "log.h"
 
-// Release progression boost for PG3D 13.2.1.
+// Release progression grant for PG3D 13.2.1.
 //
 // The project runs entirely on its own Photon Cloud application: the official
 // backend is dead, there is no economy to protect and no server-side
-// anti-cheat. For the public release every client gets the final player level
-// and a pinned 999 999 999 balance for both soft currencies (Coins and Gems),
+// anti-cheat. For the public release every client gets the maximum player
+// level and a 999 999 999 balance for both soft currencies (Coins and Gems),
 // so all weapons/items are playable out of the box on equal terms.
 //
-// Both pieces are read-side hooks over the game's own storage accessors:
-// - Storager.getInt("Coins"/"Gems") always returns kCurrencyValue;
-// - Storager.setInt("Coins"/"Gems", ...) is clamped to kCurrencyValue, so
-//   spending or earning never moves the displayed balance and any cached
-//   readers converge back to the pinned value after the next write;
-// - the three ExperienceController level getters return the real level cap,
-//   resolved at runtime from MaxExpLevelsDefault.Length (with a documented
-//   fallback), not a hardcoded magic number.
+// Instead of pinning reads (which never persists and desynced game state in
+// the earlier revision), the mod calls the game's own write paths from the
+// main menu:
+//   - ExperienceController.AddExperience(...) levels the profile up through
+//     the normal progression code, which computes the level itself and saves
+//     it to Storager;
+//   - BankController.AddCoins/AddGems(...) top the balance up to
+//     kCurrencyTarget through the normal bank code, again persisted by the
+//     game itself.
+// Because the values are written by the game, they survive process restarts
+// and library removal, and no gameplay code can observe an impossible level.
 //
-// Nothing touches saved profiles directly beyond the pinned currency writes,
-// and every pin is proven in logcat with a one-time OPG3D line.
+// The grant runs from a per-frame menu Update hook on the main thread,
+// throttled to about one check per second. The level part converges after a
+// single call (the game persists the new level immediately, so later
+// launches skip it); the currency part re-tops the balance whenever it drops
+// below the target, which is what makes it effectively infinite. A read-back
+// after each top-up verifies the storage key actually moved; if it did not
+// (currency storage layout changed), the mod marks its own Storager flag and
+// never touches the balance again instead of piling up invisible grants.
 namespace player_boost {
 namespace detail {
 
@@ -35,165 +42,188 @@ using MethodInfo = void;
 using ManagedString = void;
 
 // dump1321.cs:
-//   Storager.getInt(string, bool, bool, bool)  RVA 0xEB6CD0
-//   Storager.setInt(string, int, bool, bool)   RVA 0xEB74A0
-//   ExperienceController.get_PlayerLevel()     RVA 0x14E65C8 (static)
-//   ExperienceController.GetCurrentLevel()     RVA 0x14E788C (static)
-//   ExperienceController.get_currentLevel()    RVA 0x14E0C88 (instance)
+//   MainMenuController.Update()                       RVA 0xF7A584 (instance)
+//   BankController.Update()                           RVA 0xCD5214 (instance, fallback)
+//   ExpController.Update()                            RVA 0x14E38D4 (instance, fallback)
+//   ExperienceController.GetCurrentLevel()            RVA 0x14E788C (static)
+//   ExperienceController.AddExperience(int)           RVA 0x14E8B0C (instance)
+//   ExperienceController.sharedController             static field 0x44
+//   ExperienceController.MaxExpLevelsDefault : int[]  static field 0x20
+//   BankController.AddCoins(int, bool, AccrualType)   RVA 0xCD84B8 (static)
+//   BankController.AddGems(int, bool, AccrualType)    RVA 0xCD8634 (static)
+//   Storager.getInt(string, bool, bool, bool)         RVA 0xEB6CD0
+//   Storager.setInt(string, int, bool, bool)          RVA 0xEB74A0
+using UpdateFn = void (*)(void* self, const MethodInfo* method);
+using GetLevelFn = int32_t (*)(const MethodInfo* method);
+using AddExperienceFn = void (*)(void* self, int32_t increment,
+                                 const MethodInfo* method);
+using AddCurrencyFn = void (*)(int32_t count, bool need_indication,
+                               int32_t accrual_type, const MethodInfo* method);
 using StoragerGetIntFn = int32_t (*)(ManagedString* key, bool suppress_warnings,
                                      bool direct_read, bool direct_read_v2,
                                      const MethodInfo* method);
 using StoragerSetIntFn = void (*)(ManagedString* key, int32_t value,
                                   bool direct_write, bool direct_write_v2,
                                   const MethodInfo* method);
-using GetStaticLevelFn = int32_t (*)(const MethodInfo* method);
-using GetInstanceLevelFn = int32_t (*)(void* self, const MethodInfo* method);
 
-inline StoragerGetIntFn g_storager_get_int = nullptr;
-inline StoragerSetIntFn g_storager_set_int = nullptr;
-inline GetStaticLevelFn g_get_player_level = nullptr;
-inline GetStaticLevelFn g_get_current_level_static = nullptr;
-inline GetInstanceLevelFn g_get_current_level = nullptr;
+inline UpdateFn g_menu_update = nullptr;
 
-inline constexpr int32_t kCurrencyValue = 999999999;
-inline constexpr int32_t kFallbackMaxLevel = 55; // known PG3D 13.x level cap
+inline GetLevelFn g_get_level = nullptr;
+inline const MethodInfo* g_mi_get_level = nullptr;
+inline AddExperienceFn g_add_experience = nullptr;
+inline const MethodInfo* g_mi_add_experience = nullptr;
+inline AddCurrencyFn g_add_coins = nullptr;
+inline const MethodInfo* g_mi_add_coins = nullptr;
+inline AddCurrencyFn g_add_gems = nullptr;
+inline const MethodInfo* g_mi_add_gems = nullptr;
+inline StoragerGetIntFn g_get_int = nullptr;
+inline const MethodInfo* g_mi_get_int = nullptr;
+inline StoragerSetIntFn g_set_int = nullptr;
+inline const MethodInfo* g_mi_set_int = nullptr;
+inline void* g_shared_controller_field = nullptr;
+inline void* g_max_exp_levels_field = nullptr;
 
-inline std::atomic<int32_t> g_max_level{0};
-inline std::atomic<bool> g_coins_logged{false};
-inline std::atomic<bool> g_gems_logged{false};
+inline constexpr int32_t kCurrencyTarget = 999999999;
+inline constexpr int32_t kFallbackLevelCap = 38;   // AddExperience() early-exits at 38 on this build
+inline constexpr int32_t kFallbackExpGrant = 0x3FFFFFFF;
+inline constexpr int32_t kMaxExpGrant = 0x3FFFFFFF;  // overflow guard for the exp-table sum
+inline constexpr uint32_t kCheckIntervalFrames = 60;  // ~1 s between grant checks
+inline constexpr int kMaxLevelAttempts = 3;
+inline constexpr const char* kBrokenProbeFlag = "OPG3D_BoostBrokenProbe";
 
-bool key_equals(ManagedString* key, const char* ascii, int32_t length) {
-    if (key == nullptr || il2cpp::string_length == nullptr ||
-        il2cpp::string_chars == nullptr) {
-        return false;
-    }
-    if (il2cpp::string_length(key) != length) return false;
-    const uint16_t* chars = il2cpp::string_chars(key);
-    if (chars == nullptr) return false;
-    for (int32_t i = 0; i < length; ++i) {
-        if (chars[i] != static_cast<uint16_t>(ascii[i])) return false;
-    }
-    return true;
+inline uint32_t g_frames = 0;
+inline bool g_level_done = false;
+inline int g_level_attempts = 0;
+inline bool g_coins_probe_broken = false;
+inline bool g_gems_probe_broken = false;
+
+int32_t storager_get_int(const char* key) {
+    if (il2cpp::string_new == nullptr) return 0;
+    ManagedString* managed = il2cpp::string_new(key);
+    if (managed == nullptr) return 0;
+    return g_get_int(managed, false, false, false, g_mi_get_int);
 }
 
-// Storager keys for the soft currencies in PG3D 12.5.0/13.2.1 are exactly
-// "Coins" and "Gems" (confirmed by global-metadata strings and years of
-// modding this branch). Comparison runs over UTF-16 chars without
-// allocations: getInt is called often, so we cheaply reject by length first.
-bool currency_key_name(ManagedString* key, const char** name) {
-    if (key_equals(key, "Coins", 5)) {
-        *name = "Coins";
-        return true;
-    }
-    if (key_equals(key, "Gems", 4)) {
-        *name = "Gems";
-        return true;
-    }
-    return false;
+void storager_set_int(const char* key, int32_t value) {
+    if (il2cpp::string_new == nullptr) return;
+    ManagedString* managed = il2cpp::string_new(key);
+    if (managed == nullptr) return;
+    g_set_int(managed, value, false, false, g_mi_set_int);
 }
 
-bool should_log_pin(const char* name) {
-    std::atomic<bool>& flag = (name[1] == 'o') ? g_coins_logged : g_gems_logged;
-    return !flag.exchange(true);
+void* read_static_field(void* field) {
+    void* value = nullptr;
+    il2cpp::field_static_get_value(field, &value);
+    return value;
 }
 
 // Il2CppArray layout in this runtime (metadata v22, ARM32): klass 0x0,
-// monitor 0x4, bounds 0x8 (NULL for SZArray), max_length 0xC.
-int32_t read_szarray_length(void* array) {
-    if (array == nullptr) return -1;
+// monitor 0x4, bounds 0x8 (NULL for SZArray), max_length 0xC, elements 0x10.
+// The exp table total is enough to reach the final level under either
+// semantics (per-level costs or cumulative thresholds).
+bool exp_table_info(int32_t* out_cap, int32_t* out_total_exp) {
+    void* array = read_static_field(g_max_exp_levels_field);
+    if (array == nullptr) return false;
     int32_t length = -1;
     std::memcpy(&length, static_cast<const char*>(array) + 0xC, sizeof(length));
-    return length;
-}
-
-int32_t read_static_array_length(void* klass, const char* field_name) {
-    if (klass == nullptr || il2cpp::class_get_field_from_name == nullptr ||
-        il2cpp::field_static_get_value == nullptr) {
-        return -1;
+    if (length <= 0 || length > 4096) return false;
+    int64_t total = 0;
+    const char* elements = static_cast<const char*>(array) + 0x10;
+    for (int32_t i = 0; i < length; ++i) {
+        int32_t threshold = 0;
+        std::memcpy(&threshold, elements + static_cast<size_t>(i) * 4u,
+                    sizeof(threshold));
+        if (threshold > 0) total += threshold;
     }
-    void* field = il2cpp::class_get_field_from_name(klass, field_name);
-    if (field == nullptr) return -1;
-    void* array = nullptr;
-    il2cpp::field_static_get_value(field, &array);
-    return read_szarray_length(array);
+    if (total <= 0) return false;
+    *out_cap = length;
+    *out_total_exp =
+        total > kMaxExpGrant ? kMaxExpGrant : static_cast<int32_t>(total);
+    return true;
 }
 
-// Called only from hooks on ExperienceController methods, and IL2CPP
-// guarantees a class (and its static fields) is initialized before any of its
-// methods run — so reading the static arrays here is safe.
-int32_t max_level() {
-    const int32_t cached = g_max_level.load(std::memory_order_acquire);
-    if (cached > 0) return cached;
+void grant_level() {
+    if (g_level_done || g_level_attempts >= kMaxLevelAttempts) return;
 
-    int32_t exp_len = -1;
-    int32_t health_len = -1;
-    void* klass = il2cpp::find_class("", "ExperienceController");
-    if (klass != nullptr) {
-        exp_len = read_static_array_length(klass, "MaxExpLevelsDefault");
-        health_len = read_static_array_length(klass, "HealthByLevel");
+    const int32_t level = g_get_level(g_mi_get_level);
+    int32_t cap = kFallbackLevelCap;
+    int32_t grant = kFallbackExpGrant;
+    const bool have_table = exp_table_info(&cap, &grant);
+    if (level >= cap) {
+        g_level_done = true;
+        LOGI("boost: player level already at cap (%d >= %d); nothing to grant",
+             level, cap);
+        return;
     }
 
-    int32_t resolved = exp_len > 0 ? exp_len : health_len;
-    if (resolved <= 0) {
-        resolved = kFallbackMaxLevel;
-        LOGW("boost: MaxExpLevelsDefault/HealthByLevel unreadable; "
-             "falling back to known 13.x cap %d", resolved);
-    } else if (health_len > 0 && health_len != exp_len) {
-        LOGW("boost: MaxExpLevelsDefault.Length=%d differs from "
-             "HealthByLevel.Length=%d; using %d", exp_len, health_len, resolved);
+    void* controller = read_static_field(g_shared_controller_field);
+    if (controller == nullptr) return;  // controller not up yet; retry later
+
+    ++g_level_attempts;
+    // AddExperience runs the stock level-up loop: it walks MaxExpLevels,
+    // fires the level-up events and writes both the exp and the level keys
+    // to Storager itself, so the result persists in the save.
+    g_add_experience(controller, grant, g_mi_add_experience);
+    const int32_t after = g_get_level(g_mi_get_level);
+    if (after >= cap) {
+        g_level_done = true;
+        LOGI("boost: player level %d -> %d via AddExperience(+%d exp, cap %d, "
+             "exp table %s)",
+             level, after, grant, cap, have_table ? "read" : "fallback");
+    } else {
+        LOGW("boost: AddExperience(+%d exp) moved level %d -> %d, cap %d not "
+             "reached (attempt %d/%d)",
+             grant, level, after, cap, g_level_attempts, kMaxLevelAttempts);
     }
-    g_max_level.store(resolved, std::memory_order_release);
-    LOGI("boost: player level pinned to cap %d "
-         "(MaxExpLevelsDefault.Length=%d, HealthByLevel.Length=%d)",
-         resolved, exp_len, health_len);
-    return resolved;
 }
 
-int32_t hook_storager_get_int(ManagedString* key, bool suppress_warnings,
-                              bool direct_read, bool direct_read_v2,
-                              const MethodInfo* method) {
-    const char* name = nullptr;
-    if (currency_key_name(key, &name)) {
-        if (should_log_pin(name)) {
-            LOGI("boost: Storager.getInt(\"%s\") pinned to %d",
-                 name, kCurrencyValue);
-        }
-        return kCurrencyValue;
+void grant_currency(const char* key, AddCurrencyFn add,
+                    const MethodInfo* add_mi, const char* label,
+                    bool* probe_broken) {
+    if (*probe_broken) return;
+
+    const int32_t before = storager_get_int(key);
+    if (before >= kCurrencyTarget) return;
+    if (storager_get_int(kBrokenProbeFlag) != 0) {
+        // A previous run proved the probe key does not track the real
+        // balance; the one-time flat grant already landed then, so never
+        // add again (otherwise every launch would add another ~1e9).
+        *probe_broken = true;
+        return;
     }
-    return g_storager_get_int(key, suppress_warnings, direct_read,
-                              direct_read_v2, method);
-}
 
-void hook_storager_set_int(ManagedString* key, int32_t value, bool direct_write,
-                           bool direct_write_v2, const MethodInfo* method) {
-    const char* name = nullptr;
-    if (currency_key_name(key, &name)) {
-        if (should_log_pin(name)) {
-            LOGI("boost: Storager.setInt(\"%s\", %d) clamped to %d",
-                 name, value, kCurrencyValue);
-        }
-        value = kCurrencyValue;
+    // BankController resolves the real storage key internally and persists
+    // the result through Storager; needIndication=false keeps the UI quiet.
+    add(kCurrencyTarget - before, false, 0, add_mi);
+
+    const int32_t after = storager_get_int(key);
+    if (after <= before) {
+        // The read-back key is not the one the bank writes (13.2.1 migrated
+        // currency storage). The grant itself still landed through the game's
+        // own method, so mark it and stop touching the balance.
+        storager_set_int(kBrokenProbeFlag, 1);
+        *probe_broken = true;
+        LOGW("boost: %s read-back did not move (%d -> %d); flat grant applied "
+             "once, top-up disabled",
+             label, before, after);
+        return;
     }
-    g_storager_set_int(key, value, direct_write, direct_write_v2, method);
+    LOGI("boost: %s %d -> %d via BankController (target %d)", label, before,
+         after, kCurrencyTarget);
 }
 
-int32_t hook_get_player_level(const MethodInfo* method) {
-    (void)g_get_player_level;
-    (void)method;
-    return max_level();
+void maybe_grant() {
+    if (++g_frames % kCheckIntervalFrames != 1) return;
+    grant_level();
+    grant_currency("Coins", g_add_coins, g_mi_add_coins, "coins",
+                   &g_coins_probe_broken);
+    grant_currency("Gems", g_add_gems, g_mi_add_gems, "gems",
+                   &g_gems_probe_broken);
 }
 
-int32_t hook_get_current_level_static(const MethodInfo* method) {
-    (void)g_get_current_level_static;
-    (void)method;
-    return max_level();
-}
-
-int32_t hook_get_current_level(void* self, const MethodInfo* method) {
-    (void)g_get_current_level;
-    (void)self;
-    (void)method;
-    return max_level();
+void hook_menu_update(void* self, const MethodInfo* method) {
+    g_menu_update(self, method);
+    maybe_grant();
 }
 
 template <typename Fn>
@@ -206,50 +236,85 @@ void** original_slot(Fn* fn) {
     return reinterpret_cast<void**>(fn);
 }
 
-inline bool install_optional(const hook::ManagedMethod& target, void* replace,
-                             void** original, int* installed) {
-    if (hook::install(target, replace, original, false)) {
-        ++(*installed);
-        return true;
+bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
+                  const MethodInfo** out_mi) {
+    void* info = il2cpp::find_method_info(target.namespaze, target.klass,
+                                          target.method, target.args_count);
+    void* pointer = il2cpp::method_pointer(info);
+    if (info == nullptr || pointer == nullptr) {
+        LOGE("boost: cannot resolve %s.%s/%d", target.klass, target.method,
+             target.args_count);
+        return false;
     }
-    return false;
+    *out_fn = pointer;
+    *out_mi = info;
+    return true;
 }
 
 } // namespace detail
 
 inline bool install_hooks() {
-    int installed = 0;
+    bool ok = true;
+    ok &= detail::resolve_call({"", "ExperienceController", "GetCurrentLevel", 0},
+                               reinterpret_cast<void**>(&detail::g_get_level),
+                               &detail::g_mi_get_level);
+    ok &= detail::resolve_call({"", "ExperienceController", "AddExperience", 1},
+                               reinterpret_cast<void**>(&detail::g_add_experience),
+                               &detail::g_mi_add_experience);
+    ok &= detail::resolve_call({"", "BankController", "AddCoins", 3},
+                               reinterpret_cast<void**>(&detail::g_add_coins),
+                               &detail::g_mi_add_coins);
+    ok &= detail::resolve_call({"", "BankController", "AddGems", 3},
+                               reinterpret_cast<void**>(&detail::g_add_gems),
+                               &detail::g_mi_add_gems);
+    ok &= detail::resolve_call({"", "Storager", "getInt", 4},
+                               reinterpret_cast<void**>(&detail::g_get_int),
+                               &detail::g_mi_get_int);
+    ok &= detail::resolve_call({"", "Storager", "setInt", 4},
+                               reinterpret_cast<void**>(&detail::g_set_int),
+                               &detail::g_mi_set_int);
 
-    // Currency is the mandatory part of the release feature: without the
-    // getInt pin the balance is not infinite, so fail closed with a clear log.
-    const bool currency_read = hook::install(
-        {"", "Storager", "getInt", 4},
-        detail::replacement(&detail::hook_storager_get_int),
-        detail::original_slot(&detail::g_storager_get_int), true);
-    if (currency_read) ++installed;
-    detail::install_optional(
-        {"", "Storager", "setInt", 4},
-        detail::replacement(&detail::hook_storager_set_int),
-        detail::original_slot(&detail::g_storager_set_int), &installed);
+    detail::g_shared_controller_field =
+        il2cpp::find_field("", "ExperienceController", "sharedController");
+    detail::g_max_exp_levels_field =
+        il2cpp::find_field("", "ExperienceController", "MaxExpLevelsDefault");
+    if (detail::g_shared_controller_field == nullptr) {
+        LOGE("boost: ExperienceController.sharedController field not found");
+        ok = false;
+    }
+    if (detail::g_max_exp_levels_field == nullptr) {
+        LOGW("boost: MaxExpLevelsDefault field not found; "
+             "level grant will use fallback constants");
+    }
+    if (!ok) {
+        LOGE("boost: cannot resolve the game's progression methods; "
+             "grant disabled");
+        return false;
+    }
 
-    const bool level = hook::install(
-        {"", "ExperienceController", "get_PlayerLevel", 0},
-        detail::replacement(&detail::hook_get_player_level),
-        detail::original_slot(&detail::g_get_player_level), true);
-    if (level) ++installed;
-    detail::install_optional(
-        {"", "ExperienceController", "GetCurrentLevel", 0},
-        detail::replacement(&detail::hook_get_current_level_static),
-        detail::original_slot(&detail::g_get_current_level_static), &installed);
-    detail::install_optional(
-        {"", "ExperienceController", "get_currentLevel", 0},
-        detail::replacement(&detail::hook_get_current_level),
-        detail::original_slot(&detail::g_get_current_level), &installed);
-
-    LOGI("boost: installed %d hooks (currency=%s, level=%s; cap=%d, currency=%d)",
-         installed, currency_read ? "OK" : "FAILED", level ? "OK" : "FAILED",
-         detail::kFallbackMaxLevel, detail::kCurrencyValue);
-    return currency_read && level;
+    // Any always-alive menu-scene Update works as the trigger; the grant is
+    // idempotent, so the first one that resolves wins.
+    static const hook::ManagedMethod kTriggers[] = {
+        {"", "MainMenuController", "Update", 0},
+        {"", "BankController", "Update", 0},
+        {"", "ExpController", "Update", 0},
+    };
+    const char* chosen = nullptr;
+    for (const auto& trigger : kTriggers) {
+        if (hook::install(trigger, detail::replacement(&detail::hook_menu_update),
+                          detail::original_slot(&detail::g_menu_update), false)) {
+            chosen = trigger.klass;
+            break;
+        }
+    }
+    if (chosen == nullptr) {
+        LOGE("boost: no menu Update hook target available; grant disabled");
+        return false;
+    }
+    LOGI("boost: progression grant armed (trigger=%s.Update, currency target=%d, "
+         "level via AddExperience)",
+         chosen, detail::kCurrencyTarget);
+    return true;
 }
 
 } // namespace player_boost
