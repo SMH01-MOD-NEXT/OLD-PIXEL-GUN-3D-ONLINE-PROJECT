@@ -19,6 +19,7 @@
 #include "obb_provisioner.h"
 #include "photon_hooks.h"
 #include "player_boost.h"
+#include "post_match_ui.h"
 #include "removed_arsenal.h"
 
 namespace {
@@ -134,21 +135,23 @@ void* init_thread(void*) {
     const bool guard_installed = cloud_guard::install_hooks();
     const bool boost_installed = player_boost::install_hooks();
     const bool gameplay_installed = legacy_gameplay::install_hooks();
+    const bool post_match_installed = post_match_ui::install_hooks();
     const bool free_details_installed = free_detail_weapons::install_hooks();
     const bool clan_craft_installed = clan_craft::install_hooks();
     const bool removed_arsenal_installed = removed_arsenal::install_hooks();
     const bool abuse_slot_sink_installed = abuse_slot_sink::install_hooks();
     const bool cheat_guard_installed = cheat_guard::install_hooks();
     if (photon_installed && guard_installed && boost_installed &&
-        gameplay_installed && free_details_installed &&
-        clan_craft_installed && removed_arsenal_installed &&
-        abuse_slot_sink_installed && cheat_guard_installed) {
+        gameplay_installed && post_match_installed &&
+        free_details_installed && clan_craft_installed &&
+        removed_arsenal_installed && abuse_slot_sink_installed &&
+        cheat_guard_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
-             "tutorial skip, free detail weapons, clan-free blueprint "
-             "crafting, retired arsenal in the shop, the whole lobby craft "
-             "catalogue on the account, upgrade timers, the virtual abuse-"
-             "slot persistence sink and the local cheat-detection progress-"
-             "wipe block active");
+             "tutorial skip, direct post-match player/team table, free detail "
+             "weapons, clan-free blueprint crafting, retired arsenal in the "
+             "shop, the whole lobby craft catalogue on the account, upgrade "
+             "timers, the virtual abuse-slot persistence sink and the local "
+             "cheat-detection progress-wipe block active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -165,6 +168,10 @@ void* init_thread(void*) {
         if (!gameplay_installed) {
             LOGE("init: legacy gameplay module incomplete; tutorial skip or "
                  "upgrade time may be unavailable");
+        }
+        if (!post_match_installed) {
+            LOGE("init: post-match reward bypass incomplete; the second-round "
+                 "OK button can still remain behind a stale one-shot guard");
         }
         if (!free_details_installed) {
             LOGE("init: free detail-weapon compatibility is unavailable");
