@@ -22,12 +22,11 @@
 #define PHOTON_SERVER_PORT 5055
 #endif
 
-// Human-readable identity of the source revision this library was compiled
-// from. It is printed as the first line of the init log so a stale
-// libopg3d.so can be recognised immediately instead of being mistaken for a
-// failing hook. Bump the feature tag whenever runtime behaviour changes.
+// Human-readable identity printed before any runtime diagnostics. Keep this
+// target-specific: mixing the 13.2.1 and 14.1.1 libraries is unsafe even
+// though ordinary hooks resolve through metadata.
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "13.2.1 framework OBB + direct post-match (armory v14)"
+#define OPG3D_BUILD_TAG "14.1.1 full port v1 (re-sign + direct post-match + lobby)"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
