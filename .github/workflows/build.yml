@@ -2,9 +2,9 @@ name: build
 
 on:
   push:
-    branches: [main, "13.2.1"]
+    branches: [main, "13.2.1", "14.1.1"]
   pull_request:
-    branches: [main, "13.2.1"]
+    branches: [main, "13.2.1", "14.1.1"]
   workflow_dispatch:
 
 permissions:
@@ -22,33 +22,18 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
-      # Pull-request code is intentionally built without repository secrets.
-      # build.gradle and CMake both default PHOTON_APP_ID to an empty string,
-      # which is enough to compile and validate the native library.
       - name: Build PR (assembleRelease, armeabi-v7a, no Photon AppID)
         if: github.event_name == 'pull_request'
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
 
-      # Trusted branch pushes and manual runs keep producing the configured
-      # online build. PHOTON_APP_ID comes only from the repository secret.
       - name: Build trusted ref (assembleRelease, armeabi-v7a)
         if: github.event_name != 'pull_request'
         env:
           ORG_GRADLE_PROJECT_PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
 
-      # Guard against stack-unwinder regressions.
-      #
-      # libil2cpp.so carries a GNU-compatible ARM EHABI unwinder and raises
-      # managed exceptions through it. If a frame of our hook is described in
-      # generic model with a reference to __gxx_personality_v0 from the
-      # statically linked LLVM libc++abi, the first exception flying through
-      # the hook crashes the game in __unw_set_reg. Details are in the
-      # -fno-exceptions comment in opg3d/src/main/cpp/CMakeLists.txt.
-      #
-      # The danger is that without -fno-exceptions everything builds silently
-      # and only breaks on the device when the connection drops, so CI checks
-      # that the opg3d object files never reference that personality.
+      # A managed exception crossing one of our ARM hook frames must never be
+      # handed to LLVM's incompatible generic C++ personality.
       - name: Assert no LLVM C++ personality in our frames
         run: |
           set -euo pipefail
@@ -68,12 +53,11 @@ jobs:
           fi
           echo "$OBJS"
           if echo "$OBJS" | xargs "$NM" --undefined-only | grep -q '__gxx_personality_v0'; then
-            echo "::error::libopg3d frames reference __gxx_personality_v0 — a managed exception will crash the game. Restore -fno-exceptions."
+            echo "::error::libopg3d frames reference __gxx_personality_v0 — restore -fno-exceptions"
             exit 1
           fi
           echo "ok: no generic-model personality in our frames"
 
-      # The stage's public artifact is exactly one ready library.
       - name: Collect libopg3d.so
         run: |
           mkdir -p out
