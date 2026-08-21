@@ -26,12 +26,20 @@
 //
 //   1. BalanceController.NumOfDetailsForCraft(string)            -> 0
 //   2. CraftSetsManager.IsEnoughDetailsForCraftItem(string, str) -> true
-//   3. WeaponCraftDetailsInfo.GetDetailsCount(string)            -> large
+//   3. Rilisoft.WeaponCraftDetailsInfo.GetDetailsCount(string)   -> large
+//
+// Note the namespace of (3): WeaponCraftDetailsInfo is the only target of
+// this module that is not in the global namespace, and requesting the global
+// one made the lookup fail silently (optional hook -> warning only), which is
+// why the armory kept showing the real owned count.
 //
 // Only (1) is mandatory. (2) and (3) install when the class exists, so a
 // metadata mismatch degrades instead of failing the whole library, and each
 // path logs the first time it is used. If crafting is still refused, logcat
 // now shows exactly which of the three paths the game consulted.
+//
+// Clan blueprints have one more, non-detail gate of their own; see
+// clan_craft.h.
 //
 // Nothing here fabricates a server response: the stock craft button,
 // inventory provisioning, persistence and UI refresh still grant the weapon.
@@ -150,13 +158,15 @@ inline bool install_hooks() {
     }
 
     // Optional: the owned-detail count shown and compared by the armory UI.
+    // This class is declared in the Rilisoft namespace, unlike the two
+    // targets above.
     const bool owned_count = hook::install(
-        {"", "WeaponCraftDetailsInfo", "GetDetailsCount", 1},
+        {"Rilisoft", "WeaponCraftDetailsInfo", "GetDetailsCount", 1},
         detail::replacement(&detail::hook_details_count),
         detail::original_slot(&detail::g_details_count), false);
     if (!owned_count) {
-        LOGW("free-details: WeaponCraftDetailsInfo.GetDetailsCount is "
-             "unavailable; the armory may still show a shortage");
+        LOGW("free-details: Rilisoft.WeaponCraftDetailsInfo.GetDetailsCount "
+             "is unavailable; the armory may still show a shortage");
     }
 
     LOGI("free-details: armed (required=0 for every recipe, craft gate=%s, "
