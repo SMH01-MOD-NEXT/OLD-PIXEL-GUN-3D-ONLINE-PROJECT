@@ -16,6 +16,7 @@ The project does not connect to Cubic Games services and is not affiliated with 
 - **Free detail weapons.** Every craft recipe reports **0 required details** and the craft gate is answered positively, so the stock craft flow grants the weapon immediately. These weapons already have no craft wait in this client. There is no category filtering.
 - **Clan blueprints without a clan.** Clan blueprints are refused by a code path that has nothing to do with clans: the craft handler only accepts items present in the ordinary craft-recipe list, and clan recipes are parsed into a separate table. Rather than faking clan state, a refused press is completed by calling the game's own craft start with the same arguments the handler would have used. No `Clan` object is created and no clan data is written or sent anywhere.
 - **Retired arsenal weapons back in the shop.** The weapons removed from the arsenal by the 2015-06-15 content update are still complete in the client and are only kept off the shelves by one name list. That list is bypassed for the duration of a single shelf decision, per record, so retired weapons are shown and bought through the normal shop flow at the price the client itself computes. Ownership, `CanBuy`, prices, and the tier, level, filter-map and campaign gates are untouched, and the list keeps its real contents for the multiplayer code that substitutes retired weapons on other players' models.
+- **Local cheat-detection punishment blocked.** Detaching the client from the dead backend does not disarm `CheatDetectedBanner`. Its frame tick still runs `PlayerPrefs.DeleteAll()`, rewrites the `HackDetected` Storager marks, pushes the emptied state through `CloudSyncController.ApplyChanges` and posts an abuse report, and its show path additionally disconnects Photon and loads a full-screen banner scene. All three entry points are neutralised at the banner itself, and a banner shown by any other route removes itself instead of tearing down the rest of the scene. Detection inputs, ownership, currency, Storager and every save path stay stock; the module never writes save state.
 - **Offline-safe weapon upgrades.** When the retired server-time endpoint returns an invalid value, the client receives local Unix UTC seconds instead. The fallback is monotonic, so a device-clock rollback cannot strand an active item. The normal craft/upgrade timers, inventory provisioning, save routines, and UI refreshes remain responsible for state.
 - **Build stamp and diagnostics.** The first init line prints the source tag and compile timestamp of the running library, so a stale `libopg3d.so` is recognisable immediately. Runtime decisions are logged under one `OPG3D` logcat tag with sequence numbers, timestamps, thread IDs, and caller addresses where useful.
 
@@ -158,6 +159,91 @@ So the module never clears, replaces or nulls the list. For the single record th
 - **Ownership and saves.** Purchases, grants and persistence go through the untouched stock shop flow.
 - **Armor and hats.** Retired wear is a different mechanism (a compensation path around `MoneyGivenRemovedArmorHat`, not this name list), so it is out of scope for this module.
 
+## Blocking the local CHEAT DETECTED wipe
+
+The dead backend cannot punish anyone any more, but the APK still ships a purely local punishment. It is a single MonoBehaviour, and it erases the save on the device.
+
+### The punishment path
+
+```text
+CheatDetectedBanner : MonoBehaviour
+  const string HackDetectedKey = "HackDetected"
+
+  Update()                       RVA 0x12CB624
+    +0xA0  b   ClearAllProgress()                     ; tail call
+
+  ClearAllProgress()             RVA 0x12CAF4C
+    +0x98  bl  Storager.getString(string)             RVA 0xEBD8D8
+    +0xEC  bl  PlayerPrefs.DeleteAll()                RVA 0x1DA5640
+    +0xF8  bl  PlayerPrefs.Save()                     RVA 0x1DA56D0
+    +0x15C bl  Storager.setInt(string,int,...)        RVA 0xEB74A0
+    +0x1B4 bl  Storager.setString(string,string)      RVA 0xEBD760
+    +0x248 bl  CloudSyncController.ApplyChanges(bool) RVA 0x132A5FC
+    +0x274 bl  SendCheatTypeOnServer()                RVA 0x12CB238
+
+  ShowAndClearProgress()         RVA 0x12CAE84
+    +0x80  bl  PhotonNetwork.Disconnect()             RVA 0x6E6344
+    +0xA4  b   SceneManager.LoadScene(string)         RVA 0x1DB0D4C
+
+  Awake()                        RVA 0x12CB2C4
+    +0x50  bl  RemoveObjects()                        RVA 0x12CB448
+    +0x90  bl  ConnectScene.MainLoadingTexture()      RVA 0x112E58C
+
+  RemoveObjects()                RVA 0x12CB448
+           bl  Object.Destroy(Object)                 RVA 0x1D9F274
+           ; walks Transform.root of everything it finds and destroys it
+
+  OnExitButtonClick()            RVA 0x12CB6EC  ->  Application.Quit()
+  SendCheatTypeOnServer()        RVA 0x12CB238  ->  WWWForm abuse report
+```
+
+So the full-screen banner is not the damage: the damage is `PlayerPrefs.DeleteAll()` plus the rewritten `HackDetected` marks, and the emptied state is then pushed through the cloud-sync path so a later sync cannot bring the save back.
+
+### What the whole-binary scans proved
+
+Two scans of every direct `B`/`BL` in `.text` pin the graph down:
+
+- `PlayerPrefs.DeleteAll` has exactly **six** callers in the entire client, and only one is cheat-driven: `ClearAllProgress +0xEC`. The rest are ordinary wrappers (`KeychainCleaner.Clear`, `P31Prefs.removeAll`, `Save.DeleteAll`, `CryptoPlayerPrefs.DeleteAll`, `CustomHungerBase`).
+- `ClearAllProgress` has exactly **one** caller: `Update() +0xA0`.
+- `SendCheatTypeOnServer` has exactly **one** caller: `ClearAllProgress +0x274`.
+- `ShowAndClearProgress` has **no** direct caller in this build; it is reached indirectly, so it is neutralised as insurance rather than as the fix.
+
+That is why the block is installed at the banner, three methods deep: nothing else in the client loses a path it legitimately uses.
+
+### Why the detector itself is left alone
+
+The cheat criteria are server-driven data, not code that can be safely inverted:
+
+```text
+Rilisoft.CheatingMethods { None=0, SignatureTampering=1, CoinThreshold=2, GemThreshold=4 }
+Rilisoft.CheaterConfigMemento { CheckSignatureTampering, CoinThreshold, GemThreshold }
+AdsConfigManager.GetCheatingMethods(AdsConfigMemento)   RVA 0xE50FEC
+  single caller: GetPlayerCategory +0x118
+FriendsController.NewCheaterDetectParametersAvailable   Action<int,int,int,int>
+  fed by the cached "CheaterDetectParameters" config
+```
+
+The coin and gem thresholds are exactly what a private server's granted balance trips, and the methods that read that balance are ordinary getters shared with the shop, the bank and the HUD. Forcing them would corrupt real game state. The module therefore lets detection think whatever it likes and removes only its ability to act.
+
+### What the module does
+
+Mandatory, all on `CheatDetectedBanner`:
+
+1. `Update()` is never forwarded, so the tail call into the wipe cannot happen.
+2. `ClearAllProgress()` is refused, as defence in depth for any indirect route.
+3. `ShowAndClearProgress()` is refused, so the Photon disconnect and the banner scene load are skipped as well.
+
+Optional, cosmetic and scene safety, so a failure here still leaves the save protected:
+
+4. `Awake()` is intercepted. Instead of running the stock body — which wires the overlay and calls `RemoveObjects()` — the banner destroys its own `GameObject` through `Component.get_gameObject` and `UnityEngine.Object.Destroy`, and play continues.
+5. `RemoveObjects()` is refused, so a banner shown by any other route cannot destroy unrelated scene objects.
+
+### What stays stock
+
+- **No save writes.** The module does not clear the persisted `HackDetected` mark and never calls `Storager`, `PlayerPrefs` or `CloudSyncController`. The mark is read once, read-only, so a device report can show whether an earlier wipe already left it set.
+- **Detection inputs.** Currency, level, ownership, signature and config readers are untouched.
+- **The abuse report** is simply never started, because its only caller is the refused wipe.
+
 ## Technical design
 
 1. **Safe early initialization.** A native constructor starts a detached thread, waits for `libil2cpp.so`, waits for the assembly list to stabilize, and attaches to the IL2CPP runtime before touching metadata.
@@ -165,13 +251,14 @@ So the module never clears, replaces or nulls the list. For the single record th
 3. **Metadata-driven, fail-closed hooks.** Targets are found with the IL2CPP metadata API and hooked at their actual `MethodInfo::methodPointer` using ShadowHook in UNIQUE mode. No managed method RVA is compiled into the project; RVAs appear only in comments and documentation, as evidence for a decision. If a required class, method, or trampoline is unavailable, the module reports failure instead of patching an assumed address.
 4. **Read-only predicates over synthetic state.** Where the client blocks an action because a retired service can no longer answer, the missing answer is supplied at the exact predicate that asks for it. State that other systems would read — clan membership, server responses, currency ledgers, ownership — is not fabricated.
 5. **Narrowest possible scope.** When a predicate or a collection has consumers beyond the blocked action, its answer is relaxed only for the duration of that action instead of globally, so unrelated screens and the multiplayer code keep observing the real state.
-6. **Evidence before overrides.** A hypothesis about why the client refuses something is confirmed by a device log or by disassembly of the actual handler before it is shipped, and an override that the logs disprove is removed instead of being left in place "just in case".
-7. **Honest UI.** When a predicate is answered, the screens explaining that requirement are corrected as well, so the game never instructs the player to satisfy a condition that no longer exists or cannot be reached.
-8. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, purchases, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
-9. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
-10. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
-11. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
-12. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
+6. **Punishment is disarmed, detection is not.** Where the client reacts to a state a private server creates on purpose, the reaction is intercepted at its own entry points and the criteria that produced it are left untouched, because those criteria read ordinary game state that other systems share.
+7. **Evidence before overrides.** A hypothesis about why the client refuses something is confirmed by a device log or by disassembly of the actual handler before it is shipped, and an override that the logs disprove is removed instead of being left in place "just in case".
+8. **Honest UI.** When a predicate is answered, the screens explaining that requirement are corrected as well, so the game never instructs the player to satisfy a condition that no longer exists or cannot be reached.
+9. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, purchases, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
+10. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
+11. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
+12. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
+13. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
 
 ## Building
 
@@ -208,18 +295,31 @@ adb logcat -s OPG3D
 Relevant healthy-startup lines include:
 
 ```text
-init: libopg3d build 13.2.1 retired arsenal in shop (armory v8) built ...
-init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting, retired arsenal in the shop and upgrade timers active
+init: libopg3d build 13.2.1 local cheat-guard (armory v9) built ...
+init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting, retired arsenal in the shop, upgrade timers and the local cheat-detection progress-wipe block active
 legacy: tutorial skipped automatically; stage 3 and shop tutorial completion saved
 free-details: armed (required=0 for every recipe, craft gate=forced, owned count=synthetic); no category filtering
 free-details: required details for '<item id>': 25 -> 0
 clan-craft: armed (section=Available, shop shortcut=forced, medals=free, clan storage=synthetic, clan hint window=suppressed, press scope=on, direct craft start=on, busy-slot guard=on); no clan object is created
 removed-arsenal: armed (scope=shop shelf builder only, list=never cleared, CanBuy=untouched, prices=stock, tier/level/filter gates=stock)
+cheat-guard: armed (scope=CheatDetectedBanner only, PlayerPrefs/Storager/CloudSync writes=none, detection inputs=stock, persisted mark=read-only)
 boost: persisted grant armed (trigger=MainMenuController.Update, level target=38, currency target=999999999, level-up UI=skipped)
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 photon-status: 1024 (Connect) ...
 ui: ConnectionControl.OnConnectedToMaster state=16 ...
 ```
+
+If the client decides to punish the session, the block is visible instead of a wiped save:
+
+```text
+cheat-guard: CheatDetectedBanner.Awake() intercepted; the stock body would tear down the rest of the scene and arm the wipe tick
+cheat-guard: persisted 'HackDetected' mark reads <n> (read-only; this module never writes save state)
+cheat-guard: banner object destroyed on Awake; the session continues untouched
+cheat-guard: CheatDetectedBanner.Update() suppressed; its tail call into ClearAllProgress (PlayerPrefs.DeleteAll + Storager marks + cloud push + abuse report) never runs
+cheat-guard: CheatDetectedBanner.ClearAllProgress() refused; local progress, Storager marks and CloudSyncController are left exactly as they were
+```
+
+Any of those lines means the detection fired and nothing was erased. `ShowAndClearProgress() refused` in the same block additionally means the client tried to disconnect Photon and load the banner scene.
 
 Pressing **Craft** on a clan blueprint should produce this sequence:
 
@@ -244,7 +344,7 @@ removed-arsenal: retired weapon '<item id>' (prefab '<prefab>') offered to the s
 
 If a listed weapon shows no price in the shop, that is the stock price path answering with nothing for a retired id, not the module: the prefab names in these lines are what a price fix would have to be based on.
 
-The `removed-arsenal:` lines exist only on `armory v8` or newer. The `direct craft start` and `busy-slot guard` fields of the clan-craft armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
+The `cheat-guard:` lines exist only on `armory v9` or newer. The `removed-arsenal:` lines exist only on `armory v8` or newer. The `direct craft start` and `busy-slot guard` fields of the clan-craft armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
 
 AppIDs are logged only as a length and FNV-1a fingerprint.
 
@@ -269,6 +369,7 @@ opg3d/src/main/cpp/
 ├── free_detail_weapons.h     # zero-detail weapon crafting
 ├── clan_craft.h              # clan blueprints without clan membership
 ├── removed_arsenal.h         # retired weapons on the shop shelves
+├── cheat_guard.h             # local CHEAT DETECTED progress wipe blocked
 ├── config.h                  # build-time defaults and build tag; no credentials
 └── CMakeLists.txt            # pinned static ShadowHook and libopg3d.so
 ```
@@ -282,6 +383,7 @@ opg3d/src/main/cpp/
 - The refusal itself was located by disassembling `ShopNGUIController.HandleCraftButton_NoInfo` (`+0x1A0`, ordinary craft-recipe list lookup) and confirming that `WeaponManager.StartCraftWeaponOrAvatar` has exactly one caller, `+0x8FC` of the same handler.
 - The direct craft start of `armory v7` is derived from that handler's own success path and still needs a device report from a build printing the `armory v7` stamp.
 - The retired-weapon shop filter of `armory v8` was located by disassembly: the removed-name check at `_AddWeaponToShopListsIfNeeded +0x474`, the lazy rebuild in `get_Removed150615_PrefabNames +0xB4`, the three shelf call sites in `_InitShopCategoryLists`, and a full `BL` scan of `.text` for the fifteen readers of the list. It still needs a device report from a build printing the `armory v8` stamp, in particular whether every re-listed weapon also has a price.
+- The local wipe blocked by `armory v9` was reported from a live session ("CHEAT DETECTED" on half the screen) and then traced statically: `CheatDetectedBanner.Update +0xA0` as the only caller of `ClearAllProgress`, `ClearAllProgress +0xEC` as the only cheat-driven caller of `PlayerPrefs.DeleteAll` among six in the whole binary, `+0x248` for the cloud push, `+0x274` for the abuse report, and no direct caller at all for `ShowAndClearProgress`. A device report from a build printing the `armory v9` stamp is still needed, including the value of the persisted `HackDetected` mark.
 - The clan-storage accessors and the medal price were verified against the supplied 13.2.1 analysis files only.
 - Photon handshake, master/game-server transitions, room creation, and a 1v1 match have been verified between two devices on different networks.
 - All clients must use EU, with EU configured as the only allowed Photon region.
