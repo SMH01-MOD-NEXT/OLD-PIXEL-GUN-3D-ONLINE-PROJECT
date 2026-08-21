@@ -142,8 +142,9 @@ void* init_thread(void*) {
         cheat_guard_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
              "tutorial skip, free detail weapons, clan-free blueprint "
-             "crafting, retired arsenal in the shop, upgrade timers and the "
-             "local cheat-detection progress-wipe block active");
+             "crafting, retired arsenal in the shop, the whole lobby craft "
+             "catalogue on the account, upgrade timers and the local "
+             "cheat-detection progress-wipe block active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
