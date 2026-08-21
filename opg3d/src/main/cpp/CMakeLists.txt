@@ -82,6 +82,19 @@ add_library(shadowhook_static STATIC ${SH_SRC})
 target_compile_features(shadowhook_static PRIVATE c_std_11)
 # Third-party code: silence warnings and optimize for size.
 target_compile_options(shadowhook_static PRIVATE -Os -w)
+# ShadowHook normally overwrites one A32 instruction and jumps through an
+# 8-byte island allocated within the target's +/-32 MiB branch range. The
+# 14.1.1 libil2cpp mapping has no usable island near three PhotonNetwork
+# methods, so the first strategy returns errno 40. Enable ShadowHook's own
+# second strategy for this verified ARM32 target: after an island allocation
+# failure it rewrites the first two regular A32 prologue instructions with an
+# 8-byte absolute jump. The island strategy remains the first choice for all
+# other hooks.
+if(ANDROID_ABI STREQUAL "armeabi-v7a")
+    target_compile_definitions(shadowhook_static PRIVATE
+        SH_CONFIG_TRY_HOOK_WITHOUT_ISLAND=1
+    )
+endif()
 target_include_directories(shadowhook_static
     PUBLIC  ${SH_SRC_DIR}/include
     PRIVATE ${SH_SRC_DIR}
