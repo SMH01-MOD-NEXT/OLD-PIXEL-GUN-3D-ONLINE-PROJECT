@@ -21,7 +21,7 @@
 // libopg3d.so can be recognised immediately instead of being mistaken for a
 // failing hook. Bump the feature tag whenever runtime behaviour changes.
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "13.2.1 retired arsenal in shop (armory v8)"
+#define OPG3D_BUILD_TAG "13.2.1 local cheat-guard (armory v9)"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
