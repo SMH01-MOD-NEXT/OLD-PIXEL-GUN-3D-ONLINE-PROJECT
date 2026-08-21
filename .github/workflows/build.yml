@@ -3,6 +3,8 @@ name: build
 on:
   push:
     branches: [main, "13.2.1"]
+  pull_request:
+    branches: [main, "13.2.1"]
   workflow_dispatch:
 
 permissions:
@@ -20,10 +22,17 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
-      # PHOTON_APP_ID comes only from repository secrets. CMake downloads the
-      # shadowhook sources at the pinned tag, patches them and links them
-      # statically into the single libopg3d.so.
-      - name: Build (assembleRelease, armeabi-v7a)
+      # Pull-request code is intentionally built without repository secrets.
+      # build.gradle and CMake both default PHOTON_APP_ID to an empty string,
+      # which is enough to compile and validate the native library.
+      - name: Build PR (assembleRelease, armeabi-v7a, no Photon AppID)
+        if: github.event_name == 'pull_request'
+        run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
+
+      # Trusted branch pushes and manual runs keep producing the configured
+      # online build. PHOTON_APP_ID comes only from the repository secret.
+      - name: Build trusted ref (assembleRelease, armeabi-v7a)
+        if: github.event_name != 'pull_request'
         env:
           ORG_GRADLE_PROJECT_PHOTON_APP_ID: ${{ secrets.PHOTON_APP_ID }}
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace
