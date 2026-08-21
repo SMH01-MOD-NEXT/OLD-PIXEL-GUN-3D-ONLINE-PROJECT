@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "custom_hunger_guard.h"
 #include "hook.h"
 #include "il2cpp.h"
 #include "log.h"
@@ -160,13 +161,19 @@ inline bool install_hooks() {
         LOGE("cheat-guard: the virtual abuse-slot sink is incomplete; a "
              "fixed inert key could still persist from match one to match "
              "two");
-        return false;
+    } else {
+        LOGI("cheat-guard: virtual abuse-slot sink armed (hasKey=false, "
+             "getString=empty, setString=no-op for opg3d_inert_slot_a..d; all "
+             "other Storager keys are stock)");
     }
 
-    LOGI("cheat-guard: virtual abuse-slot sink armed (hasKey=false, "
-         "getString=empty, setString=no-op for opg3d_inert_slot_a..d; all "
-         "other Storager keys are stock)");
-    return true;
+    // CustomHungerBase is a separate delayed punishment scene, not part of the
+    // four redirected persistence slots. Install its two gates here so the
+    // existing main-module success condition remains fail-closed without
+    // coupling its implementation to the much larger CheatDetectedBanner
+    // guard.
+    const bool custom_hunger_installed = custom_hunger_guard::install_hooks();
+    return installed && custom_hunger_installed;
 }
 
 } // namespace abuse_slot_sink
