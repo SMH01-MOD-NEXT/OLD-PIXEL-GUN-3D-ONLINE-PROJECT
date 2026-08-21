@@ -15,6 +15,7 @@ The project does not connect to Cubic Games services and is not affiliated with 
 - **Automatic tutorial skip.** The initial training stage is completed before scene routing can send a fresh profile into training. Both the first-match stage and the 12.1+ shop-tutorial flag are written through the game's own persistence APIs, so the skip survives a restart.
 - **Free detail weapons.** Every craft recipe reports **0 required details** and the craft gate is answered positively, so the stock craft flow grants the weapon immediately. These weapons already have no craft wait in this client. There is no category filtering.
 - **Clan blueprints without a clan.** Clan blueprints are refused by a code path that has nothing to do with clans: the craft handler only accepts items present in the ordinary craft-recipe list, and clan recipes are parsed into a separate table. Rather than faking clan state, a refused press is completed by calling the game's own craft start with the same arguments the handler would have used. No `Clan` object is created and no clan data is written or sent anywhere.
+- **Retired arsenal weapons back in the shop.** The weapons removed from the arsenal by the 2015-06-15 content update are still complete in the client and are only kept off the shelves by one name list. That list is bypassed for the duration of a single shelf decision, per record, so retired weapons are shown and bought through the normal shop flow at the price the client itself computes. Ownership, `CanBuy`, prices, and the tier, level, filter-map and campaign gates are untouched, and the list keeps its real contents for the multiplayer code that substitutes retired weapons on other players' models.
 - **Offline-safe weapon upgrades.** When the retired server-time endpoint returns an invalid value, the client receives local Unix UTC seconds instead. The fallback is monotonic, so a device-clock rollback cannot strand an active item. The normal craft/upgrade timers, inventory provisioning, save routines, and UI refreshes remain responsible for state.
 - **Build stamp and diagnostics.** The first init line prints the source tag and compile timestamp of the running library, so a stale `libopg3d.so` is recognisable immediately. Runtime decisions are logged under one `OPG3D` logcat tag with sequence numbers, timestamps, thread IDs, and caller addresses where useful.
 
@@ -104,16 +105,69 @@ The "Crafting Process" window (`CraftSectionClanInfoController`, fields `_availa
 
 One consequence is documented on purpose: if a craft is already running and a clan blueprint is pressed, the window stays suppressed and the press is declined with a log line, because this branch never reaches the stock "already crafting" handling that would have offered the speed-up window.
 
+## Retired arsenal weapons in the shop
+
+The weapons pulled from the arsenal by the 2015-06-15 content update never left the client. `ItemDb` still holds their records, their prefabs, icons and upgrade chains ship with the APK, and the game still knows how to equip and render them. On a private server there is no reason to keep them off the shelves.
+
+### Why `CanBuy` is not used
+
+`ItemRecord.get_CanBuy()` (RVA `0x535CF4`) has no backing field in this build — it is computed — and it is read by ownership and pricing paths rather than by the shelf builder: `ItemDb.GetCanBuyWeapon()` (`0x5320A0`), `ItemDb.GetCanBuyWeaponTags()` (`0x532264`), `ItemDb.GetCanBuyWearTags(...)` (`0x5359D8`), `RespawnWindowItemToBuy.IsCanBuy()`. Forcing it — even only for retired items — would change what the client treats as a purchasable item and can present an owned weapon as unowned. It is therefore never touched.
+
+### What actually hides them
+
+The filter is one name list, not a per-item flag:
+
+```text
+WeaponManager._Removed150615_PrefabNAmes            static HashSet<string>, +0x130
+  filled once by InitializeRemoved150615Weapons()    RVA 0x98AB94
+    +0x90 -> BalanceController.RemovedWeaponNames()  RVA 0xC9E2D0
+  exposed by  get_Removed150615_PrefabNames()        RVA 0x98ACC0
+    +0xB4 -> InitializeRemoved150615Weapons()        ; lazy rebuild
+```
+
+and the shelf is refused inside the per-record shop builder:
+
+```text
+WeaponManager._AddWeaponToShopListsIfNeeded(ItemRecord)  RVA 0x98ADE4
+  +0x474  bl  WeaponManager.get_Removed150615_PrefabNames()
+          bl  ItemRecord.get_PrefabName()
+              HashSet<string>.Contains(prefab)
+          b   +0x71C        ; returns; the record is never appended
+```
+
+That method is called only from `_InitShopCategoryLists` (`+0x9C0`, `+0x1090`, `+0x123C`), which the shop rebuild drives. Nothing on the path reads or writes ownership, currency or saves: a filtered record is simply absent from a category list.
+
+Because the getter rebuilds the list lazily, nulling the static field does not disable the filter — the next call restores it from the balance config.
+
+### Why the list is not emptied
+
+The same list has fifteen readers, and three of them must keep seeing its real contents, because they substitute a retired weapon on another player's model instead of hiding anything:
+
+```text
+CharacterInterface.SetWeapon(...)                           +0x664
+CharacterView.SetWeaponAndSkin(..., replaceRemovedWeapons)  +0x948
+Player_move_c.<SetWeaponRPC>c__Iterator2.MoveNext()         +0x138
+```
+
+So the module never clears, replaces or nulls the list. For the single record the shelf builder is currently deciding about, that record's prefab name is unlisted right before the stock method runs and put back immediately after it returns, and the restore is verified with the game's own `Contains`. `Contains`, `Remove` and `Add` are resolved from the class of the live `HashSet<string>` instance, so no container layout is assumed. Anything unexpected forwards the call unchanged, which keeps the stock result — the weapon stays hidden — instead of guessing.
+
+### What stays stock
+
+- **Prices.** `ItemDb.GetPriceByShopId` (`0x531448`) consults `BalanceController.pricesFromServer` first and falls back to the local `ItemDb` records, so a re-listed weapon is bought through the normal shop flow at the price the client computes for it. No price is fabricated.
+- **Every other shelf condition** of the same method: campaign-only records, filter maps, the try-gun check, the player tier, and the event/craft tag set with its level requirement. An unhidden weapon appears where the client itself would have put it.
+- **Ownership and saves.** Purchases, grants and persistence go through the untouched stock shop flow.
+- **Armor and hats.** Retired wear is a different mechanism (a compensation path around `MoneyGivenRemovedArmorHat`, not this name list), so it is out of scope for this module.
+
 ## Technical design
 
 1. **Safe early initialization.** A native constructor starts a detached thread, waits for `libil2cpp.so`, waits for the assembly list to stabilize, and attaches to the IL2CPP runtime before touching metadata.
 2. **Symbol resolution without `dlsym`.** Android linker namespaces and `RTLD_LOCAL` hide the game's exports from `dlsym(RTLD_DEFAULT)`. `elf_sym` reads the already-mapped ELF dynamic symbol table directly.
 3. **Metadata-driven, fail-closed hooks.** Targets are found with the IL2CPP metadata API and hooked at their actual `MethodInfo::methodPointer` using ShadowHook in UNIQUE mode. No managed method RVA is compiled into the project; RVAs appear only in comments and documentation, as evidence for a decision. If a required class, method, or trampoline is unavailable, the module reports failure instead of patching an assumed address.
-4. **Read-only predicates over synthetic state.** Where the client blocks an action because a retired service can no longer answer, the missing answer is supplied at the exact predicate that asks for it. State that other systems would read — clan membership, server responses, currency ledgers — is not fabricated.
-5. **Narrowest possible scope.** When a predicate has consumers beyond the blocked action, its answer is relaxed only for the duration of that action instead of globally, so unrelated screens keep observing the real state.
+4. **Read-only predicates over synthetic state.** Where the client blocks an action because a retired service can no longer answer, the missing answer is supplied at the exact predicate that asks for it. State that other systems would read — clan membership, server responses, currency ledgers, ownership — is not fabricated.
+5. **Narrowest possible scope.** When a predicate or a collection has consumers beyond the blocked action, its answer is relaxed only for the duration of that action instead of globally, so unrelated screens and the multiplayer code keep observing the real state.
 6. **Evidence before overrides.** A hypothesis about why the client refuses something is confirmed by a device log or by disassembly of the actual handler before it is shipped, and an override that the logs disprove is removed instead of being left in place "just in case".
 7. **Honest UI.** When a predicate is answered, the screens explaining that requirement are corrected as well, so the game never instructs the player to satisfy a condition that no longer exists or cannot be reached.
-8. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
+8. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, purchases, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
 9. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
 10. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
 11. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
@@ -154,12 +208,13 @@ adb logcat -s OPG3D
 Relevant healthy-startup lines include:
 
 ```text
-init: libopg3d build 13.2.1 clan-craft workaround (armory v7) built ...
-init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting and upgrade timers active
+init: libopg3d build 13.2.1 retired arsenal in shop (armory v8) built ...
+init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting, retired arsenal in the shop and upgrade timers active
 legacy: tutorial skipped automatically; stage 3 and shop tutorial completion saved
 free-details: armed (required=0 for every recipe, craft gate=forced, owned count=synthetic); no category filtering
 free-details: required details for '<item id>': 25 -> 0
 clan-craft: armed (section=Available, shop shortcut=forced, medals=free, clan storage=synthetic, clan hint window=suppressed, press scope=on, direct craft start=on, busy-slot guard=on); no clan object is created
+removed-arsenal: armed (scope=shop shelf builder only, list=never cleared, CanBuy=untouched, prices=stock, tier/level/filter gates=stock)
 boost: persisted grant armed (trigger=MainMenuController.Update, level target=38, currency target=999999999, level-up UI=skipped)
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 photon-status: 1024 (Connect) ...
@@ -180,7 +235,16 @@ The last line is the one that matters: it means the craft is running. If it is m
 clan-craft: '<item id>' was not started because '<other item>' is still being crafted; ...
 ```
 
-The `direct craft start` and `busy-slot guard` fields of the armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
+Opening the shop after a rebuild names every retired weapon that reached the shelves, up to a logging cap:
+
+```text
+removed-arsenal: retired-name list is live; shop shelf filter is now bypassed per record
+removed-arsenal: retired weapon '<item id>' (prefab '<prefab>') offered to the shop at its stock price; shelf decisions so far: <n>
+```
+
+If a listed weapon shows no price in the shop, that is the stock price path answering with nothing for a retired id, not the module: the prefab names in these lines are what a price fix would have to be based on.
+
+The `removed-arsenal:` lines exist only on `armory v8` or newer. The `direct craft start` and `busy-slot guard` fields of the clan-craft armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
 
 AppIDs are logged only as a length and FNV-1a fingerprint.
 
@@ -204,6 +268,7 @@ opg3d/src/main/cpp/
 ├── legacy_gameplay.h         # tutorials and upgrade clock fallback
 ├── free_detail_weapons.h     # zero-detail weapon crafting
 ├── clan_craft.h              # clan blueprints without clan membership
+├── removed_arsenal.h         # retired weapons on the shop shelves
 ├── config.h                  # build-time defaults and build tag; no credentials
 └── CMakeLists.txt            # pinned static ShadowHook and libopg3d.so
 ```
@@ -216,6 +281,7 @@ opg3d/src/main/cpp/
 - The `armory v6` build proved on device that `ClansController.IsClanItem` and `ShopCraftManager.CraftItemAndNotCrafted` are not called during a craft press, which is why both overrides were removed.
 - The refusal itself was located by disassembling `ShopNGUIController.HandleCraftButton_NoInfo` (`+0x1A0`, ordinary craft-recipe list lookup) and confirming that `WeaponManager.StartCraftWeaponOrAvatar` has exactly one caller, `+0x8FC` of the same handler.
 - The direct craft start of `armory v7` is derived from that handler's own success path and still needs a device report from a build printing the `armory v7` stamp.
+- The retired-weapon shop filter of `armory v8` was located by disassembly: the removed-name check at `_AddWeaponToShopListsIfNeeded +0x474`, the lazy rebuild in `get_Removed150615_PrefabNames +0xB4`, the three shelf call sites in `_InitShopCategoryLists`, and a full `BL` scan of `.text` for the fifteen readers of the list. It still needs a device report from a build printing the `armory v8` stamp, in particular whether every re-listed weapon also has a price.
 - The clan-storage accessors and the medal price were verified against the supplied 13.2.1 analysis files only.
 - Photon handshake, master/game-server transitions, room creation, and a 1v1 match have been verified between two devices on different networks.
 - All clients must use EU, with EU configured as the only allowed Photon region.
