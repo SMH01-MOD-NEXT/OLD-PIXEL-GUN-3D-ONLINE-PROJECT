@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 #include "elf_sym.h"
 
@@ -13,6 +14,11 @@ constexpr const char* kSo = "libil2cpp.so";
 // A sane upper bound for the number of managed assemblies. If the runtime
 // reports more, we have read the vector mid-reallocation and must not walk it.
 constexpr size_t kMaxAssemblies = 8192u;
+
+// Upper bound for one nested-type walk. A compiler-generated class family
+// never comes close; the cap only guarantees termination if the runtime ever
+// hands back an inconsistent iterator.
+constexpr size_t kMaxNestedTypes = 4096u;
 
 template <typename T>
 bool bind(T& fn, const char* name) {
@@ -39,6 +45,35 @@ void append_utf8(std::string& out, uint32_t cp) {
     }
 }
 
+// Exactly what il2cpp_class_from_name() can see: the top-level type list of
+// each loaded image. Nested types are deliberately not reachable here.
+void* class_from_name_any_image(const char* namespaze, const char* name) {
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image ||
+        !class_from_name || namespaze == nullptr || name == nullptr) {
+        return nullptr;
+    }
+
+    void* domain = domain_get();
+    if (domain == nullptr) return nullptr;
+
+    size_t count = 0;
+    void** assemblies = domain_get_assemblies(domain, &count);
+    if (assemblies == nullptr || count == 0u || count > kMaxAssemblies) {
+        return nullptr;
+    }
+
+    // Search all managed assemblies: old PUN plugins could be built as
+    // Assembly-CSharp, Assembly-CSharp-firstpass or a separate Photon assembly.
+    for (size_t i = 0; i < count; ++i) {
+        if (assemblies[i] == nullptr) continue;
+        void* image = assembly_get_image(assemblies[i]);
+        if (image == nullptr) continue;
+        void* klass = class_from_name(image, namespaze, name);
+        if (klass != nullptr) return klass;
+    }
+    return nullptr;
+}
+
 } // namespace
 
 bool resolve() {
@@ -60,6 +95,13 @@ bool resolve() {
     ok &= bind(field_static_set_value,    "il2cpp_field_static_set_value");
     ok &= bind(thread_attach,             "il2cpp_thread_attach");
     bind(thread_detach, "il2cpp_thread_detach");
+
+    // Optional on purpose: only nested-type resolution needs these two. Keeping
+    // them out of `ok` means a layout that lacks them still installs every
+    // top-level hook instead of failing the whole module; the nested iterator
+    // blocks degrade to the same "not found" warning they produced before.
+    bind(class_get_nested_types, "il2cpp_class_get_nested_types");
+    bind(class_get_name,         "il2cpp_class_get_name");
     return ok;
 }
 
@@ -90,29 +132,50 @@ void* find_image(const char* name) {
     return nullptr;
 }
 
+void* find_nested_class(void* outer, const char* name) {
+    if (outer == nullptr || name == nullptr ||
+        class_get_nested_types == nullptr || class_get_name == nullptr) {
+        return nullptr;
+    }
+
+    // GetNestedTypes() sets up the nested-type list of the declaring class on
+    // demand. It does not run managed static constructors, so this keeps the
+    // same contract as the rest of the lookups in this file.
+    void* iter = nullptr;
+    for (size_t guard = 0; guard < kMaxNestedTypes; ++guard) {
+        void* nested = class_get_nested_types(outer, &iter);
+        if (nested == nullptr) break;
+        const char* nested_name = class_get_name(nested);
+        if (nested_name != nullptr && std::strcmp(nested_name, name) == 0) {
+            return nested;
+        }
+    }
+    return nullptr;
+}
+
 void* find_class(const char* namespaze, const char* name) {
-    if (!domain_get || !domain_get_assemblies || !assembly_get_image ||
-        !class_from_name || namespaze == nullptr || name == nullptr) {
-        return nullptr;
-    }
+    if (namespaze == nullptr || name == nullptr) return nullptr;
 
-    void* domain = domain_get();
-    if (domain == nullptr) return nullptr;
+    void* direct = class_from_name_any_image(namespaze, name);
+    if (direct != nullptr) return direct;
 
-    size_t count = 0;
-    void** assemblies = domain_get_assemblies(domain, &count);
-    if (assemblies == nullptr || count == 0u || count > kMaxAssemblies) {
-        return nullptr;
-    }
+    // Nested fallback (see the comment on find_class in il2cpp.h). Split points
+    // are tried from the right, so "Outer/<M>c__Iterator0" and
+    // "Outer.<M>c__Iterator0" both resolve, and the plain lookup above always
+    // gets the first attempt at a dotted name that is really a namespace.
+    const std::string full(name);
+    for (size_t i = full.size(); i-- > 0;) {
+        const char c = full[i];
+        if (c != '/' && c != '.') continue;
+        if (i == 0u || i + 1u >= full.size()) continue;
 
-    // Search all managed assemblies: old PUN plugins could be built as
-    // Assembly-CSharp, Assembly-CSharp-firstpass or a separate Photon assembly.
-    for (size_t i = 0; i < count; ++i) {
-        if (assemblies[i] == nullptr) continue;
-        void* image = assembly_get_image(assemblies[i]);
-        if (image == nullptr) continue;
-        void* klass = class_from_name(image, namespaze, name);
-        if (klass != nullptr) return klass;
+        // The declaring type may itself be nested, hence the recursion. It
+        // always terminates: the outer name is strictly shorter every time.
+        void* outer = find_class(namespaze, full.substr(0, i).c_str());
+        if (outer == nullptr) continue;
+
+        void* nested = find_nested_class(outer, full.substr(i + 1u).c_str());
+        if (nested != nullptr) return nested;
     }
     return nullptr;
 }
