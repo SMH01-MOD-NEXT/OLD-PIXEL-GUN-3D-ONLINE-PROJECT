@@ -160,8 +160,15 @@ if(PHOTON_MODE STREQUAL "selfhosted")
     target_compile_definitions(opg3d PRIVATE PHOTON_MODE_SELFHOSTED=1)
 endif()
 
+# z: obb_provisioner.h reads the APK as a plain ZIP with syscalls, and both
+# things it needs from zlib are unavoidable there — AndroidManifest.xml is
+# always deflated inside an APK (that is where the package name and the version
+# code come from), and the extracted expansion file is verified against the
+# CRC-32 recorded in the archive. libz is an NDK-public system library, so this
+# adds a DT_NEEDED on libz.so and nothing to the artifact.
 target_link_libraries(opg3d PRIVATE
     shadowhook_static
     log
     dl
+    z
 )
