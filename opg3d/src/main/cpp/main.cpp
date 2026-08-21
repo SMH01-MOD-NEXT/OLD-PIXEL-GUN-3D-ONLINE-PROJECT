@@ -16,6 +16,7 @@
 #include "log.h"
 #include "photon_hooks.h"
 #include "player_boost.h"
+#include "removed_arsenal.h"
 
 namespace {
 
@@ -132,12 +133,14 @@ void* init_thread(void*) {
     const bool gameplay_installed = legacy_gameplay::install_hooks();
     const bool free_details_installed = free_detail_weapons::install_hooks();
     const bool clan_craft_installed = clan_craft::install_hooks();
+    const bool removed_arsenal_installed = removed_arsenal::install_hooks();
     if (photon_installed && guard_installed && boost_installed &&
         gameplay_installed && free_details_installed &&
-        clan_craft_installed) {
+        clan_craft_installed && removed_arsenal_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
              "tutorial skip, free detail weapons, clan-free blueprint "
-             "crafting and upgrade timers active");
+             "crafting, retired arsenal in the shop and upgrade timers "
+             "active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -161,6 +164,10 @@ void* init_thread(void*) {
         if (!clan_craft_installed) {
             LOGE("init: clan blueprints remain locked; the craft-section "
                  "availability gate could not be answered");
+        }
+        if (!removed_arsenal_installed) {
+            LOGE("init: retired arsenal weapons stay hidden; the shop shelf "
+                 "builder could not be wrapped");
         }
     }
 
