@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "hook.h"
@@ -10,70 +11,93 @@
 
 // Clan blueprints on a client without a backend.
 //
-// Detail prices are already zero for every recipe (see
-// free_detail_weapons.h) and the armory correctly shows "0 of 0" for clan
-// blueprints, yet pressing Craft used to open the "Crafting Process" hint
-// window instead of starting the craft. Clans were a purely server-side
-// feature, so every clan requirement of this build is unreachable for good.
+// Detail prices are already zero for every recipe (see free_detail_weapons.h)
+// and the armory correctly shows "0 of 0" for a clan blueprint, yet pressing
+// Craft never started a craft. Two earlier hypotheses were tested on device
+// and both were disproved:
 //
-// What the device logs proved, step by step:
+//   * Forcing CraftSectionAvailability to Available only changed the hint
+//     window's own call-to-action from "Find a Clan" to "Raise the level".
+//     The enum is read by that window, not by the press.
+//   * Scoping ClansController.IsClanItem(string) to the craft press had no
+//     effect whatsoever: the armory v6 log shows the hook installed and then
+//     never called during a press, and the same is true for
+//     ShopCraftManager.CraftItemAndNotCrafted(string).
 //
-//   1. Forcing the craft-section enum works. The dump defines
+// Static disassembly settled the question. The libil2cpp.so of this build is
+// ARM (A32) code, so plain BL scanning resolves the call graph exactly:
 //
-//        enum CraftSectionAvailability { UnavailableClansNotOpened = 0,
-//                                       UnavailableNoClan         = 1,
-//                                       UnavailableNoDetails      = 2,
-//                                       Available                 = 3 }
+//   ArmoryInfoScreenController.HandleCraftButtonClicked  (RVA 0xC92A5C)
+//     +0xDC  -> ShopNGUIController.HandleCraftButton_NoInfo (RVA 0x9F1740)
+//              (the only caller; the logged press PC is +0xC92B3C)
 //
-//      and the hook reports "UnavailableNoClan(1) -> Available(3)". The
-//      hint window is built from that same value, which is why its
-//      call-to-action changed from "Find a Clan" to "Raise the level":
-//      CraftSectionClanInfoController picks its header and button label from
-//      the enum, and both clan states point at something unreachable here.
+// and that handler is the only caller of the craft start itself:
 //
-//   2. The craft press is refused *before* that enum is consulted. The press
-//      trace prints "stock section state <unknown>", meaning
-//      GetCraftSectionAvailability had not been called even once at that
-//      moment, and the first call right afterwards returns into
-//      0x1ABD670..0x1ABD8F8, the body of CraftSectionClanInfoController
-//      .Awake. In other words the enum is only read by the window the
-//      handler had already decided to open.
+//   WeaponManager.StartCraftWeaponOrAvatar(string, long)  (RVA 0x962FB8)
+//     called once, from HandleCraftButton_NoInfo +0x8FC
 //
-//   3. Clan storage is never queried during the press either: no clan-storage
-//      decision is logged between the press and the window.
+// The refusal happens long before any clan state is consulted. At +0x1A0 the
+// handler asks a list of ordinary craft recipes whether it contains the
+// pressed id:
 //
-// The only clan input the handler can consult that early is the item
-// classification itself:
+//   0x9F18E0  bl   List<string>.Contains(id)
+//   0x9F18E4  cmp  r0, #1
+//   0x9F18E8  bne  0x9F1A7C          ; returns without ever reaching +0x8FC
 //
-//   ClansController.IsClanItem(string id) -> bool     (static, RVA 0x1016364)
+// Clan blueprints are absent from that list: their recipes are parsed
+// separately, by BalanceController.ParseClanRecipesConfig, so the ordinary
+// recipe table this branch consults has no entry for them. This is why every
+// clan-side override was ineffective — the branch that refuses the press is
+// not about clans at all, and no clan answer can influence it.
 //
-// A clan blueprint is therefore routed away from the clan branch: while a
-// craft press is on the stack, that classification is answered with "not a
-// clan item", so the handler takes the ordinary detail recipe, which already
-// costs zero details and finishes without a timer. Outside the press the
-// stock answer is returned untouched, which keeps item categories, the clan
-// storage screens and the chest logic exactly as the game built them.
+// So this module stops arguing with the handler. When the stock handler
+// refuses a press, the craft is started directly through the game's own
+// methods, reproducing the exact sequence of the handler's own success path
+// (+0x810 .. +0x8FC), including where each argument comes from:
+//
+//   ItemDb.GetByTag(id)                                  -> ItemRecord
+//   ItemRecord.PrefabName                                -> string prefab
+//   BalanceController.GetFullTimeCraftInSeconds(prefab)   -> int seconds
+//   FriendsController.ServerTime + seconds                -> long endTime
+//   WeaponManager.StartCraftWeaponOrAvatar(id, endTime)
+//
+// Note that the stock code keys the craft duration by prefab name while the
+// craft itself is keyed by item tag; both are reproduced faithfully instead of
+// passing the same string twice. Persistence, the craft timer, the finish
+// handler and the reward path all stay inside the game's own code, and the
+// caller refreshes the armory by calling ArmoryInfoScreenController.SetItem
+// immediately after the handler returns, so no UI is driven from here either.
+//
+// Three guards keep the forced start honest:
+//
+//   1. It runs only for the outermost craft press, and only when the stock
+//      handler actually refused it — observed as the hint window being raised
+//      inside the press scope, which is the refusal signature of this branch.
+//      A press the stock handler completes on its own is never touched.
+//   2. It runs only when the craft slot is empty. The handler's own "already
+//      crafting" check lives at +0x494, far behind the recipe-list exit, so a
+//      clan blueprint pressed while another weapon is crafting would never
+//      reach it. WeaponManager.CurrentCraftingWeaponOrAvatar is read first,
+//      and a busy slot means the press is declined instead of overwriting a
+//      craft that is already running.
+//   3. It verifies the slot afterwards and reports an error if the game did
+//      not accept the craft, rather than logging success unconditionally.
 //
 // Nothing here constructs a Clan instance, assigns ClansController.myClan,
 // rewrites the "Clan.MyClanCache" entry on disk or calls any retired clan
 // endpoint (SendUpdateStock, AskCraftFortItem, AddClanCurrency,
-// SendClanMessageDetailsBought). That distinction is the whole point: a
-// synthetic clan would leak into every clan screen, siege matchmaking, the
-// chest/season logic and the analytics payloads, while a scoped predicate is
-// only observable in the one code path that asks "may this player craft this
-// item right now".
+// SendClanMessageDetailsBought). A synthetic clan would leak into every clan
+// screen, siege matchmaking, chest and season logic, and analytics payload,
+// which is exactly how a dead-backend client crashes.
 //
-// Two clan-side inputs of the same craft path stay neutralized because they
-// read from clan storage that no longer exists, and the medal price is waived
-// for the same reason:
+// The clan-side answers that remain are the ones that keep the armory screen
+// itself coherent, because they read state that no longer exists:
 //
+//   ShopCraftManager.GetCraftSectionAvailability()        -> Available
+//   ShopNGUIController.IsCraftSectionAvailable()          -> true
 //   BalanceController.MedalsForClanCraft(string)          -> 0
 //   ClansController.AnyPartExistsInStock(string, type)    -> true
 //   ClansController.GetPartCountInStock(string, type)     -> synthetic if empty
-//
-// Only the availability gate is mandatory. Everything else installs when the
-// metadata matches and degrades with a warning otherwise. The craft press is
-// traced so a follow-up report shows which predicate the client consulted.
 namespace clan_craft {
 namespace detail {
 
@@ -93,24 +117,50 @@ using PartCountFn = int32_t (*)(void* static_context, ManagedString* item_id,
                                 int32_t item_type, const MethodInfo* method);
 using AnyPartFn = bool (*)(void* static_context, ManagedString* item_id,
                            int32_t item_type, const MethodInfo* method);
-using IsClanItemFn = bool (*)(void* static_context, ManagedString* item_id,
-                              const MethodInfo* method);
-using CraftableFn = bool (*)(void* static_context, ManagedString* item_id,
-                             const MethodInfo* method);
 using ShowSectionInfoFn = void (*)(void* self, const MethodInfo* method);
 using CraftPressFn = void (*)(void* self, ManagedString* item_id,
                               void* bank_panel, void* instant_window_parent,
                               const MethodInfo* method);
+
+// Stock calls used by the forced craft start. Signatures are taken from the
+// handler's own call sites, not guessed.
+using ItemByTagFn = void* (*)(void* static_context, ManagedString* tag,
+                              const MethodInfo* method);
+using PrefabNameFn = ManagedString* (*)(void* self, const MethodInfo* method);
+using CraftSecondsFn = int32_t (*)(void* static_context,
+                                   ManagedString* prefab_name,
+                                   const MethodInfo* method);
+using ServerTimeFn = int64_t (*)(void* static_context,
+                                 const MethodInfo* method);
+using StartCraftFn = void (*)(void* static_context, ManagedString* tag,
+                              int64_t end_time, const MethodInfo* method);
+// KeyValuePair<string, long> is returned through a hidden result pointer in
+// r0, which pushes the null static context to r1 and MethodInfo* to r2. This
+// is how the handler itself calls the getter at +0x494.
+using CurrentCraftFn = void (*)(void* result, void* static_context,
+                                const MethodInfo* method);
 
 inline AvailabilityFn g_availability = nullptr;
 inline SectionAvailableFn g_section_available = nullptr;
 inline MedalsFn g_medals_for_clan_craft = nullptr;
 inline PartCountFn g_part_count = nullptr;
 inline AnyPartFn g_any_part = nullptr;
-inline IsClanItemFn g_is_clan_item = nullptr;
-inline CraftableFn g_craft_and_not_crafted = nullptr;
 inline ShowSectionInfoFn g_show_section_info = nullptr;
 inline CraftPressFn g_craft_press = nullptr;
+
+inline ItemByTagFn g_item_by_tag = nullptr;
+inline const MethodInfo* g_mi_item_by_tag = nullptr;
+inline PrefabNameFn g_prefab_name = nullptr;
+inline const MethodInfo* g_mi_prefab_name = nullptr;
+inline CraftSecondsFn g_craft_seconds = nullptr;
+inline const MethodInfo* g_mi_craft_seconds = nullptr;
+inline ServerTimeFn g_server_time = nullptr;
+inline const MethodInfo* g_mi_server_time = nullptr;
+inline StartCraftFn g_start_craft = nullptr;
+inline const MethodInfo* g_mi_start_craft = nullptr;
+inline CurrentCraftFn g_current_craft = nullptr;
+inline const MethodInfo* g_mi_current_craft = nullptr;
+inline bool g_direct_start_ready = false;
 
 // CraftSectionAvailability values, verified in the 13.2.1 dump.
 inline constexpr int32_t kUnavailableClansNotOpened = 0;
@@ -121,34 +171,40 @@ inline constexpr int32_t kUnknownAvailability = -1;
 
 // Reported as "present in clan storage" when that storage is empty. Kept
 // small on purpose: every recipe already costs zero details, so this value
-// only has to be non-zero for boolean and ">= required" comparisons. If a
-// clan screen ever displays it, it stays a plausible number instead of a
-// nine-digit one.
+// only has to be non-zero for boolean and ">= required" comparisons.
 inline constexpr int32_t kSyntheticStockParts = 99;
 
 // Per-path logging is capped so a per-frame UI refresh cannot flood logcat.
+// The forced start is rarer and more interesting, so it gets its own budget.
 inline constexpr uint32_t kMaxLoggedDecisions = 8;
+inline constexpr uint32_t kMaxLoggedStarts = 24;
+
+// KeyValuePair<string, long> is 16 bytes in this build (4-byte reference, then
+// the 8-byte value at offset 8). The buffer is oversized and 8-byte aligned so
+// the managed getter can never write past it.
+inline constexpr size_t kCraftSlotBufferSize = 32;
+inline constexpr size_t kCraftSlotKeyOffset = 0;
 
 // Last value the stock game computed for the craft section. The armory polls
 // that getter while the screen is open, so this is a cheap, side-effect-free
-// way for other hooks to know the real reason without synthesising a managed
-// call of their own.
+// way for other hooks to know the real reason.
 inline std::atomic<int32_t> g_last_stock_availability{kUnknownAvailability};
 
 inline std::atomic<uint32_t> g_logged_availability{0u};
 inline std::atomic<uint32_t> g_logged_section{0u};
 inline std::atomic<uint32_t> g_logged_medals{0u};
 inline std::atomic<uint32_t> g_logged_stock{0u};
-inline std::atomic<uint32_t> g_logged_clan_item{0u};
-inline std::atomic<uint32_t> g_logged_craftable{0u};
 inline std::atomic<uint32_t> g_logged_info{0u};
 inline std::atomic<uint32_t> g_logged_press{0u};
+inline std::atomic<uint32_t> g_logged_start{0u};
 
-// Depth of craft-button handlers currently executing on this thread. Managed
-// UI callbacks all run on the Unity main thread, and the counter is
-// thread-local anyway, so a hook on another thread never sees a scope it does
-// not belong to.
+// Depth of craft-button handlers currently executing on this thread, and
+// whether the stock handler refused the current press by raising its hint
+// window. Managed UI callbacks all run on the Unity main thread, and both
+// values are thread-local anyway, so a hook on another thread never observes a
+// press it does not belong to.
 inline thread_local int32_t g_press_depth = 0;
+inline thread_local bool g_press_refused = false;
 
 class PressScope {
   public:
@@ -253,53 +309,108 @@ bool hook_any_part(void* static_context, ManagedString* item_id,
     return stock_result ? stock_result : true;
 }
 
-// The item classification that routes a blueprint into the clan branch of the
-// craft handler. Answering it honestly outside a craft press keeps every clan
-// screen intact; answering "not a clan item" during the press sends the
-// handler down the ordinary detail recipe, which this build can complete.
-bool hook_is_clan_item(void* static_context, ManagedString* item_id,
-                       const MethodInfo* method) {
-    const bool stock_result = g_is_clan_item(static_context, item_id, method);
-    if (!stock_result || !inside_craft_press()) return stock_result;
+// Reads WeaponManager.CurrentCraftingWeaponOrAvatar and reports whether a
+// craft is running. The stock handler tests the same value by checking its Key
+// for null/empty, which is reproduced here without calling into the generic
+// KeyValuePair accessor.
+bool craft_slot_busy(std::string* out_tag) {
+    if (g_current_craft == nullptr) return false;
 
-    if (should_log(g_logged_clan_item)) {
-        LOGI("clan-craft: '%s' is a clan blueprint; answered 'regular craft "
-             "item' for this press so the detail recipe is used instead of "
-             "the clan branch",
-             item_name(item_id).c_str());
+    alignas(8) unsigned char buffer[kCraftSlotBufferSize];
+    std::memset(buffer, 0, sizeof(buffer));
+    g_current_craft(buffer, nullptr, g_mi_current_craft);
+
+    ManagedString* key = nullptr;
+    std::memcpy(&key, buffer + kCraftSlotKeyOffset, sizeof(key));
+    if (key == nullptr) return false;
+    if (il2cpp::string_length != nullptr && il2cpp::string_length(key) <= 0) {
+        return false;
     }
-    return false;
+    const std::string tag = il2cpp::to_utf8(key, 64);
+    if (tag.empty()) return false;
+    if (out_tag != nullptr) *out_tag = tag;
+    return true;
 }
 
-// Diagnostics only: reports whether the handler still considers the item a
-// craftable, not yet crafted recipe once the clan branch is out of the way.
-bool hook_craft_and_not_crafted(void* static_context, ManagedString* item_id,
-                                const MethodInfo* method) {
-    const bool stock_result =
-        g_craft_and_not_crafted(static_context, item_id, method);
-    if (inside_craft_press() && should_log(g_logged_craftable)) {
-        LOGI("clan-craft: craft recipe check for '%s' -> %s",
-             item_name(item_id).c_str(), stock_result ? "craftable" : "no");
+// Runs the handler's own success path for an item its recipe list refuses.
+// Every step is a stock managed method; nothing is written directly.
+bool start_craft_directly(ManagedString* item_id) {
+    if (!g_direct_start_ready) {
+        if (should_log(g_logged_start)) {
+            LOGE("clan-craft: craft of '%s' was refused and the direct start "
+                 "is unavailable; the stock craft methods could not be "
+                 "resolved at startup", item_name(item_id).c_str());
+        }
+        return false;
     }
-    return stock_result;
+
+    const std::string tag = item_name(item_id);
+
+    std::string running_tag;
+    if (craft_slot_busy(&running_tag)) {
+        if (should_log(g_logged_start)) {
+            LOGW("clan-craft: '%s' was not started because '%s' is still "
+                 "being crafted; the stock client also allows only one craft "
+                 "at a time", tag.c_str(), running_tag.c_str());
+        }
+        return false;
+    }
+
+    void* record = g_item_by_tag(nullptr, item_id, g_mi_item_by_tag);
+    if (record == nullptr) {
+        LOGE("clan-craft: ItemDb has no record for '%s'; craft not started",
+             tag.c_str());
+        return false;
+    }
+    ManagedString* prefab = g_prefab_name(record, g_mi_prefab_name);
+    if (prefab == nullptr) {
+        LOGE("clan-craft: item '%s' has no prefab name; craft not started",
+             tag.c_str());
+        return false;
+    }
+
+    int32_t seconds = g_craft_seconds(nullptr, prefab, g_mi_craft_seconds);
+    if (seconds < 0) seconds = 0;
+    const int64_t now = g_server_time(nullptr, g_mi_server_time);
+    const int64_t end_time = now + seconds;
+
+    g_start_craft(nullptr, item_id, end_time, g_mi_start_craft);
+
+    std::string started_tag;
+    if (!craft_slot_busy(&started_tag)) {
+        LOGE("clan-craft: WeaponManager did not accept the craft of '%s' "
+             "(prefab '%s', %d s); the craft slot is still empty",
+             tag.c_str(), il2cpp::to_utf8(prefab, 64).c_str(), seconds);
+        return false;
+    }
+
+    if (should_log(g_logged_start)) {
+        LOGI("clan-craft: stock handler refused '%s' because the ordinary "
+             "craft recipe list has no entry for a clan blueprint; craft "
+             "started through WeaponManager (prefab '%s', %d s, ends at %lld, "
+             "slot now '%s')",
+             tag.c_str(), il2cpp::to_utf8(prefab, 64).c_str(), seconds,
+             static_cast<long long>(end_time), started_tag.c_str());
+    }
+    return true;
 }
 
 // The hint window shows one requirement line plus one call-to-action per
 // availability state. Both clan states point at something unreachable here,
 // and their button opens the dead clan search, so the window is skipped for
-// those states. It is also skipped for anything raised during a craft press:
-// at that point the press has already been granted, so a requirement popup
-// would only advertise a rule that no longer applies. The details variant
-// outside a press stays useful and is forwarded untouched.
+// those states. During a craft press it is also the refusal signature of the
+// recipe-list branch: the window is suppressed and the press is remembered as
+// refused, so the craft can be started directly once the handler returns.
 void hook_show_section_info(void* self, const MethodInfo* method) {
     const int32_t stock_value =
         g_last_stock_availability.load(std::memory_order_relaxed);
 
     if (inside_craft_press()) {
+        g_press_refused = true;
         if (should_log(g_logged_info)) {
-            LOGW("clan-craft: craft press still opened the hint window (last "
-                 "section state %s); window suppressed, the craft itself did "
-                 "not start",
+            LOGI("clan-craft: stock handler refused the press and raised its "
+                 "hint window (last section state %s); window suppressed, "
+                 "starting the craft directly",
                  availability_name(stock_value));
         }
         return;
@@ -316,27 +427,83 @@ void hook_show_section_info(void* self, const MethodInfo* method) {
     g_show_section_info(self, method);
 }
 
-// Marks the craft press for the hooks above and traces it, then forwards the
-// call unchanged. The scope ends when the stock handler returns, so nothing
-// outside the button press observes the relaxed clan classification.
+// Marks the craft press, forwards it unchanged, and starts the craft directly
+// if the stock handler refused it. Only the outermost press acts, so a nested
+// handler cannot start the same craft twice.
 void hook_craft_press(void* self, ManagedString* item_id, void* bank_panel,
                       void* instant_window_parent,
                       const MethodInfo* method) {
+    const bool outermost = (g_press_depth == 0);
     PressScope scope;
+    if (outermost) g_press_refused = false;
+
     if (should_log(g_logged_press)) {
         LOGI("clan-craft: craft pressed for '%s' (stock section state %s)",
              item_name(item_id).c_str(),
              availability_name(
                  g_last_stock_availability.load(std::memory_order_relaxed)));
     }
+
     g_craft_press(self, item_id, bank_panel, instant_window_parent, method);
+
+    if (!outermost || !g_press_refused) return;
+    g_press_refused = false;
+    start_craft_directly(item_id);
+}
+
+bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
+                  const MethodInfo** out_mi) {
+    void* info = il2cpp::find_method_info(target.namespaze, target.klass,
+                                          target.method, target.args_count);
+    void* pointer = il2cpp::method_pointer(info);
+    if (info == nullptr || pointer == nullptr) {
+        LOGE("clan-craft: cannot resolve %s.%s/%d", target.klass, target.method,
+             target.args_count);
+        return false;
+    }
+    *out_fn = pointer;
+    *out_mi = info;
+    return true;
+}
+
+// Resolves the stock craft methods used by the forced start. The craft slot
+// getter is optional: without it the start is still correct, it just cannot
+// decline a press while another craft is running, so its absence downgrades
+// the feature instead of disabling it.
+bool resolve_direct_start() {
+    bool ok = true;
+    ok &= resolve_call({"", "ItemDb", "GetByTag", 1},
+                       reinterpret_cast<void**>(&g_item_by_tag),
+                       &g_mi_item_by_tag);
+    ok &= resolve_call({"", "ItemRecord", "get_PrefabName", 0},
+                       reinterpret_cast<void**>(&g_prefab_name),
+                       &g_mi_prefab_name);
+    ok &= resolve_call({"", "BalanceController", "GetFullTimeCraftInSeconds", 1},
+                       reinterpret_cast<void**>(&g_craft_seconds),
+                       &g_mi_craft_seconds);
+    ok &= resolve_call({"", "FriendsController", "get_ServerTime", 0},
+                       reinterpret_cast<void**>(&g_server_time),
+                       &g_mi_server_time);
+    ok &= resolve_call({"", "WeaponManager", "StartCraftWeaponOrAvatar", 2},
+                       reinterpret_cast<void**>(&g_start_craft),
+                       &g_mi_start_craft);
+
+    if (!resolve_call({"", "WeaponManager", "get_CurrentCraftingWeaponOrAvatar",
+                       0},
+                      reinterpret_cast<void**>(&g_current_craft),
+                      &g_mi_current_craft)) {
+        g_current_craft = nullptr;
+        LOGW("clan-craft: the craft slot getter is unavailable; a refused "
+             "press cannot be declined while another craft is running");
+    }
+    return ok;
 }
 
 } // namespace detail
 
 inline bool install_hooks() {
     // Mandatory: the enum the whole craft section is driven by. Without it
-    // clan blueprints stay locked no matter what the prices say.
+    // clan blueprints stay locked in the UI no matter what the prices say.
     const bool availability = hook::install(
         {"", "ShopCraftManager", "GetCraftSectionAvailability", 0},
         detail::replacement(&detail::hook_availability),
@@ -384,57 +551,47 @@ inline bool install_hooks() {
              part_count ? 1 : 0);
     }
 
-    // The item classification that decides whether the craft handler takes
-    // the clan branch. This is the hook that actually starts the craft, so a
-    // failure here is reported loudly even though the module keeps working.
-    const bool clan_item = hook::install(
-        {"", "ClansController", "IsClanItem", 1},
-        detail::replacement(&detail::hook_is_clan_item),
-        detail::original_slot(&detail::g_is_clan_item), false);
-    if (!clan_item) {
-        LOGE("clan-craft: ClansController.IsClanItem could not be hooked; the "
-             "craft press will keep falling back to the clan branch");
-    }
-
-    // Optional, diagnostics only.
-    const bool craftable = hook::install(
-        {"", "ShopCraftManager", "CraftItemAndNotCrafted", 1},
-        detail::replacement(&detail::hook_craft_and_not_crafted),
-        detail::original_slot(&detail::g_craft_and_not_crafted), false);
-    if (!craftable) {
-        LOGW("clan-craft: craft-recipe tracing is unavailable");
-    }
-
-    // Optional: the hint window that would keep advertising a clan or level
-    // requirement which no longer blocks anything.
+    // The refusal signature of the recipe-list branch, and the window that
+    // would otherwise advertise a requirement which no longer blocks anything.
     const bool info_window = hook::install(
         {"", "ShopNGUIController", "ShowCraftSectionInfo", 0},
         detail::replacement(&detail::hook_show_section_info),
         detail::original_slot(&detail::g_show_section_info), false);
     if (!info_window) {
-        LOGW("clan-craft: ShopNGUIController.ShowCraftSectionInfo is "
-             "unavailable; the clan hint window may still be shown");
+        LOGE("clan-craft: ShopNGUIController.ShowCraftSectionInfo could not "
+             "be hooked; a refused press cannot be detected and the clan hint "
+             "window may still be shown");
     }
 
-    // Required for the scoped classification above: without this hook there
-    // is no craft press to scope to.
+    // The press itself: the scope the refusal is observed in and the place
+    // the direct craft start is issued from.
     const bool craft_press = hook::install(
         {"", "ShopNGUIController", "HandleCraftButton_NoInfo", 3},
         detail::replacement(&detail::hook_craft_press),
         detail::original_slot(&detail::g_craft_press), false);
     if (!craft_press) {
         LOGE("clan-craft: ShopNGUIController.HandleCraftButton_NoInfo could "
-             "not be hooked; the scoped clan-item workaround stays inactive");
+             "not be hooked; clan blueprints cannot be crafted");
     }
 
+    detail::g_direct_start_ready = detail::resolve_direct_start();
+    if (!detail::g_direct_start_ready) {
+        LOGE("clan-craft: the stock craft methods could not be resolved; a "
+             "refused press cannot be completed");
+    }
+
+    const bool ready = craft_press && info_window &&
+                       detail::g_direct_start_ready;
+
     LOGI("clan-craft: armed (section=Available, shop shortcut=%s, medals=%s, "
-         "clan storage=%s, clan item during press=%s, clan hint window=%s, "
-         "press scope=%s, recipe trace=%s); no clan object is created",
+         "clan storage=%s, clan hint window=%s, press scope=%s, direct craft "
+         "start=%s, busy-slot guard=%s); no clan object is created",
          section_available ? "forced" : "stock", medals ? "free" : "stock",
          (any_part && part_count) ? "synthetic" : "partial",
-         clan_item ? "regular" : "stock",
          info_window ? "suppressed" : "stock",
-         craft_press ? "on" : "off", craftable ? "on" : "off");
+         craft_press ? "on" : "off",
+         ready ? "on" : "off",
+         detail::g_current_craft != nullptr ? "on" : "off");
     return true;
 }
 
