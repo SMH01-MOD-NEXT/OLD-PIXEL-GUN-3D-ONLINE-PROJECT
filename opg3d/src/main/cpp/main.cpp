@@ -15,6 +15,7 @@
 #include "il2cpp.h"
 #include "legacy_gameplay.h"
 #include "log.h"
+#include "obb_provisioner.h"
 #include "photon_hooks.h"
 #include "player_boost.h"
 #include "removed_arsenal.h"
@@ -189,6 +190,20 @@ void* init_thread(void*) {
 } // namespace
 
 __attribute__((constructor)) static void on_load() {
+    // Expansion file first, and synchronously.
+    //
+    // Unity decides whether its data exists while libunity/libil2cpp
+    // initialise, so the copy cannot be deferred to the phase-0 thread below —
+    // by the time that thread finds libil2cpp.so the game has already looked
+    // for the .obb. This constructor runs while the APK's native libraries are
+    // still being loaded, which is the last moment where the file can still
+    // appear "before" the engine. On a first launch the loader thread
+    // therefore blocks for one sequential copy out of the APK; afterwards the
+    // call only stats a single file. Details and failure modes are documented
+    // in obb_provisioner.h. A failure here never affects the hooks below: the
+    // module only logs and returns false.
+    obb_provisioner::provision();
+
     pthread_t thread;
     if (pthread_create(&thread, nullptr, init_thread, nullptr) == 0) {
         pthread_detach(thread);
@@ -198,5 +213,10 @@ __attribute__((constructor)) static void on_load() {
 }
 
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
+    // Defence in depth. JNI_OnLoad normally runs after our ELF constructor and
+    // finds the work already done (provision() is idempotent), but if this
+    // library is ever loaded through a path that reaches JNI_OnLoad first, the
+    // expansion file still lands before Unity starts.
+    obb_provisioner::provision();
     return JNI_VERSION_1_6;
 }
