@@ -12,6 +12,7 @@ The project does not connect to Cubic Games services and is not affiliated with 
 - **Fixed EU routing.** Every connection uses Photon Cloud region `eu`. This removes the first-launch `32756 / Region none is not available` race and keeps every player in one regional room pool. EU must also remain the only allowed region in the Photon dashboard.
 - **Dead-backend disconnect guard.** The obsolete `FriendsController.Update` disconnect path is quarantined only while Photon is connecting or connected. Normal PUN callbacks, room transitions, RPC, synchronization, and intentional disconnects remain stock.
 - **Persistent release progression.** The game repeatedly runs its own `ExperienceController.AddExperience` path until the final level, **38**, is reached. The experience table is indexed from level 0, so its length of 39 is not a level; every computed target is clamped to 38. Repeated level-up popups are suppressed only during automatic steps. Coins and Gems are maintained at **999,999,999** through the stock bank and Storager paths, so the values persist.
+- **The whole lobby craft catalogue on the account.** Lobby items — bases, gates, fences, terrain, roads, decor, backgrounds, effects, devices, the pet kennel and the paid bundles — are a progression of their own, normally bought with coins, gems or real money, or unlocked by in-match lockers that a private server can no longer make meaningful. Every item that exists in the build is granted for real, through the client's own `AddItemNow` and its own save, so each one becomes a genuine ownership record under the `lobby_items` key instead of an answer faked by a getter. It survives a restart, and prices, craft timers, lockers, item buffs and the cloud merge stay stock.
 - **Automatic tutorial skip.** The initial training stage is completed before scene routing can send a fresh profile into training. Both the first-match stage and the 12.1+ shop-tutorial flag are written through the game's own persistence APIs, so the skip survives a restart.
 - **Free detail weapons.** Every craft recipe reports **0 required details** and the craft gate is answered positively, so the stock craft flow grants the weapon immediately. These weapons already have no craft wait in this client. There is no category filtering.
 - **Clan blueprints without a clan.** Clan blueprints are refused by a code path that has nothing to do with clans: the craft handler only accepts items present in the ordinary craft-recipe list, and clan recipes are parsed into a separate table. Rather than faking clan state, a refused press is completed by calling the game's own craft start with the same arguments the handler would have used. No `Clan` object is created and no clan data is written or sent anywhere.
@@ -244,21 +245,88 @@ Optional, cosmetic and scene safety, so a failure here still leaves the save pro
 - **Detection inputs.** Currency, level, ownership, signature and config readers are untouched.
 - **The abuse report** is simply never started, because its only caller is the refused wipe.
 
+## The whole lobby craft catalogue on the account
+
+Lobby crafting is a third progression, unrelated to weapons and armour. It builds the player's own lobby out of items grouped by `LobbyItemGroupType` (`Buildings`, `Gate`, `Fance`, `Terrain`, `Road`, `Decor`, `BigDecor`, `Backgrounds`, `Effects`, `PetKennel`, `Devices`, `Bundles`) and placed in the slots of `LobbyItemInfo.LobbyItemSlot` (`Base`, `wall`, `gate`, `kennel`, `terrain`, `road`, `decor_small`, `decor_big`, `background_1`, `background_2`, `device_1`, `device_2`, `skybox`). Some items are sold in paid bundles (`bundle_my`, `bundle_winter`), and others are gated behind lockers that only a live population can produce:
+
+```text
+LobbyItemInfo.LobbyItemLockerType { None, KillMobs, KillPlayersInDuels,
+                                    KillPlayersWithGadget, KillPlayersWithPet,
+                                    GainLikes }
+```
+
+On a private server, `GainLikes` and duel lockers are unreachable by design, and a bundle can no longer be bought at all.
+
+### Ownership is a record, not a flag
+
+The build ships the entire catalogue: `LobbyItemsInfo.info` describes every item that exists, and `LobbyItemsController._allItems` holds one `LobbyItem` per description. Ownership is a separate per-item object, `LobbyItemPlayerInfo` (`InfoId`, `CraftStarted`, `IsCrafted`, `IsEquiped`, `EquipTime`, `Lockers`), and the client has exactly one method that creates it:
+
+```text
+LobbyItemsController.AddItemNow(LobbyItem)             RVA 0x13E8534
+  +0x7C   bl  LobbyItem.get_IsExists()                 ; refuses duplicates
+          bl  Object..ctor + LobbyItem.set_PlayerInfo(new LobbyItemPlayerInfo)
+          bl  LobbyItemInfo.get_Id()                   ; InfoId of the record
+          bl  FriendsController.get_ServerTime()       ; craft marked finished
+          bl  LobbyItem.get_CraftTime()
+  +0x434  bl  LobbyItem.get_IsBundle() / get_Bundle() / Bundle.get_Items()
+  +0x9D0  bl  LobbyItemsController.Equip(item, silent) ; bundle path only
+  +0x9D8  bl  LobbyItemsController.SavePlayerCurrentData()
+
+LobbyItemsController.SavePlayerCurrentData()           RVA 0x13E81E0
+  +0x2B8  bl  LobbyItemPlayerInfoSerializedObject..ctor()
+  +0x2D4  b   SaveLobbyItemsPlayerData(serialized)     RVA 0x13E0BB4
+            bl  JsonUtility.ToJson(obj)                RVA 0x1AB7278
+            b   Storager.setString("lobby_items", json) RVA 0xEBD760
+```
+
+A scan of every branch inside `AddItemNow` finds **no** `BankController` call, **no** `ItemPrice` read and no purchase path at all: it is the client's own unconditional grant, and it saves the result itself. Bundles are expanded in the same call, so a bundle row grants its contents through the same code the game would have run after a real purchase.
+
+### The loop is the game's own
+
+The client already uses that method exactly the way this module does — for the starter items every account receives:
+
+```text
+LobbyItemsController.GetFreeItemsIfNotExists()         RVA 0x13EC858
+  +0x168  bl  LobbyItem.get_IsExists()
+  +0x17C  bl  LobbyItemsController.AddItemNow(item)
+```
+
+So the grant is not an override of an ownership getter. `LobbyItem.get_IsExists()` is only **read**, to decide what is still missing, and the item is then handed to the client's own grant. The account really owns every item afterwards: a real `LobbyItemPlayerInfo` record exists for it, serialised by `JsonUtility` into the `lobby_items` Storager entry, so it survives a restart and is visible to every screen, effect handler and cloud applyer that reads that save.
+
+### How it runs
+
+The module lives in `player_boost.h` (namespace `player_boost::lobby`) because it is part of the same progression grant, and it is driven from `LobbyItemsController.Update`:
+
+1. Nothing happens until `LobbyItemsController.IsReady` is true, so `InitItems()` and `ReadPlayerData()` finish their own setup first.
+2. `AllItems` is walked in small batches — at most three grants per frame — because every grant rewrites the whole lobby save through `JsonUtility.ToJson`. `List<LobbyItem>` is read with `get_Count`/`get_Item` resolved from the class of the live list, so no container layout is assumed.
+3. Each granted item is named in the log, up to a cap, and a batch that granted anything calls the game's own `SavePlayerCurrentData()` once more, so a partially walked catalogue is still persisted.
+4. A pass that granted something is followed by one more verification pass. When a pass grants nothing, the catalogue is complete and the walk stops; it is re-verified occasionally afterwards, because a cloud merge (`LobbyItemsCloudApplyer.MergeLobbyItems`) can reintroduce missing records.
+5. If the client refuses a grant, the item is skipped and logged, and a long run of refusals disables the module instead of hammering the save.
+
+### What stays stock
+
+- **Prices, craft timers and speed-ups.** `LobbyItemInfo.PriceBuy`, `PriceSpeedUp`, `PriceInstant` and `CraftTime` are never touched; the grant simply does not go through a purchase.
+- **Lockers.** `LobbyItemLocker` progress, `LockPointsLeft` and the like/kill counters are left alone. The item is owned, but no locker counter is falsified.
+- **Equipping and appearance.** Plain items are granted without being equipped, exactly as the stock method does — only its bundle path equips. Item buffs and effects are applied by the client's own `AddEffects`/`GetEffect` code when it decides to.
+- **The save format and the cloud merge.** Only the game's own serializer writes `lobby_items`, and `LobbyItemsCloudApplyer` keeps merging as it always did.
+
 ## Technical design
 
 1. **Safe early initialization.** A native constructor starts a detached thread, waits for `libil2cpp.so`, waits for the assembly list to stabilize, and attaches to the IL2CPP runtime before touching metadata.
 2. **Symbol resolution without `dlsym`.** Android linker namespaces and `RTLD_LOCAL` hide the game's exports from `dlsym(RTLD_DEFAULT)`. `elf_sym` reads the already-mapped ELF dynamic symbol table directly.
 3. **Metadata-driven, fail-closed hooks.** Targets are found with the IL2CPP metadata API and hooked at their actual `MethodInfo::methodPointer` using ShadowHook in UNIQUE mode. No managed method RVA is compiled into the project; RVAs appear only in comments and documentation, as evidence for a decision. If a required class, method, or trampoline is unavailable, the module reports failure instead of patching an assumed address.
 4. **Read-only predicates over synthetic state.** Where the client blocks an action because a retired service can no longer answer, the missing answer is supplied at the exact predicate that asks for it. State that other systems would read — clan membership, server responses, currency ledgers, ownership — is not fabricated.
-5. **Narrowest possible scope.** When a predicate or a collection has consumers beyond the blocked action, its answer is relaxed only for the duration of that action instead of globally, so unrelated screens and the multiplayer code keep observing the real state.
-6. **Punishment is disarmed, detection is not.** Where the client reacts to a state a private server creates on purpose, the reaction is intercepted at its own entry points and the criteria that produced it are left untouched, because those criteria read ordinary game state that other systems share.
-7. **Evidence before overrides.** A hypothesis about why the client refuses something is confirmed by a device log or by disassembly of the actual handler before it is shipped, and an override that the logs disprove is removed instead of being left in place "just in case".
-8. **Honest UI.** When a predicate is answered, the screens explaining that requirement are corrected as well, so the game never instructs the player to satisfy a condition that no longer exists or cannot be reached.
-9. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, purchases, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
-10. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
-11. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
-12. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
-13. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
+5. **Ownership is granted, never simulated.** When the goal is that the account *has* something, the client's own grant and its own save are called, so the result is a real record other systems can read. An ownership getter is only ever read to find out what is missing; it is never answered on the game's behalf.
+6. **Narrowest possible scope.** When a predicate or a collection has consumers beyond the blocked action, its answer is relaxed only for the duration of that action instead of globally, so unrelated screens and the multiplayer code keep observing the real state.
+7. **Punishment is disarmed, detection is not.** Where the client reacts to a state a private server creates on purpose, the reaction is intercepted at its own entry points and the criteria that produced it are left untouched, because those criteria read ordinary game state that other systems share.
+8. **Evidence before overrides.** A hypothesis about why the client refuses something is confirmed by a device log or by disassembly of the actual handler before it is shipped, and an override that the logs disprove is removed instead of being left in place "just in case".
+9. **Honest UI.** When a predicate is answered, the screens explaining that requirement are corrected as well, so the game never instructs the player to satisfy a condition that no longer exists or cannot be reached.
+10. **Stock state transitions.** Tutorial completion, level advancement, bank writes, zero-detail crafting, item grants, purchases, upgrades, and saves go through original game methods. Where a refused action has to be completed, the module calls the same managed method the handler would have called, with the arguments taken from the same sources, rather than writing game state itself.
+11. **Bounded work per frame.** Grants that rewrite a save file are spread over several frames in small batches, so a full catalogue can be handed out without a visible hitch and without a save write storm.
+12. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
+13. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
+14. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
+15. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
 
 ## Building
 
@@ -295,8 +363,8 @@ adb logcat -s OPG3D
 Relevant healthy-startup lines include:
 
 ```text
-init: libopg3d build 13.2.1 local cheat-guard (armory v9) built ...
-init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting, retired arsenal in the shop, upgrade timers and the local cheat-detection progress-wipe block active
+init: libopg3d build 13.2.1 lobby craft grant (armory v10) built ...
+init: phase 0 ready — Photon Cloud routing, progression grant, tutorial skip, free detail weapons, clan-free blueprint crafting, retired arsenal in the shop, the whole lobby craft catalogue on the account, upgrade timers and the local cheat-detection progress-wipe block active
 legacy: tutorial skipped automatically; stage 3 and shop tutorial completion saved
 free-details: armed (required=0 for every recipe, craft gate=forced, owned count=synthetic); no category filtering
 free-details: required details for '<item id>': 25 -> 0
@@ -304,9 +372,24 @@ clan-craft: armed (section=Available, shop shortcut=forced, medals=free, clan st
 removed-arsenal: armed (scope=shop shelf builder only, list=never cleared, CanBuy=untouched, prices=stock, tier/level/filter gates=stock)
 cheat-guard: armed (scope=CheatDetectedBanner only, PlayerPrefs/Storager/CloudSync writes=none, detection inputs=stock, persisted mark=read-only)
 boost: persisted grant armed (trigger=MainMenuController.Update, level target=38, currency target=999999999, level-up UI=skipped)
+boost: lobby craft grant armed (source=LobbyItemsController.AllItems, grant=AddItemNow + SavePlayerCurrentData, batch=3 per frame, ownership getters=untouched, prices/lockers/effects=stock)
 cloud-force[...]: ... host=1(PhotonCloud expected=1) region=0(eu expected=0) ... ready=1
 photon-status: 1024 (Connect) ...
 ui: ConnectionControl.OnConnectedToMaster state=16 ...
+```
+
+Entering the lobby for the first time on a new save should hand out the catalogue and then go quiet:
+
+```text
+boost: lobby item '<item id>' granted through AddItemNow and saved (<n> so far)
+boost: lobby pass 1 granted <n> item(s) out of <total> in the catalogue; verifying once more
+boost: lobby catalogue complete — <total> item(s) exist in this build, <n> granted and saved by this module (Storager key 'lobby_items')
+```
+
+The `complete` line is the one that matters: `<total>` is how many lobby items this build contains, and `<n>` is how many the account did not have. If items are refused instead, the log names them:
+
+```text
+boost: the client refused to grant lobby item '<item id>'; it stays unowned
 ```
 
 If the client decides to punish the session, the block is visible instead of a wiped save:
@@ -342,9 +425,7 @@ removed-arsenal: retired-name list is live; shop shelf filter is now bypassed pe
 removed-arsenal: retired weapon '<item id>' (prefab '<prefab>') offered to the shop at its stock price; shelf decisions so far: <n>
 ```
 
-If a listed weapon shows no price in the shop, that is the stock price path answering with nothing for a retired id, not the module: the prefab names in these lines are what a price fix would have to be based on.
-
-The `cheat-guard:` lines exist only on `armory v9` or newer. The `removed-arsenal:` lines exist only on `armory v8` or newer. The `direct craft start` and `busy-slot guard` fields of the clan-craft armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
+The `boost: lobby` lines exist only on `armory v10` or newer. The `cheat-guard:` lines exist only on `armory v9` or newer. The `removed-arsenal:` lines exist only on `armory v8` or newer. The `direct craft start` and `busy-slot guard` fields of the clan-craft armed line, and the press lines above, exist only on `armory v7` or newer. The `clan hint window` field exists only on `armory v5` or newer, and the `free-details:` line with `owned count=synthetic` only on `armory v4` or newer. If they are missing, or the build stamp line is absent, the device is running an older `libopg3d.so` and no conclusion about the hooks should be drawn from that log.
 
 AppIDs are logged only as a length and FNV-1a fingerprint.
 
@@ -364,7 +445,8 @@ opg3d/src/main/cpp/
 ├── hook.cpp/.h               # fail-closed ShadowHook wrapper
 ├── photon_hooks.cpp/.h       # AppID override and connection tracing
 ├── cloud_guard.h             # fixed-EU routing and obsolete disconnect guard
-├── player_boost.h            # stock level steps (cap 38) and verified bank top-up
+├── player_boost.h            # stock level steps (cap 38), verified bank top-up,
+│                             # and the whole lobby craft catalogue granted
 ├── legacy_gameplay.h         # tutorials and upgrade clock fallback
 ├── free_detail_weapons.h     # zero-detail weapon crafting
 ├── clan_craft.h              # clan blueprints without clan membership
@@ -382,8 +464,9 @@ opg3d/src/main/cpp/
 - The `armory v6` build proved on device that `ClansController.IsClanItem` and `ShopCraftManager.CraftItemAndNotCrafted` are not called during a craft press, which is why both overrides were removed.
 - The refusal itself was located by disassembling `ShopNGUIController.HandleCraftButton_NoInfo` (`+0x1A0`, ordinary craft-recipe list lookup) and confirming that `WeaponManager.StartCraftWeaponOrAvatar` has exactly one caller, `+0x8FC` of the same handler.
 - The direct craft start of `armory v7` is derived from that handler's own success path and still needs a device report from a build printing the `armory v7` stamp.
-- The retired-weapon shop filter of `armory v8` was located by disassembly: the removed-name check at `_AddWeaponToShopListsIfNeeded +0x474`, the lazy rebuild in `get_Removed150615_PrefabNames +0xB4`, the three shelf call sites in `_InitShopCategoryLists`, and a full `BL` scan of `.text` for the fifteen readers of the list. It still needs a device report from a build printing the `armory v8` stamp, in particular whether every re-listed weapon also has a price.
-- The local wipe blocked by `armory v9` was reported from a live session ("CHEAT DETECTED" on half the screen) and then traced statically: `CheatDetectedBanner.Update +0xA0` as the only caller of `ClearAllProgress`, `ClearAllProgress +0xEC` as the only cheat-driven caller of `PlayerPrefs.DeleteAll` among six in the whole binary, `+0x248` for the cloud push, `+0x274` for the abuse report, and no direct caller at all for `ShowAndClearProgress`. A device report from a build printing the `armory v9` stamp is still needed, including the value of the persisted `HackDetected` mark.
+- The retired-weapon shop filter of `armory v8` is **confirmed on device**: retired weapons appear in the shop, show a price and can be bought.
+- The local wipe block of `armory v9` is provisionally confirmed on device: the "CHEAT DETECTED" banner that prompted it has not reappeared in play. A logcat capture showing the `cheat-guard:` lines and the value of the persisted `HackDetected` mark is still useful but no longer blocking.
+- The lobby catalogue grant of `armory v10` was derived from disassembly: `AddItemNow` (RVA `0x13E8534`) contains no purchase call and ends in `SavePlayerCurrentData` (`0x13E81E0`), which serialises the whole item list into the `lobby_items` Storager entry (`0x13E0BB4` -> `JsonUtility.ToJson` -> `Storager.setString`), and the client's own `GetFreeItemsIfNotExists` (`0x13EC858`) already uses the same `get_IsExists` -> `AddItemNow` loop. It still needs a device report from a build printing the `armory v10` stamp, in particular the `lobby catalogue complete` line with its item counts.
 - The clan-storage accessors and the medal price were verified against the supplied 13.2.1 analysis files only.
 - Photon handshake, master/game-server transitions, room creation, and a 1v1 match have been verified between two devices on different networks.
 - All clients must use EU, with EU configured as the only allowed Photon region.
