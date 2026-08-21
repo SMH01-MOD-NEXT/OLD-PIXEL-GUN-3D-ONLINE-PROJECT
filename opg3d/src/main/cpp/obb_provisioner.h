@@ -1,54 +1,51 @@
 #pragma once
 
 // OBB self-provisioning: the expansion file ships inside the APK and is
-// unpacked to /storage/emulated/0/Android/obb/<package>/ before Unity starts.
+// unpacked to <external>/Android/obb/<package>/main.<versionCode>.<package>.obb
+// before Unity starts.
 //
 // Why this runs where it runs
 // ---------------------------
 // Unity resolves its expansion file while libunity/libil2cpp initialise, so
-// anything that happens after that point is too late: the game has already
-// concluded that its data is missing. The earliest code of ours that runs in
-// the game process is the ELF constructor of this library (see main.cpp),
-// executed by the dynamic linker while the APK's native libraries are being
-// loaded, i.e. before Unity's own native init. provision() is therefore
-// called from there, synchronously.
+// anything happening after that is too late: the game has already decided its
+// data is missing. The earliest code of ours in the game process is the ELF
+// constructor of this library (see main.cpp), executed by the dynamic linker
+// while the APK's native libraries are loaded, i.e. before Unity's native
+// init. provision() is therefore called from there, synchronously.
 //
-// Consequences of that placement, all deliberate:
-//   * no JNI. There is no guarantee that JNI_OnLoad ever runs for us (the
-//     library can be pulled in as a DT_NEEDED dependency of another .so, in
-//     which case only constructors run), and calling into the VM from a
-//     linker constructor is not safe in general. So the package name, the
-//     version code and the payload are read out of the APK with plain
-//     syscalls instead of Context.getPackageName / PackageManager /
-//     AssetManager;
-//   * no IL2CPP and no hooks. This module never touches the runtime, so it
-//     can neither be affected by nor affect the metadata-driven modules;
-//   * the copy blocks the loading thread. On a first launch the user waits
-//     for one sequential read of the payload out of the APK. That is the
-//     price for the game finding its data on the very first frame; every
-//     later launch only stats a single file.
+// Consequences, all deliberate:
+//   * no JNI. There is no guarantee JNI_OnLoad ever runs for us (the library
+//     can be pulled in as a DT_NEEDED dependency, in which case only
+//     constructors run), and calling into the VM from a linker constructor is
+//     not safe in general. So the package name, the version code and the
+//     payload are read out of the APK with plain syscalls instead of
+//     Context.getPackageName / PackageManager / AssetManager;
+//   * no IL2CPP and no hooks, so this module can neither be affected by nor
+//     affect the metadata-driven modules;
+//   * the copy blocks the loading thread. On a first launch the user waits for
+//     one sequential read of the payload out of the APK; every later launch
+//     only stats a single file.
 //
 // What it does, in order:
 //   1. finds its own APK through /proc/self/maps;
-//   2. parses the APK's ZIP central directory (zip64 aware, because an APK
-//      with an embedded expansion file is large);
+//   2. parses the ZIP central directory (zip64 aware - an APK with an embedded
+//      expansion file is large);
 //   3. inflates AndroidManifest.xml and reads `package` and `versionCode`
-//      straight out of the binary XML, so the destination name is derived
-//      from what this build actually is. Nothing is hardcoded; a rebuild
-//      with a different version code needs no source change here;
+//      straight out of the binary XML, so the destination name is derived from
+//      what this build actually is. Nothing is hardcoded: a rebuild with a new
+//      version code needs no change here;
 //   4. picks the payload from the APK's assets (assets/obb/*.obb preferred);
-//   5. builds <external>/Android/obb/<package>/main.<versionCode>.<package>.obb,
-//      creates the two directories with mode 0755 and does nothing at all if
-//      a file of exactly the expected size is already there;
+//   5. creates <external>/Android/obb and <external>/Android/obb/<package>
+//      with mode 0755 and does nothing at all when a file of exactly the
+//      expected size is already in place;
 //   6. extracts to "<dest>.opg3d-part", verifies the CRC-32 recorded in the
-//      APK, fsyncs, chmods the result 0644 and renames it into place, so an
-//      interrupted first launch can never leave a half-written expansion
-//      file that the game would then try to read;
-//   7. repeats the whole placement for a patch payload if the APK has one.
+//      APK, fsyncs, chmods 0644 and renames into place, so an interrupted
+//      first launch cannot leave a half-written expansion file behind;
+//   7. repeats the placement for a patch payload if the APK carries one.
 //
-// Nothing here is destructive. An expansion file of the right size is left
-// untouched, files belonging to other version codes are reported and kept,
-// and every failure path leaves storage exactly as it was and says why.
+// Nothing here is destructive: a correct expansion file is left untouched,
+// files of other version codes are kept, and every failure path leaves storage
+// as it was and logs why.
 
 #include <atomic>
 #include <cerrno>
@@ -73,11 +70,12 @@ namespace detail {
 
 constexpr size_t kPathCap = 640;
 constexpr size_t kNameCap = 320;
-constexpr size_t kChunk = 1u << 20;                        // copy buffer
-constexpr uint64_t kEocdWindow = 66u * 1024u;              // EOCD + comment
-constexpr size_t kManifestCap = 4u * 1024u * 1024u;        // sanity cap
-constexpr size_t kCentralDirectoryCap = 64u * 1024u * 1024u;
-constexpr uint64_t kFreeSpaceMargin = 32u * 1024u * 1024u; // never fill the volume
+constexpr size_t kPackageCap = 192;
+constexpr size_t kChunk = 1u << 20;                          // copy buffer
+constexpr uint64_t kEocdWindow = 66u * 1024u;                // EOCD + comment
+constexpr size_t kManifestCap = 4u * 1024u * 1024u;
+constexpr uint64_t kCentralDirectoryCap = 64u * 1024u * 1024u;
+constexpr uint64_t kFreeSpaceMargin = 32u * 1024u * 1024u;   // never fill the volume
 constexpr uint64_t kProgressStep = 64u * 1024u * 1024u;
 
 constexpr uint32_t kSigEocd = 0x06054b50u;
@@ -90,8 +88,7 @@ constexpr uint32_t kZip32Sentinel = 0xffffffffu;
 constexpr uint16_t kMethodStore = 0u;
 constexpr uint16_t kMethodDeflate = 8u;
 
-// provision() is called from two entry points (see main.cpp) and must do the
-// work exactly once.
+// provision() has two entry points (see main.cpp) and must run exactly once.
 inline std::atomic<bool> g_started{false};
 inline std::atomic<bool> g_result{false};
 
@@ -118,6 +115,7 @@ inline bool read_exact(int fd, void* buffer, size_t length, uint64_t offset) {
     while (done < length) {
         const ssize_t got = pread64(fd, out + done, length - done,
                                     static_cast<off64_t>(offset + done));
+        if (got < 0 && errno == EINTR) continue;
         if (got <= 0) return false;
         done += static_cast<size_t>(got);
     }
@@ -129,19 +127,15 @@ inline bool write_exact(int fd, const void* buffer, size_t length) {
     size_t done = 0u;
     while (done < length) {
         const ssize_t put = write(fd, in + done, length - done);
-        if (put <= 0) {
-            if (put < 0 && errno == EINTR) continue;
-            return false;
-        }
+        if (put < 0 && errno == EINTR) continue;
+        if (put <= 0) return false;
         done += static_cast<size_t>(put);
     }
     return true;
 }
 
 inline char lower(char value) {
-    return (value >= 'A' && value <= 'Z')
-               ? static_cast<char>(value - 'A' + 'a')
-               : value;
+    return (value >= 'A' && value <= 'Z') ? static_cast<char>(value - 'A' + 'a') : value;
 }
 
 inline bool starts_with_ci(const char* text, const char* prefix) {
@@ -169,8 +163,8 @@ inline const char* base_name_of(const char* path) {
 
 // --- our own APK -----------------------------------------------------------
 //
-// The mapping name for a library loaded straight out of the APK looks like
-// "/data/app/~~x==/com.pixel.gun3d-y==/base.apk!/lib/armeabi-v7a/libX.so",
+// A library loaded straight out of the APK is mapped as
+// "/data/app/~~a==/com.pixel.gun3d-b==/base.apk!/lib/armeabi-v7a/libX.so",
 // so the path is cut right after ".apk". base.apk wins over any split.
 inline bool find_own_apk(char* out, size_t capacity) {
     FILE* maps = std::fopen("/proc/self/maps", "re");
@@ -190,9 +184,7 @@ inline bool find_own_apk(char* out, size_t capacity) {
         if (stat64(path, &info) != 0 || !S_ISREG(info.st_mode)) continue;
 
         const bool is_base = std::strstr(path, "/base.apk") != nullptr;
-        if (best[0] == '\0' || is_base) {
-            std::snprintf(best, sizeof(best), "%s", path);
-        }
+        if (best[0] == '\0' || is_base) std::snprintf(best, sizeof(best), "%s", path);
         if (is_base) break;
     }
     std::fclose(maps);
@@ -202,7 +194,7 @@ inline bool find_own_apk(char* out, size_t capacity) {
     return true;
 }
 
-// Process name, used only to cross-check the manifest and as a fallback.
+// Process name: cross-check for the manifest and fallback if parsing fails.
 inline bool read_process_name(char* out, size_t capacity) {
     const int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
@@ -212,7 +204,7 @@ inline bool read_process_name(char* out, size_t capacity) {
     if (got <= 0) return false;
     buffer[got] = '\0';
 
-    char* colon = std::strchr(buffer, ':'); // "pkg:sub-process"
+    char* colon = std::strchr(buffer, ':'); // "package:sub-process"
     if (colon != nullptr) *colon = '\0';
     if (std::strchr(buffer, '.') == nullptr) return false;
     std::snprintf(out, capacity, "%s", buffer);
@@ -237,19 +229,16 @@ struct Catalogue {
     ZipEntry patch_payload;
     int main_score;
     int patch_score;
-    uint64_t stale_reported;
 };
 
-inline bool locate_central_directory(int fd, uint64_t file_size,
-                                     uint64_t* cd_offset, uint64_t* cd_size,
-                                     uint64_t* entry_count) {
+inline bool locate_central_directory(int fd, uint64_t file_size, uint64_t* cd_offset,
+                                    uint64_t* cd_size, uint64_t* entry_count) {
     if (file_size < 22u) return false;
     const uint64_t window = file_size < kEocdWindow ? file_size : kEocdWindow;
-    const uint64_t window_start = file_size - window;
-
     uint8_t* buffer = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(window)));
     if (buffer == nullptr) return false;
-    if (!read_exact(fd, buffer, static_cast<size_t>(window), window_start)) {
+    if (!read_exact(fd, buffer, static_cast<size_t>(window), file_size - window)) {
+        LOGE("obb: cannot read the tail of the APK: %s", std::strerror(errno));
         std::free(buffer);
         return false;
     }
@@ -272,8 +261,8 @@ inline bool locate_central_directory(int fd, uint64_t file_size,
     uint64_t size = le32(record + 12);
     uint64_t offset = le32(record + 16);
 
-    // zip64: the 32-bit fields are saturated and the real values live in the
-    // zip64 record pointed at by the locator directly in front of the EOCD.
+    // zip64: the 32-bit fields saturate and the real values live in the record
+    // pointed at by the locator directly in front of the EOCD.
     if (entries == 0xffffu || size == kZip32Sentinel || offset == kZip32Sentinel) {
         bool resolved = false;
         if (eocd >= 20 && le32(record - 20) == kSigZip64Locator) {
@@ -288,17 +277,16 @@ inline bool locate_central_directory(int fd, uint64_t file_size,
             }
         }
         if (!resolved) {
-            LOGE("obb: the APK needs a zip64 central directory but none was found");
+            LOGE("obb: this APK needs a zip64 central directory but none was found");
             std::free(buffer);
             return false;
         }
     }
     std::free(buffer);
 
-    if (size == 0u || offset + size > file_size || size > kCentralDirectoryCap) {
+    if (size == 0u || size > kCentralDirectoryCap || offset + size > file_size) {
         LOGE("obb: implausible central directory (offset=%" PRIu64 ", size=%" PRIu64
-             ", apk=%" PRIu64 ")",
-             offset, size, file_size);
+             ", apk=%" PRIu64 ")", offset, size, file_size);
         return false;
     }
     *cd_offset = offset;
@@ -307,8 +295,8 @@ inline bool locate_central_directory(int fd, uint64_t file_size,
     return true;
 }
 
-// Only the fields that were saturated in the 32-bit header are present in the
-// zip64 extra field, and always in this order.
+// Only the fields saturated in the 32-bit header are present in the zip64
+// extra field, always in this order.
 inline void apply_zip64_extra(const uint8_t* extra, size_t extra_length,
                               bool need_uncompressed, bool need_compressed,
                               bool need_offset, ZipEntry* entry) {
@@ -338,8 +326,7 @@ inline void apply_zip64_extra(const uint8_t* extra, size_t extra_length,
 }
 
 // assets/obb/*.obb is the documented place for the payload; a stray .obb
-// anywhere else under assets/ is accepted with a lower score so a repack that
-// dropped the file at assets/ still works.
+// elsewhere under assets/ still works, with a lower score.
 inline int payload_score(const char* name) {
     if (std::strncmp(name, "assets/", 7) != 0) return 0;
     if (!ends_with_ci(name, ".obb")) return 0;
@@ -380,7 +367,7 @@ inline bool scan_catalogue(int fd, uint64_t cd_offset, uint64_t cd_size,
         const size_t record = 46u + name_length + extra_length + comment_length;
         if (cursor + record > static_cast<size_t>(cd_size)) break;
 
-        if (name_length < kNameCap) {
+        if (name_length > 0u && name_length < kNameCap) {
             ZipEntry entry {};
             std::memcpy(entry.name, header + 46, name_length);
             entry.name[name_length] = '\0';
@@ -403,8 +390,7 @@ inline bool scan_catalogue(int fd, uint64_t cd_offset, uint64_t cd_size,
             } else {
                 const int score = payload_score(entry.name);
                 if (score > 0) {
-                    const bool is_patch = starts_with_ci(base_name_of(entry.name), "patch");
-                    if (is_patch) {
+                    if (starts_with_ci(base_name_of(entry.name), "patch")) {
                         if (score > catalogue->patch_score) {
                             catalogue->patch_payload = entry;
                             catalogue->patch_score = score;
@@ -434,8 +420,8 @@ inline bool entry_data_offset(int fd, const ZipEntry& entry, uint64_t* data_offs
 
 // --- binary AndroidManifest.xml -------------------------------------------
 //
-// Only what is needed for two attributes of the <manifest> element. Attribute
-// names are matched as strings, so no resource-id table is required.
+// Only what two attributes of <manifest> need. Attribute names are matched as
+// strings, so no resource-id table is required.
 
 struct StringPool {
     const uint8_t* chunk;
@@ -451,10 +437,9 @@ inline bool pool_string(const StringPool& pool, uint32_t index, char* out, size_
     out[0] = '\0';
     if (pool.chunk == nullptr || index >= pool.count) return false;
 
-    const size_t offset = le32(pool.offsets + 4u * index);
     const uint8_t* end = pool.chunk + pool.chunk_size;
-    const uint8_t* cursor = pool.strings + offset;
-    if (cursor + 2 > end) return false;
+    const uint8_t* cursor = pool.strings + le32(pool.offsets + 4u * index);
+    if (cursor < pool.chunk || cursor + 2 > end) return false;
 
     size_t written = 0u;
     if (pool.utf8) {
@@ -484,7 +469,8 @@ inline bool pool_string(const StringPool& pool, uint32_t index, char* out, size_
             units = ((units & 0x7fffu) << 16) | le16(cursor);
             cursor += 2;
         }
-        for (uint32_t i = 0u; i < units && cursor + 2u * i + 2u <= end && written + 1u < capacity; ++i) {
+        for (uint32_t i = 0u;
+             i < units && cursor + 2u * i + 2u <= end && written + 1u < capacity; ++i) {
             const uint16_t unit = le16(cursor + 2u * i);
             out[written++] = (unit != 0u && unit < 0x80u) ? static_cast<char>(unit) : '?';
         }
@@ -495,18 +481,17 @@ inline bool pool_string(const StringPool& pool, uint32_t index, char* out, size_
 
 inline bool parse_manifest(const uint8_t* data, size_t size, char* package,
                            size_t package_capacity, int64_t* version_code) {
-    if (size < 8u || le16(data) != 0x0003u) return false;
+    if (size < 8u || le16(data) != 0x0003u) return false; // RES_XML_TYPE
 
     StringPool pool {};
     size_t cursor = 8u;
-    bool found = false;
     while (cursor + 8u <= size) {
         const uint8_t* chunk = data + cursor;
         const uint16_t type = le16(chunk);
         const uint16_t header_size = le16(chunk + 2);
         const uint32_t chunk_size = le32(chunk + 4);
-        if (chunk_size < 8u || header_size < 8u ||
-            cursor + chunk_size > size || header_size > chunk_size) {
+        if (chunk_size < 8u || header_size < 8u || header_size > chunk_size ||
+            cursor + chunk_size > size) {
             break;
         }
 
@@ -517,12 +502,12 @@ inline bool parse_manifest(const uint8_t* data, size_t size, char* package,
             pool.count = le32(chunk + 8);
             pool.offsets = chunk + header_size;
             pool.strings = chunk + le32(chunk + 20);
-            pool.utf8 = (flags & 0x0100u) != 0u;
+            pool.utf8 = (flags & 0x0100u) != 0u; // UTF8_FLAG
             if (pool.strings < chunk || pool.strings > chunk + chunk_size ||
                 pool.offsets + 4u * static_cast<size_t>(pool.count) > chunk + chunk_size) {
                 pool.chunk = nullptr;
             }
-        } else if (type == 0x0102u && pool.chunk != nullptr) { // RES_XML_START_ELEMENT
+        } else if (type == 0x0102u && pool.chunk != nullptr) { // START_ELEMENT
             const uint8_t* extension = chunk + header_size;
             if (extension + 20u > chunk + chunk_size) break;
             char element[64];
@@ -536,8 +521,8 @@ inline bool parse_manifest(const uint8_t* data, size_t size, char* package,
             const uint16_t attribute_size = le16(extension + 10);
             const uint16_t attribute_count = le16(extension + 12);
             for (uint16_t i = 0u; i < attribute_count && attribute_size >= 20u; ++i) {
-                const uint8_t* attribute = extension + attribute_start +
-                                           static_cast<size_t>(i) * attribute_size;
+                const uint8_t* attribute =
+                    extension + attribute_start + static_cast<size_t>(i) * attribute_size;
                 if (attribute + 20u > chunk + chunk_size) break;
                 char name[64];
                 if (!pool_string(pool, le32(attribute + 4), name, sizeof(name))) continue;
@@ -558,18 +543,27 @@ inline bool parse_manifest(const uint8_t* data, size_t size, char* package,
                     }
                 }
             }
-            found = true;
-            break;
+            return true;
         }
         cursor += chunk_size;
     }
-    return found;
+    return false;
+}
+
+// Last-resort version code: "main.1526.com.pixel.gun3d.obb".
+inline int64_t version_from_payload_name(const char* base_name) {
+    const char* dot = std::strchr(base_name, '.');
+    if (dot == nullptr) return -1;
+    ++dot;
+    if (*dot < '0' || *dot > '9') return -1;
+    return std::strtoll(dot, nullptr, 10);
 }
 
 // --- extraction ------------------------------------------------------------
 
 inline bool read_entry_to_memory(int fd, const ZipEntry& entry, uint64_t data_offset,
                                  uint8_t* out, size_t capacity, size_t* produced) {
+    *produced = 0u;
     if (entry.uncompressed == 0u || entry.uncompressed > capacity) return false;
 
     if (entry.method == kMethodStore) {
@@ -640,6 +634,15 @@ inline bool extract_entry_to_file(int fd, const ZipEntry& entry, uint64_t data_o
         unlink(temporary);
         return false;
     }
+    if (!inflating && entry.method != kMethodStore) {
+        LOGE("obb: '%s' uses unsupported ZIP method %u", entry.name,
+             static_cast<unsigned>(entry.method));
+        std::free(input);
+        std::free(output);
+        close(out);
+        unlink(temporary);
+        return false;
+    }
 
     bool ok = true;
     bool finished = false;
@@ -650,9 +653,9 @@ inline bool extract_entry_to_file(int fd, const ZipEntry& entry, uint64_t data_o
 
     while (ok && !finished && remaining > 0u) {
         const size_t take = remaining < kChunk ? static_cast<size_t>(remaining) : kChunk;
-        if (!read_exact(fd, input, take, data_offset + (entry.compressed - remaining))) {
-            LOGE("obb: read error in the APK at %" PRIu64 ": %s",
-                 data_offset + (entry.compressed - remaining), std::strerror(errno));
+        const uint64_t at = data_offset + (entry.compressed - remaining);
+        if (!read_exact(fd, input, take, at)) {
+            LOGE("obb: read error in the APK at %" PRIu64 ": %s", at, std::strerror(errno));
             ok = false;
             break;
         }
@@ -698,7 +701,7 @@ inline bool extract_entry_to_file(int fd, const ZipEntry& entry, uint64_t data_o
 
         if (ok && entry.uncompressed > 0u && written - logged >= kProgressStep) {
             logged = written;
-            LOGI("obb: copying '%s' — %" PRIu64 "/%" PRIu64 " bytes (%" PRIu64 "%%)",
+            LOGI("obb: copying '%s': %" PRIu64 "/%" PRIu64 " bytes (%" PRIu64 "%%)",
                  base_name_of(entry.name), written, entry.uncompressed,
                  written * 100u / entry.uncompressed);
         }
@@ -709,7 +712,7 @@ inline bool extract_entry_to_file(int fd, const ZipEntry& entry, uint64_t data_o
     std::free(output);
 
     if (ok && written != entry.uncompressed) {
-        LOGE("obb: '%s' produced %" PRIu64 " bytes but the APK says %" PRIu64,
+        LOGE("obb: '%s' produced %" PRIu64 " bytes, the APK says %" PRIu64,
              entry.name, written, entry.uncompressed);
         ok = false;
     }
@@ -728,7 +731,7 @@ inline bool extract_entry_to_file(int fd, const ZipEntry& entry, uint64_t data_o
         unlink(temporary);
         return false;
     }
-    // The game opens the file with its own uid, so 0644 is enough; on FUSE
+    // The game reads the file as its own uid, so 0644 is enough. On FUSE
     // emulated storage the mode is fixed by the volume and chmod is a no-op.
     if (chmod(temporary, 0644) != 0 && errno != EPERM) {
         LOGW("obb: chmod 0644 on '%s' failed: %s", temporary, std::strerror(errno));
@@ -771,11 +774,10 @@ inline size_t external_roots(char roots[3][kPathCap]) {
 inline bool free_space_available(const char* directory, uint64_t needed) {
     struct statvfs stats {};
     if (statvfs(directory, &stats) != 0) return true; // unknown: let the copy decide
-    const uint64_t free_bytes = static_cast<uint64_t>(stats.f_bavail) *
-                                static_cast<uint64_t>(stats.f_frsize);
+    const uint64_t free_bytes =
+        static_cast<uint64_t>(stats.f_bavail) * static_cast<uint64_t>(stats.f_frsize);
     if (free_bytes >= needed + kFreeSpaceMargin) return true;
-    LOGE("obb: not enough free space on '%s': %" PRIu64 " MiB available, %" PRIu64
-         " MiB needed",
+    LOGE("obb: not enough free space on '%s': %" PRIu64 " MiB free, %" PRIu64 " MiB needed",
          directory, free_bytes / (1024u * 1024u),
          (needed + kFreeSpaceMargin) / (1024u * 1024u));
     return false;
@@ -792,7 +794,7 @@ inline bool place_payload(int apk_fd, const ZipEntry& entry, const char* kind,
         char obb_root[kPathCap];
         std::snprintf(obb_root, sizeof(obb_root), "%s/Android/obb", roots[i]);
         if (!ensure_directory(obb_root)) {
-            LOGW("obb: '%s' unusable: %s", obb_root, std::strerror(errno));
+            LOGW("obb: '%s' is not usable: %s", obb_root, std::strerror(errno));
             continue;
         }
         char candidate[kPathCap];
@@ -804,8 +806,8 @@ inline bool place_payload(int apk_fd, const ZipEntry& entry, const char* kind,
         std::snprintf(directory, sizeof(directory), "%s", candidate);
     }
     if (directory[0] == '\0') {
-        LOGE("obb: no writable Android/obb directory for '%s'; the expansion file "
-             "was NOT provisioned", package);
+        LOGE("obb: no writable Android/obb/%s directory; the %s expansion file was "
+             "NOT provisioned", package, kind);
         return false;
     }
 
@@ -819,31 +821,190 @@ inline bool place_payload(int apk_fd, const ZipEntry& entry, const char* kind,
             if (chmod(destination, 0644) != 0 && errno != EPERM) {
                 LOGW("obb: chmod 0644 on '%s' failed: %s", destination, std::strerror(errno));
             }
-            LOGI("obb: '%s' already in place (%" PRIu64 " bytes); nothing to copy",
+            LOGI("obb: '%s' is already in place (%" PRIu64 " bytes); nothing to copy",
                  destination, entry.uncompressed);
             return true;
         }
         LOGW("obb: '%s' is %" PRId64 " bytes but the APK carries %" PRIu64
-             "; replacing it",
-             destination, static_cast<int64_t>(existing.st_size), entry.uncompressed);
+             "; replacing it", destination, static_cast<int64_t>(existing.st_size),
+             entry.uncompressed);
     }
 
     if (!free_space_available(directory, entry.uncompressed)) return false;
 
     uint64_t data_offset = 0u;
-    if (!entry_data_offset(apk_fd, entry, data_offset ? data_offset : 0u)) {
-        // placeholder, replaced below
-    }
     if (!entry_data_offset(apk_fd, entry, &data_offset)) {
         LOGE("obb: broken local header for '%s'", entry.name);
         return false;
     }
 
-    LOGI("obb: extracting '%s' (%" PRIu64 " bytes, %s) to '%s'",
-         entry.name, entry.uncompressed,
-         entry.method == kMethodStore ? "stored" : "deflated", destination);
+    LOGI("obb: extracting '%s' (%" PRIu64 " bytes, %s) to '%s'", entry.name,
+         entry.uncompressed, entry.method == kMethodStore ? "stored" : "deflated",
+         destination);
 
     char temporary[kPathCap];
     std::snprintf(temporary, sizeof(temporary), "%s.opg3d-part", destination);
     const uint64_t started = ::opg3d_log::monotonic_ms();
-    if (!extract_entry
+    if (!extract_entry_to_file(apk_fd, entry, data_offset, temporary)) return false;
+
+    if (rename(temporary, destination) != 0) {
+        LOGE("obb: rename '%s' -> '%s' failed: %s", temporary, destination,
+             std::strerror(errno));
+        unlink(temporary);
+        return false;
+    }
+    if (chmod(destination, 0644) != 0 && errno != EPERM) {
+        LOGW("obb: chmod 0644 on '%s' failed: %s", destination, std::strerror(errno));
+    }
+    const int directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd >= 0) {
+        fsync(directory_fd);
+        close(directory_fd);
+    }
+
+    // The expansion file is itself a ZIP; a payload that does not start with
+    // one is almost certainly the wrong asset and the game will refuse it.
+    uint8_t magic[4] = {0u, 0u, 0u, 0u};
+    bool zip_like = false;
+    const int check_fd = open(destination, O_RDONLY | O_CLOEXEC);
+    if (check_fd >= 0) {
+        zip_like = read(check_fd, magic, sizeof(magic)) == 4 && magic[0] == 'P' && magic[1] == 'K';
+        close(check_fd);
+    }
+    if (!zip_like) {
+        LOGW("obb: '%s' does not start with a ZIP signature; the game may reject it",
+             destination);
+    }
+
+    LOGI("obb: '%s' ready (%" PRIu64 " bytes, mode 0644, %" PRIu64 " ms)",
+         destination, entry.uncompressed, ::opg3d_log::monotonic_ms() - started);
+    return true;
+}
+
+inline bool run() {
+    char apk[kPathCap];
+    if (!find_own_apk(apk, sizeof(apk))) {
+        LOGE("obb: own APK not found in /proc/self/maps; expansion provisioning skipped");
+        return false;
+    }
+    const int fd = open(apk, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGE("obb: cannot open '%s': %s", apk, std::strerror(errno));
+        return false;
+    }
+    struct stat64 apk_info {};
+    if (fstat64(fd, &apk_info) != 0) {
+        LOGE("obb: cannot stat '%s': %s", apk, std::strerror(errno));
+        close(fd);
+        return false;
+    }
+    LOGI("obb: apk='%s' (%" PRId64 " bytes)", apk, static_cast<int64_t>(apk_info.st_size));
+
+    uint64_t cd_offset = 0u;
+    uint64_t cd_size = 0u;
+    uint64_t entries = 0u;
+    if (!locate_central_directory(fd, static_cast<uint64_t>(apk_info.st_size), &cd_offset,
+                                 &cd_size, &entries)) {
+        close(fd);
+        return false;
+    }
+
+    Catalogue catalogue {};
+    if (!scan_catalogue(fd, cd_offset, cd_size, entries, &catalogue)) {
+        close(fd);
+        return false;
+    }
+
+    char package[kPackageCap];
+    package[0] = '\0';
+    int64_t version_code = -1;
+    if (catalogue.manifest.valid) {
+        uint64_t manifest_offset = 0u;
+        if (entry_data_offset(fd, catalogue.manifest, &manifest_offset)) {
+            uint8_t* blob = static_cast<uint8_t*>(std::malloc(kManifestCap));
+            size_t produced = 0u;
+            if (blob != nullptr &&
+                read_entry_to_memory(fd, catalogue.manifest, manifest_offset, blob,
+                                     kManifestCap, &produced)) {
+                if (!parse_manifest(blob, produced, package, sizeof(package), &version_code)) {
+                    LOGW("obb: AndroidManifest.xml could not be parsed");
+                }
+            } else {
+                LOGW("obb: AndroidManifest.xml could not be read from the APK");
+            }
+            std::free(blob);
+        }
+    } else {
+        LOGW("obb: the APK has no AndroidManifest.xml entry");
+    }
+
+    char process_name[kPackageCap];
+    process_name[0] = '\0';
+    const bool have_process_name = read_process_name(process_name, sizeof(process_name));
+    if (package[0] == '\0' && have_process_name) {
+        std::snprintf(package, sizeof(package), "%s", process_name);
+        LOGW("obb: package name taken from /proc/self/cmdline ('%s')", package);
+    } else if (have_process_name && std::strcmp(package, process_name) != 0) {
+        LOGW("obb: manifest package '%s' differs from the process name '%s'; using the "
+             "manifest", package, process_name);
+    }
+    if (package[0] == '\0') {
+        LOGE("obb: package name unknown; expansion provisioning aborted");
+        close(fd);
+        return false;
+    }
+
+    if (version_code < 0 && catalogue.main_payload.valid) {
+        version_code = version_from_payload_name(base_name_of(catalogue.main_payload.name));
+        if (version_code >= 0) {
+            LOGW("obb: version code taken from the asset name ('%" PRId64 "')", version_code);
+        }
+    }
+    if (version_code < 0) {
+        LOGE("obb: version code unknown; the expansion file cannot be named correctly");
+        close(fd);
+        return false;
+    }
+
+    LOGI("obb: package='%s' versionCode=%" PRId64 " expected='main.%" PRId64 ".%s.obb'",
+         package, version_code, version_code, package);
+
+    if (!catalogue.main_payload.valid) {
+        LOGI("obb: this APK carries no assets/obb payload; nothing to provision (the game "
+             "will use whatever is already on storage)");
+        close(fd);
+        return true;
+    }
+
+    const uint64_t started = ::opg3d_log::monotonic_ms();
+    bool ok = place_payload(fd, catalogue.main_payload, "main", package, version_code);
+    if (catalogue.patch_payload.valid) {
+        ok = place_payload(fd, catalogue.patch_payload, "patch", package, version_code) && ok;
+    }
+    close(fd);
+
+    if (ok) {
+        LOGI("obb: provisioning finished in %" PRIu64 " ms; Unity has not started yet",
+             ::opg3d_log::monotonic_ms() - started);
+    } else {
+        LOGE("obb: provisioning FAILED after %" PRIu64 " ms; the game will behave as if the "
+             "expansion file were missing", ::opg3d_log::monotonic_ms() - started);
+    }
+    return ok;
+}
+
+} // namespace detail
+
+// Idempotent. Safe to call from more than one entry point; the first call does
+// the work, later calls return its result.
+inline bool provision() {
+    bool expected = false;
+    if (!detail::g_started.compare_exchange_strong(expected, true)) {
+        return detail::g_result.load();
+    }
+    const bool ok = detail::run();
+    detail::g_result.store(ok);
+    return ok;
+}
+
+} // namespace obb_provisioner
