@@ -24,6 +24,10 @@
 // AddCoins/AddGems receive count=0. The implementation below models that ABI
 // explicitly and discovers the real currency keys by observing the getInt()
 // call made by BankController itself; no guessed "Coins"/"Gems" keys are used.
+//
+// The lobby half of this module (namespace player_boost::lobby, below) grants
+// the whole lobby craft catalogue the same way: through the client's own item
+// grant and its own save, never by answering an ownership getter.
 namespace player_boost {
 namespace detail {
 
@@ -329,6 +333,309 @@ bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
 
 } // namespace detail
 
+// ---------------------------------------------------------------------------
+// The whole lobby craft catalogue, granted to the account.
+//
+// Lobby items are a progression of their own, unrelated to weapons and armour:
+// bases, gates, fences, terrain, roads, small and big decor, static and
+// dynamic backgrounds, effects, devices, the pet kennel and the paid bundles
+// (LobbyItemGroupType 100..600, LobbyItemInfo.LobbyItemSlot Base..skybox).
+// They are crafted in the lobby for coins/gems/real money, or gated behind
+// in-match lockers (kill N mobs, win duels, kill with a gadget or a pet,
+// collect lobby likes) that a private server can no longer make meaningful.
+//
+// The build ships the entire catalogue: LobbyItemsInfo.info describes every
+// item that exists, and LobbyItemsController._allItems holds one LobbyItem per
+// entry. Ownership is not a flag on that description — it is a separate
+// per-item LobbyItemPlayerInfo record, and the client grants one
+// unconditionally:
+//
+//   LobbyItemsController.AddItemNow(LobbyItem)          RVA 0x13E8534
+//     +0x7C  bl  LobbyItem.get_IsExists()               ; refuses duplicates
+//            bl  Object..ctor + LobbyItem.set_PlayerInfo(new player info)
+//            bl  LobbyItemInfo.get_Id()                 ; InfoId of the record
+//            bl  FriendsController.get_ServerTime()     ; craft marked done
+//            bl  LobbyItem.get_CraftTime()
+//     +0x9D0 bl  LobbyItemsController.Equip(item, silent)   ; bundle path only
+//     +0x9D8 bl  LobbyItemsController.SavePlayerCurrentData()
+//
+//   SavePlayerCurrentData()                             RVA 0x13E81E0
+//     +0x2D4 b   SaveLobbyItemsPlayerData(serialized)   RVA 0x13E0BB4
+//              bl JsonUtility.ToJson(obj)               RVA 0x1AB7278
+//              b  Storager.setString("lobby_items", json)  RVA 0xEBD760
+//
+// A scan of every branch in AddItemNow finds no BankController call, no
+// ItemPrice read and no purchase path at all: it is the client's own grant.
+// The game already uses it exactly the way this module does, for the starter
+// items:
+//
+//   LobbyItemsController.GetFreeItemsIfNotExists()      RVA 0x13EC858
+//     +0x168 bl  LobbyItem.get_IsExists()
+//     +0x17C bl  LobbyItemsController.AddItemNow(item)
+//
+// So nothing here is an ownership getter override. The account really receives
+// every item as a real LobbyItemPlayerInfo record, written by the game's own
+// save under the "lobby_items" Storager key, and it survives a restart. Prices,
+// craft timers, lockers, item effects/buffs and the cloud merge
+// (LobbyItemsCloudApplyer) are left exactly as they are.
+namespace lobby {
+
+using MethodInfo = void;
+using ManagedString = void;
+
+using UpdateFn = void (*)(void* self, const MethodInfo* method);
+using BoolInstanceFn = bool (*)(void* self, const MethodInfo* method);
+using ObjectInstanceFn = void* (*)(void* self, const MethodInfo* method);
+using VoidInstanceFn = void (*)(void* self, const MethodInfo* method);
+using AddItemFn = bool (*)(void* self, void* item, const MethodInfo* method);
+using ListCountFn = int32_t (*)(void* self, const MethodInfo* method);
+using ListItemFn = void* (*)(void* self, int32_t index,
+                             const MethodInfo* method);
+
+inline UpdateFn g_controller_update = nullptr;
+
+inline BoolInstanceFn g_is_ready = nullptr;
+inline const MethodInfo* g_mi_is_ready = nullptr;
+inline ObjectInstanceFn g_all_items = nullptr;
+inline const MethodInfo* g_mi_all_items = nullptr;
+inline AddItemFn g_add_item_now = nullptr;
+inline const MethodInfo* g_mi_add_item_now = nullptr;
+inline VoidInstanceFn g_save_player_data = nullptr;
+inline const MethodInfo* g_mi_save_player_data = nullptr;
+inline BoolInstanceFn g_item_exists = nullptr;
+inline const MethodInfo* g_mi_item_exists = nullptr;
+inline ObjectInstanceFn g_item_id = nullptr;
+inline const MethodInfo* g_mi_item_id = nullptr;
+
+// List<LobbyItem> is a generic instantiation, so its accessors are taken from
+// the class of the live list instead of being looked up by name in metadata.
+inline ListCountFn g_list_count = nullptr;
+inline const MethodInfo* g_mi_list_count = nullptr;
+inline ListItemFn g_list_item = nullptr;
+inline const MethodInfo* g_mi_list_item = nullptr;
+inline bool g_list_api_ready = false;
+inline bool g_list_api_failed = false;
+
+// Every grant writes the whole lobby save (JsonUtility.ToJson +
+// Storager.setString), so the catalogue is walked in small batches instead of
+// in one frame. All of this runs on the main thread inside
+// LobbyItemsController.Update, so plain statics are sufficient.
+inline constexpr int32_t kGrantsPerTick = 3;
+inline constexpr int32_t kScannedPerTick = 96;
+inline constexpr uint32_t kMaxLoggedGrants = 40;
+inline constexpr uint32_t kMaxFailures = 32;
+inline constexpr int32_t kMaxPasses = 8;
+inline constexpr uint32_t kRecheckTicks = 1800;
+
+inline bool g_disabled = false;
+inline bool g_complete = false;
+inline int32_t g_cursor = 0;
+inline int32_t g_pass = 0;
+inline uint32_t g_pass_granted = 0;
+inline uint32_t g_granted_total = 0;
+inline uint32_t g_failures = 0;
+inline uint32_t g_logged_grants = 0;
+inline uint32_t g_logged_failures = 0;
+inline uint32_t g_idle_ticks = 0;
+
+std::string item_name(void* item) {
+    if (item == nullptr || g_item_id == nullptr) {
+        return std::string("<id-api-unavailable>");
+    }
+    void* id = g_item_id(item, g_mi_item_id);
+    if (id == nullptr) return std::string("<null>");
+    return il2cpp::to_utf8(id, 64);
+}
+
+bool resolve_list_api(void* list) {
+    if (g_list_api_ready) return true;
+    if (g_list_api_failed) return false;
+    if (list == nullptr || il2cpp::object_get_class == nullptr ||
+        il2cpp::class_get_method_from_name == nullptr) {
+        return false;
+    }
+
+    void* klass = il2cpp::object_get_class(list);
+    if (klass == nullptr) {
+        g_list_api_failed = true;
+        LOGE("boost: the lobby catalogue list has no class; lobby items are "
+             "not granted");
+        return false;
+    }
+
+    void* count_info = il2cpp::class_get_method_from_name(klass, "get_Count", 0);
+    void* item_info = il2cpp::class_get_method_from_name(klass, "get_Item", 1);
+    void* count_ptr = il2cpp::method_pointer(count_info);
+    void* item_ptr = il2cpp::method_pointer(item_info);
+    if (count_ptr == nullptr || item_ptr == nullptr) {
+        g_list_api_failed = true;
+        LOGE("boost: List<LobbyItem> get_Count/get_Item could not be resolved "
+             "(%d/%d); lobby items are not granted",
+             count_ptr != nullptr ? 1 : 0, item_ptr != nullptr ? 1 : 0);
+        return false;
+    }
+
+    g_list_count = reinterpret_cast<ListCountFn>(count_ptr);
+    g_mi_list_count = count_info;
+    g_list_item = reinterpret_cast<ListItemFn>(item_ptr);
+    g_mi_list_item = item_info;
+    g_list_api_ready = true;
+    return true;
+}
+
+void finish_pass(int32_t count) {
+    ++g_pass;
+    if (g_pass_granted > 0 && g_pass < kMaxPasses) {
+        LOGI("boost: lobby pass %d granted %u item(s) out of %d in the "
+             "catalogue; verifying once more",
+             g_pass, g_pass_granted, count);
+        g_cursor = 0;
+        g_pass_granted = 0;
+        return;
+    }
+    g_complete = true;
+    g_cursor = 0;
+    g_pass_granted = 0;
+    g_idle_ticks = 0;
+    LOGI("boost: lobby catalogue complete — %d item(s) exist in this build, "
+         "%u granted and saved by this module (Storager key 'lobby_items')",
+         count, g_granted_total);
+}
+
+void grant_batch(void* self) {
+    void* items = g_all_items(self, g_mi_all_items);
+    if (items == nullptr || !resolve_list_api(items)) return;
+
+    const int32_t count = g_list_count(items, g_mi_list_count);
+    if (count <= 0) return;
+    if (g_cursor >= count) {
+        finish_pass(count);
+        return;
+    }
+
+    int32_t scanned = 0;
+    int32_t granted = 0;
+    while (g_cursor < count && scanned < kScannedPerTick &&
+           granted < kGrantsPerTick) {
+        void* item = g_list_item(items, g_cursor, g_mi_list_item);
+        ++g_cursor;
+        ++scanned;
+        if (item == nullptr) continue;
+        // Ownership is read, never answered: this is the same question the
+        // stock free-item loop asks before granting.
+        if (g_item_exists(item, g_mi_item_exists)) continue;
+
+        const std::string id = item_name(item);
+        if (!g_add_item_now(self, item, g_mi_add_item_now)) {
+            ++g_failures;
+            if (g_logged_failures < kMaxLoggedGrants) {
+                ++g_logged_failures;
+                LOGW("boost: the client refused to grant lobby item '%s'; it "
+                     "stays unowned",
+                     id.c_str());
+            }
+            if (g_failures >= kMaxFailures) {
+                g_disabled = true;
+                LOGE("boost: %u lobby grants were refused in a row; the lobby "
+                     "catalogue grant is disabled to leave the save alone",
+                     g_failures);
+                return;
+            }
+            continue;
+        }
+
+        ++granted;
+        ++g_pass_granted;
+        ++g_granted_total;
+        if (g_logged_grants < kMaxLoggedGrants) {
+            ++g_logged_grants;
+            LOGI("boost: lobby item '%s' granted through AddItemNow and saved "
+                 "(%u so far)",
+                 id.c_str(), g_granted_total);
+        }
+    }
+
+    // AddItemNow saves on its own; this is the game's own save method called
+    // once per batch so a partially walked catalogue is still persisted.
+    if (granted > 0 && g_save_player_data != nullptr) {
+        g_save_player_data(self, g_mi_save_player_data);
+    }
+    if (g_cursor >= count) finish_pass(count);
+}
+
+void hook_controller_update(void* self, const MethodInfo* method) {
+    g_controller_update(self, method);
+    if (self == nullptr || g_disabled) return;
+    // Items are constructed by InitItems()/ReadPlayerData() first; granting
+    // before the controller reports itself ready would race that setup.
+    if (!g_is_ready(self, g_mi_is_ready)) return;
+
+    if (g_complete) {
+        // A cloud merge or a re-read can reintroduce missing records, so the
+        // catalogue is re-verified occasionally instead of once per process.
+        if (++g_idle_ticks < kRecheckTicks) return;
+        g_idle_ticks = 0;
+        g_complete = false;
+        g_cursor = 0;
+        g_pass = 0;
+        g_pass_granted = 0;
+    }
+    grant_batch(self);
+}
+
+inline bool install() {
+    bool ok = detail::resolve_call(
+        {"Rilisoft", "LobbyItemsController", "get_IsReady", 0},
+        reinterpret_cast<void**>(&g_is_ready), &g_mi_is_ready);
+    ok &= detail::resolve_call(
+        {"Rilisoft", "LobbyItemsController", "get_AllItems", 0},
+        reinterpret_cast<void**>(&g_all_items), &g_mi_all_items);
+    ok &= detail::resolve_call(
+        {"Rilisoft", "LobbyItemsController", "AddItemNow", 1},
+        reinterpret_cast<void**>(&g_add_item_now), &g_mi_add_item_now);
+    ok &= detail::resolve_call({"Rilisoft", "LobbyItem", "get_IsExists", 0},
+                               reinterpret_cast<void**>(&g_item_exists),
+                               &g_mi_item_exists);
+    if (!ok) {
+        LOGE("boost: the lobby catalogue API could not be resolved; lobby "
+             "craft items are NOT granted");
+        return false;
+    }
+
+    // Optional: an extra save per batch, and item ids for the log lines.
+    if (!detail::resolve_call(
+            {"Rilisoft", "LobbyItemsController", "SavePlayerCurrentData", 0},
+            reinterpret_cast<void**>(&g_save_player_data),
+            &g_mi_save_player_data)) {
+        g_save_player_data = nullptr;
+        LOGW("boost: SavePlayerCurrentData is unavailable; lobby grants rely "
+             "on the save AddItemNow performs itself");
+    }
+    if (!detail::resolve_call({"Rilisoft", "LobbyItem", "get_Id", 0},
+                              reinterpret_cast<void**>(&g_item_id),
+                              &g_mi_item_id)) {
+        g_item_id = nullptr;
+        LOGW("boost: LobbyItem.get_Id is unavailable; lobby grants will not be "
+             "named in the log");
+    }
+
+    if (!hook::install({"Rilisoft", "LobbyItemsController", "Update", 0},
+                       detail::replacement(&hook_controller_update),
+                       detail::original_slot(&g_controller_update), false)) {
+        LOGE("boost: LobbyItemsController.Update could not be hooked; lobby "
+             "craft items are NOT granted");
+        return false;
+    }
+
+    LOGI("boost: lobby craft grant armed (source=LobbyItemsController.AllItems, "
+         "grant=AddItemNow + SavePlayerCurrentData, batch=%d per frame, "
+         "ownership getters=untouched, prices/lockers/effects=stock)",
+         kGrantsPerTick);
+    return true;
+}
+
+} // namespace lobby
+
 inline bool install_hooks() {
     bool ok = true;
     ok &= detail::resolve_call({"", "ExperienceController", "GetCurrentLevel", 0},
@@ -400,6 +707,13 @@ inline bool install_hooks() {
     LOGI("boost: persisted grant armed (trigger=%s.Update, level target=%d, "
          "currency target=%d, level-up UI=skipped)",
          chosen, detail::kLevelCap, detail::kCurrencyTarget);
+
+    // The lobby catalogue is a separate progression and a separate save file.
+    // Its failure must not take the level and currency grants down with it.
+    if (!lobby::install()) {
+        LOGW("boost: lobby craft items are not being granted; the level and "
+             "currency grants above are unaffected");
+    }
     return true;
 }
 
