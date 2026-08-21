@@ -21,7 +21,7 @@
 // libopg3d.so can be recognised immediately instead of being mistaken for a
 // failing hook. Bump the feature tag whenever runtime behaviour changes.
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "13.2.1 clan-craft workaround (armory v5)"
+#define OPG3D_BUILD_TAG "13.2.1 clan-craft workaround (armory v6)"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
