@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "clan_craft.h"
 #include "cloud_guard.h"
 #include "config.h"
 #include "elf_sym.h"
@@ -130,10 +131,13 @@ void* init_thread(void*) {
     const bool boost_installed = player_boost::install_hooks();
     const bool gameplay_installed = legacy_gameplay::install_hooks();
     const bool free_details_installed = free_detail_weapons::install_hooks();
+    const bool clan_craft_installed = clan_craft::install_hooks();
     if (photon_installed && guard_installed && boost_installed &&
-        gameplay_installed && free_details_installed) {
+        gameplay_installed && free_details_installed &&
+        clan_craft_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
-             "tutorial skip, free detail weapons and upgrade timers active");
+             "tutorial skip, free detail weapons, clan-free blueprint "
+             "crafting and upgrade timers active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -153,6 +157,10 @@ void* init_thread(void*) {
         }
         if (!free_details_installed) {
             LOGE("init: free detail-weapon compatibility is unavailable");
+        }
+        if (!clan_craft_installed) {
+            LOGE("init: clan blueprints remain locked; the craft-section "
+                 "availability gate could not be answered");
         }
     }
 
