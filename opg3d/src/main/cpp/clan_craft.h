@@ -44,6 +44,16 @@
 //   ClansController.AnyPartExistsInStock(string, type)    -> true
 //   ClansController.GetPartCountInStock(string, type)     -> synthetic if empty
 //
+// One UI consequence has to be handled as well. The "Crafting Process" hint
+// window (CraftSectionClanInfoController, fields _availability and
+// buttonLabels) is built from the very same enum value and picks its header
+// and call-to-action from it, so forcing Available only swapped one
+// impossible prompt for another: "Find a Clan" became "Raise the level", and
+// the button of those clan states leads into the retired clan search.
+// The window is purely informative, so ShopNGUIController
+// .ShowCraftSectionInfo() is suppressed while the stock reason is a clan
+// reason and forwarded unchanged when the section is genuinely about details.
+//
 // Only the availability gate is mandatory. Everything else installs when the
 // metadata matches and degrades with a warning otherwise. The craft press is
 // traced once per item so a follow-up report shows exactly which predicate
@@ -67,6 +77,7 @@ using PartCountFn = int32_t (*)(void* static_context, ManagedString* item_id,
                                 int32_t item_type, const MethodInfo* method);
 using AnyPartFn = bool (*)(void* static_context, ManagedString* item_id,
                            int32_t item_type, const MethodInfo* method);
+using ShowSectionInfoFn = void (*)(void* self, const MethodInfo* method);
 using CraftPressFn = void (*)(void* self, ManagedString* item_id,
                               void* bank_panel, void* instant_window_parent,
                               const MethodInfo* method);
@@ -76,6 +87,7 @@ inline SectionAvailableFn g_section_available = nullptr;
 inline MedalsFn g_medals_for_clan_craft = nullptr;
 inline PartCountFn g_part_count = nullptr;
 inline AnyPartFn g_any_part = nullptr;
+inline ShowSectionInfoFn g_show_section_info = nullptr;
 inline CraftPressFn g_craft_press = nullptr;
 
 // CraftSectionAvailability values, verified in the 13.2.1 dump.
@@ -83,6 +95,7 @@ inline constexpr int32_t kUnavailableClansNotOpened = 0;
 inline constexpr int32_t kUnavailableNoClan = 1;
 inline constexpr int32_t kUnavailableNoDetails = 2;
 inline constexpr int32_t kAvailable = 3;
+inline constexpr int32_t kUnknownAvailability = -1;
 
 // Reported as "present in clan storage" when that storage is empty. Kept
 // small on purpose: every recipe already costs zero details, so this value
@@ -94,10 +107,17 @@ inline constexpr int32_t kSyntheticStockParts = 99;
 // Per-path logging is capped so a per-frame UI refresh cannot flood logcat.
 inline constexpr uint32_t kMaxLoggedDecisions = 8;
 
+// Last value the stock game computed for the craft section. The armory polls
+// that getter while the screen is open, so this is a cheap, side-effect-free
+// way for other hooks to know the real reason without synthesising a managed
+// call of their own.
+inline std::atomic<int32_t> g_last_stock_availability{kUnknownAvailability};
+
 inline std::atomic<uint32_t> g_logged_availability{0u};
 inline std::atomic<uint32_t> g_logged_section{0u};
 inline std::atomic<uint32_t> g_logged_medals{0u};
 inline std::atomic<uint32_t> g_logged_stock{0u};
+inline std::atomic<uint32_t> g_logged_info{0u};
 inline std::atomic<uint32_t> g_logged_press{0u};
 
 template <typename Fn>
@@ -130,8 +150,16 @@ const char* availability_name(int32_t value) {
     }
 }
 
+// A clan reason is one this client can never satisfy again: clan membership
+// and the clan unlock both lived on the retired backend.
+bool is_clan_reason(int32_t availability) {
+    return availability == kUnavailableNoClan ||
+           availability == kUnavailableClansNotOpened;
+}
+
 int32_t hook_availability(void* static_context, const MethodInfo* method) {
     const int32_t stock_value = g_availability(static_context, method);
+    g_last_stock_availability.store(stock_value, std::memory_order_relaxed);
     if (stock_value == kAvailable) return stock_value;
 
     if (should_log(g_logged_availability)) {
@@ -184,15 +212,36 @@ bool hook_any_part(void* static_context, ManagedString* item_id,
     return stock_result ? stock_result : true;
 }
 
+// The hint window shows one requirement line plus one call-to-action per
+// availability state. Both clan states point at something unreachable here,
+// and their button opens the dead clan search, so the window is skipped for
+// those states only. The details variant stays useful and is forwarded
+// untouched.
+void hook_show_section_info(void* self, const MethodInfo* method) {
+    const int32_t stock_value =
+        g_last_stock_availability.load(std::memory_order_relaxed);
+    if (is_clan_reason(stock_value)) {
+        if (should_log(g_logged_info)) {
+            LOGI("clan-craft: suppressed craft hint window for %s(%d); that "
+                 "requirement no longer blocks crafting",
+                 availability_name(stock_value), stock_value);
+        }
+        return;
+    }
+    g_show_section_info(self, method);
+}
+
 // Diagnostics only: the craft press is forwarded unchanged. It exists so a
-// logcat capture shows whether the button handler is reached at all and which
-// item id it carries, which is the one piece of information the previous
-// reports were missing.
+// logcat capture shows whether the button handler is reached at all, which
+// item id it carries and what the stock section state was at that moment.
 void hook_craft_press(void* self, ManagedString* item_id, void* bank_panel,
                       void* instant_window_parent,
                       const MethodInfo* method) {
     if (should_log(g_logged_press)) {
-        LOGI("clan-craft: craft pressed for '%s'", item_name(item_id).c_str());
+        LOGI("clan-craft: craft pressed for '%s' (stock section state %s)",
+             item_name(item_id).c_str(),
+             availability_name(
+                 g_last_stock_availability.load(std::memory_order_relaxed)));
     }
     g_craft_press(self, item_id, bank_panel, instant_window_parent, method);
 }
@@ -249,6 +298,17 @@ inline bool install_hooks() {
              part_count ? 1 : 0);
     }
 
+    // Optional: the hint window that would keep advertising a clan or level
+    // requirement which no longer blocks anything.
+    const bool info_window = hook::install(
+        {"", "ShopNGUIController", "ShowCraftSectionInfo", 0},
+        detail::replacement(&detail::hook_show_section_info),
+        detail::original_slot(&detail::g_show_section_info), false);
+    if (!info_window) {
+        LOGW("clan-craft: ShopNGUIController.ShowCraftSectionInfo is "
+             "unavailable; the clan hint window may still be shown");
+    }
+
     // Optional, diagnostics only.
     const bool craft_press = hook::install(
         {"", "ShopNGUIController", "HandleCraftButton_NoInfo", 3},
@@ -259,10 +319,11 @@ inline bool install_hooks() {
     }
 
     LOGI("clan-craft: armed (section=Available, shop shortcut=%s, medals=%s, "
-         "clan storage=%s, tracing=%s); no clan object is created",
+         "clan storage=%s, clan hint window=%s, tracing=%s); no clan object "
+         "is created",
          section_available ? "forced" : "stock", medals ? "free" : "stock",
          (any_part && part_count) ? "synthetic" : "partial",
-         craft_press ? "on" : "off");
+         info_window ? "suppressed" : "stock", craft_press ? "on" : "off");
     return true;
 }
 
