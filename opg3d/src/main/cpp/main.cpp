@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "abuse_slot_sink.h"
 #include "cheat_guard.h"
 #include "clan_craft.h"
 #include "cloud_guard.h"
@@ -136,16 +137,18 @@ void* init_thread(void*) {
     const bool free_details_installed = free_detail_weapons::install_hooks();
     const bool clan_craft_installed = clan_craft::install_hooks();
     const bool removed_arsenal_installed = removed_arsenal::install_hooks();
+    const bool abuse_slot_sink_installed = abuse_slot_sink::install_hooks();
     const bool cheat_guard_installed = cheat_guard::install_hooks();
     if (photon_installed && guard_installed && boost_installed &&
         gameplay_installed && free_details_installed &&
         clan_craft_installed && removed_arsenal_installed &&
-        cheat_guard_installed) {
+        abuse_slot_sink_installed && cheat_guard_installed) {
         LOGI("init: phase 0 ready — Photon Cloud routing, progression grant, "
              "tutorial skip, free detail weapons, clan-free blueprint "
              "crafting, retired arsenal in the shop, the whole lobby craft "
-             "catalogue on the account, upgrade timers and the local "
-             "cheat-detection progress-wipe block active");
+             "catalogue on the account, upgrade timers, the virtual abuse-"
+             "slot persistence sink and the local cheat-detection progress-"
+             "wipe block active");
     } else {
         if (!photon_installed) {
             LOGE("init: core SelectPhotonAppId hook failed; fail-closed, "
@@ -173,6 +176,10 @@ void* init_thread(void*) {
         if (!removed_arsenal_installed) {
             LOGE("init: retired arsenal weapons stay hidden; the shop shelf "
                  "builder could not be wrapped");
+        }
+        if (!abuse_slot_sink_installed) {
+            LOGE("init: virtual abuse-slot sink unavailable; battle one can "
+                 "still seed a false abuse timestamp for battle two");
         }
         if (!cheat_guard_installed) {
             LOGE("init: the local CHEAT DETECTED punishment is NOT blocked; "
