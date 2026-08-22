@@ -8,7 +8,13 @@
 // instance's live progress / nextScene fields by known IL2CPP object offsets
 // taken from dump2313.cs.  A throttled heartbeat is emitted every 2 s or
 // whenever the state, progress, or result changes — whichever comes first.
-// All hooks call through to the original MoveNext; no game logic is altered.
+//
+// These hooks call through to the original MoveNext with one deliberate
+// exception: loading_stall_guard_2313::should_bypass() ends the
+// InitializeSwitcher iterator instead of entering the step that freezes the
+// game at 90% on the retired 23.1.3 backend.  See loading_stall_guard_2313.h
+// for the log evidence and the RVA cross-check.  The same guard receives the
+// enter/exit timestamps used by its stall watchdog.
 //
 // Field layout (dump2313.cs, ARM64 IL2CPP object offsets):
 //
@@ -43,6 +49,7 @@
 
 #include "hook.h"
 #include "il2cpp.h"
+#include "loading_stall_guard_2313.h"
 #include "log.h"
 
 namespace startup_trace_2313 {
@@ -107,7 +114,7 @@ static bool need_emit(Throttle& t, void* self,
     return emit;
 }
 
-// ── hook bodies ────────────────────────────────────────────────────────────
+// ── hook bodies ─────────────────────────────────────────────────────
 
 // Switcher.\u4e0b\u4e09\u4e0a\u4e1c\u4e13\u4e1a\u4e15\u4e09\u4e0e.MoveNext()
 // Drives the top-level loading coroutine (0 -> 100% bar).
@@ -117,6 +124,9 @@ bool hook_sw_start(void* self, const MethodInfo* method) {
     const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
     const float   progress2= read_at<float>  (switcher, 0x138, -1.0f);
     void*   const ns_raw   = read_at<void*>  (switcher, 0x150, nullptr);
+
+    // Proof that Unity is still scheduling the outer loading coroutine.
+    loading_stall_guard_2313::note_pump();
 
     const bool result = g_sw_start_next != nullptr
                             ? g_sw_start_next(self, method)
@@ -140,9 +150,20 @@ bool hook_sw_init(void* self, const MethodInfo* method) {
     const uint8_t rancho   = read_at<uint8_t>(self,     0x28, 0);
     const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
 
+    // The step resumed at state 35 never returns while the 23.1.3 backend is
+    // retired; ending the iterator here is what lets loading reach the menu.
+    if (loading_stall_guard_2313::should_bypass(self, state)) {
+        LOGW("23.1.3-swt: InitSwitcher state=%d progress=%.3f ranchoOk=%d "
+             "result=0 (stall guard finished the iterator)",
+             state, progress, rancho ? 1 : 0);
+        return false;
+    }
+
+    loading_stall_guard_2313::note_enter(state);
     const bool result = g_sw_init_next != nullptr
                             ? g_sw_init_next(self, method)
                             : false;
+    loading_stall_guard_2313::note_exit(state, result);
 
     if (need_emit(g_th_sw_init, self, state, progress, result)) {
         LOGI("23.1.3-swt: InitSwitcher state=%d progress=%.3f "
@@ -158,6 +179,9 @@ bool hook_sw_menu(void* self, const MethodInfo* method) {
     const int32_t state    = read_at<int32_t>(self,     0x10, INT32_MIN);
     void*   const switcher = read_at<void*>  (self,     0x20, nullptr);
     const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
+
+    // Reaching this iterator means the 90% stall is behind us.
+    loading_stall_guard_2313::note_menu_reached();
 
     const bool result = g_sw_menu_next != nullptr
                             ? g_sw_menu_next(self, method)
@@ -213,14 +237,19 @@ inline bool install_hooks() {
              "-- 90%% stall attribution will be impaired");
     }
 
-    // Switcher.InitializeSwitcher iterator.
+    // Switcher.InitializeSwitcher iterator.  This hook also carries the 90%
+    // stall bypass, so a failure here means the game will freeze again.
     if (hook::install(
             {"", u8"Switcher/\u4e1c\u4e03\u4e17\u4e0c\u4e11\u4e05\u4e1e\u4e07\u4e01",
              "MoveNext", 0},
             detail::repl(&detail::hook_sw_init),
             detail::orig(&detail::g_sw_init_next), false)) {
         ++installed;
-        LOGI("23.1.3-swt: Switcher.InitializeSwitcher heartbeat armed");
+        LOGI("23.1.3-swt: Switcher.InitializeSwitcher heartbeat + stall guard "
+             "armed");
+    } else {
+        LOGE("23.1.3-swt: Switcher.InitializeSwitcher MoveNext hook failed "
+             "-- the 90%% loading stall will NOT be bypassed");
     }
 
     // Switcher.LoadMainMenu iterator.
@@ -248,8 +277,10 @@ inline bool install_hooks() {
          "AppsMenu.Start; state/progress logged every 2 s or on change)",
          installed);
 
-    // Only Switcher.Start is critical; the rest provide additional detail.
-    return installed >= 1;
+    // Switcher.Start and InitializeSwitcher are the critical pair: the first
+    // reports loading progress, the second carries the 90% stall bypass.
+    return detail::g_sw_start_next != nullptr &&
+           detail::g_sw_init_next != nullptr;
 }
 
 } // namespace startup_trace_2313
