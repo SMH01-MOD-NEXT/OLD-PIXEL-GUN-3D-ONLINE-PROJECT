@@ -1,19 +1,69 @@
-# PG3D 16.1.1 Photon online port
+# PG3D 16.1.1 local backend session + Photon online port
 
-This branch targets the supplied obfuscated ARMv7 IL2CPP build and ports the Photon multiplayer connection path. Because the retired backend is bypassed through the stock offline-auth transition, this pass also restores only the main-menu **В бой** UIButton needed to enter the stock multiplayer flow. Progression, catalogue and gameplay modules remain out of scope.
+This branch targets the supplied obfuscated ARMv7 IL2CPP build. It keeps the existing Photon Cloud route and replaces the retired Cubic Games authorization transport with the game's own successful, online-compatible completion path backed by local `Storager` / `PlayerPrefs` state.
+
+The previous v5 path invoked `AuthInterfaceController.OnGoOfflineClick`. That opened the lobby and was enough to test Photon room entry, but it also left the process-wide backend-offline flag set. PUN could still be forced online, so a map loaded, while stock in-match initialization treated the account as offline: HUD, input and loadout initialization did not complete. v6 no longer enters the offline callback.
 
 ## Analysis inputs
 
 - `libil2cpp.so` SHA-256: `2aab620cb58a597e86975a78ab20987e71685b507456707ed42fa63fad54032b`
 - `global-metadata.dat` SHA-256: `b709931396332f27c79a8ef0e696e66fcd4aefd5d8217dca361741cee404eca6`
-- 16.1.1 `dump.cs` SHA-256: `6cbaff1fdbb21b1a93fc1c444689f9778a3e0a68b2204aaf9f5b3e59ed05a719`
+- 16.1.0 `dump.cs` SHA-256: `6cbaff1fdbb21b1a93fc1c444689f9778a3e0a68b2204aaf9f5b3e59ed05a719`
 - comparison 14.1.1 `dump1411.cs` SHA-256: `484a6041d330b587aaed702232c58423be59d495557ba84fdef64bf6a8ca24d1`
 
-The dumps, metadata and game binary are analysis inputs and are not committed.
+The binary, metadata and dumps are analysis inputs and are not committed.
 
-## Obfuscation mapping
+## Recovered backend-first state machine
 
-The 16.1.1 dump preserves the PUN type layout and signatures but obfuscates the central class and most method names. `photon_1610.h` contains the Photon mapping and `battle_ui_1610.h` contains the isolated UI mapping for this exact binary only:
+`AuthSceneState` is preserved in the 16.1.0 dump:
+
+- `0 Initial`
+- `1 Authorizing`
+- `2 Authorized`
+- `3 FullySynchronized`
+- `4 Empty`
+- `5 CheckBindedId`
+- `6 ChooseId`
+- `7 ChooseProgress`
+- `8 SendCachedCommands`
+- `9 SynchronizeProgress`
+- `10 CheckAppVersion`
+- `11 Easy`
+- `12 CheckConnection`
+- `13 SendProgress`
+- `14 WaitAsync`
+- `15 TechnicalWorks`
+
+The relevant mappings for this exact binary are:
+
+- offline button: `AuthInterfaceController.OnGoOfflineClick/0`, RVA `0x00908364`
+- offline callback registered by `AuthSceneController.Awake`: `AuthSceneController.不丏丛丝不上丐丂丂/0`, RVA `0x0090AB80`
+- successful completion: `AuthSceneController.丐业丆一七专丌丝丑/0`, RVA `0x0090BFC8`
+- completion blocker: `AuthSceneController.丕丈丁丝丈丑丛业不/0`, RVA `0x0090D5EC`
+- state getter: `AuthSceneController.且丙丐丟丞丞丗世下/0`, RVA `0x00908624`
+- session-ready getter: `AuthSceneController.丁丌丁丅丐丈丕丌丕/0`, RVA `0x009086F4`
+- state application: `AuthSceneController.丑丐丛丁丕下七与三/1`, RVA `0x00909FC4`
+
+A32 control-flow decoding of the supplied `libil2cpp.so` established the semantic difference:
+
+1. The offline callback writes `1` to a static byte at offset `0x3DC`, performs the offline lobby setup and loads the menu. It does **not** publish `FullySynchronized`.
+2. The stock successful completion first applies `CheckAppVersion`, then applies `FullySynchronized`, writes `0` to the same static byte at offset `0x3DC`, sets `AuthSceneController`'s session-ready flag at static offset `0xC`, invokes the synchronization-complete listeners, and enters the same stock menu loader.
+3. `OfflineModController.Start` later reads that `0x3DC` byte and gates backend-dependent UI. Clearing only `PhotonNetwork.offlineMode`, as v5 did, cannot clear this independent backend/session state.
+
+## Local backend behavior
+
+`backend_local_1610.h` implements a narrow in-process session boundary:
+
+1. `AuthSceneController.Awake` remains stock. Local serializers, model owners, listeners and existing persisted profile data are initialized normally.
+2. `AuthSceneController.Start` is intercepted before it can launch the retired authorization HTTP route.
+3. The game-owned successful completion method is invoked directly. No JSON payload, user ID, inventory, currency, HTTP status or WebSocket response is fabricated.
+4. The obsolete backend-fed app-version predicate is bypassed only while that synchronous local completion transaction is running. Calls outside the transaction remain stock.
+5. Completion is accepted only when the stock session-ready getter is true and the final state is `FullySynchronized` or `Empty` (the stock menu loader changes state 3 to state 4 after publishing completion). Otherwise the bridge fails closed and does not fall back to either the retired backend or the offline callback.
+6. All profile changes continue through the original controllers and their `Storager` / `PlayerPrefs` save paths. The bridge owns no parallel save format and does not globally override inventory or ownership getters.
+
+This is intentionally a backend **session emulator**, not a fake Cubic Games API server. It supplies the state transition the defunct service used to unlock while preserving the client as the authority for local data and gameplay objects.
+
+## Photon mapping retained from v5
 
 - `Switcher.SetUpPhoton(HiddenSettings)` → `Switcher.丝且丟世专丕丟丐丝/1`
 - `Switcher.SelectPhotonAppId(HiddenSettings)` → `Switcher.丞不与丗丏丕丄七三/1`
@@ -24,78 +74,44 @@ The 16.1.1 dump preserves the PUN type layout and signatures but obfuscates the 
 - `PhotonNetwork.set_offlineMode(bool)` → `与七丅一丑丈丅丘丅/1`
 - `PhotonNetwork.ConnectUsingSettings(string)` → `丟丙下世丒不丐丘丛/1`
 - `ServerSettings.UseCloud(string, CloudRegionCode)` → `ServerSettings.丛丙丄世一丁业丟专/2`
-- `OfflineModController` offline UIButton gate → `丁丅三七丆丙丛不丈(bool)/1`
-- target menu object → `MainMenuController.multiplayerButton`
-- NGUI click entry → `UIButton.OnClick()/0`
-- stock multiplayer click core → `MainMenuController.OnClickMultiplyerButtonCore(bool)/1`
-- stock `GoMulty()` → `MainMenuController.丏丛一丐世丂丌万丛/0`
-- `NetworkingPeer` → `丛丗丄与丐与三丐丄`
-- peer diagnostics retain readable names: `DebugReturn`, `OnStatusChanged`, `OnOperationResponse`
-- `PhotonNetwork.Disconnect()` → `上丁丈与丘丟丈专丄.丑丑万丂上丅丌世丝/0`
+- room-options serializer → `丏丙丞一专不万万世/2`
+- `RoomOptions.Plugins` → `不丈丏一丏万丅丂下.丂下丒不丞业专不丏`
 
-Mappings were established by matching the unchanged class field order, method order, parameter/return signatures and the PUN 1.91 layout against 14.1.1. No guessed raw RVA is used by the online module.
-
-## Runtime behavior
-
-1. The obfuscated Switcher AppID selector returns the AppID supplied through the existing `PHOTON_APP_ID` build secret. Logs contain only its character count and FNV-1a fingerprint.
-2. After `SetUpPhoton`, and again immediately before `ConnectUsingSettings`, the stock `ServerSettings.UseCloud(appId, eu)` method is called. Host type, region and stored AppID are then read back and repaired through metadata fields only if the SDK call did not leave the expected values.
-3. The auth-scene fallback still opens the menu through the game's stock offline transition. The recovered `OfflineModController` gate normally disables a list containing leaderboards, social, multiplayer, quests and friends buttons. The port keeps that stock gate for every entry except the `UIButton` whose `gameObject` is exactly `MainMenuController.multiplayerButton`; no global `UIButton` unlock is performed.
-4. The target `UIButton.OnClick` first runs its original EventDelegate list. If the offline-auth lobby did not bind the multiplayer delegate, the bridge invokes the stock `OnClickMultiplyerButtonCore(true)`. If that core returns before `GoMulty`, it invokes the stock `GoMulty` route. Connect-scene and matchmaking logic are not reimplemented.
-5. Device traces showed that this prefab emits three target `UIButton.OnClick` calls for one physical tap, starting `GoMulty` three times within 25 ms. A 500 ms target-only debounce now accepts the first dispatch and suppresses the duplicate component callbacks. Other UIButtons are unaffected.
-6. Immediately before a real PUN connection, `PhotonNetwork.offlineMode` is cleared through its own setter so the stock connect method does not reject online play.
-7. `FriendsController.Update` is forwarded normally until a Photon connection starts. While PUN is connecting or connected, that dead social/backend tick is quarantined so it cannot run the legacy local disconnect path.
-8. Passive diagnostic wrappers report the real Photon status codes, operation response code/message, stock disconnect requests and `ConnectionControl` callbacks, then always call the original implementations. Authentication and response results are not fabricated.
-9. The v4 device trace proved that authentication, Master Server and Game Server connections all succeed. Room creation alone failed with `32751 PluginMismatch`: the legacy client requested Pixel Gun's retired custom plugin while the new Photon application reported `Default`. v5 temporarily clears only `RoomOptions.Plugins` while the stock SDK serializes create/join parameters, then restores the field. Custom room properties and all other operation parameters remain stock.
+The existing Photon module still clears PUN's own `offlineMode` defensively, applies the configured Photon AppID / EU route, omits the retired custom plugin only while room options are serialized, and leaves matchmaking, RPCs and room callbacks stock.
 
 ## Build and device validation
 
-Build from branch `16.1.1-test` with the repository Actions secret `PHOTON_APP_ID`, install the resulting `libopg3d.so`, and capture:
+Build with the repository `PHOTON_APP_ID` Actions secret, install the resulting `libopg3d.so`, and capture:
 
 ```bash
 adb logcat -s OPG3D
 ```
 
-Expected startup lines:
+Expected startup and auth lines:
 
 ```text
-init: libopg3d build 16.1.1 Default Photon plugin v5 ...
-16.1.1-photon: installed 4 hooks (appid=OK connect=OK backend-guard=OK; ...)
-16.1.1-photon-plugin: Default-plugin compatibility hook installed (only ParameterCode.Plugins=204 is omitted)
-16.1.1-photon-trace: installed 8/8 hooks (status=OK operation=OK disconnect=OK)
-16.1.1-battle-ui: installed 5 hooks (gate=OK setter=OK onclick=OK core=OK go=OK; ...)
-16.1.1-battle-ui: armed 500 ms target-only click debounce
-init: 16.1.1 online port ready ...
+init: libopg3d build 16.1.1 Local backend session v6 ...
+16.1.x-local-backend: armed stock FullySynchronized completion from local Storager state ...
+16.1.x-local-backend: suppressing AuthSceneController.Start network route ...
+16.1.x-local-backend: ignored retired backend version gate for the local completion transaction
+16.1.x-local-backend: local online-compatible session ready (state=4/Empty readyFlag=1 backendOffline=cleared by stock completion)
+16.1.x-trace: MAIN MENU REACHED — MainMenuController.Awake returned
 ```
 
-After the main menu appears, the offline gate should emit this line once:
+The following old line must **not** appear:
 
 ```text
-16.1.1-battle-ui: restored the stock 'В бой' UIButton; other backend-dependent buttons remain gated
+16.1.x-auth: dead backend bypass — invoking stock AuthInterfaceController.OnGoOfflineClick
 ```
 
-On pressing **В бой**, the UI bridge should report which stock stage was missing:
+A successful gameplay test must verify all of the following on two devices:
 
-```text
-16.1.1-battle-ui: accepted one physical target click
-16.1.1-battle-ui: target UIButton.OnClick #1
-16.1.1-battle-ui: target EventDelegate did not invoke MainMenuController; dispatching the stock click core
-16.1.1-battle-ui: stock multiplayer click core entered (playSound=1)
-16.1.1-battle-ui: stock GoMulty entered from target click
-16.1.1-battle-ui: target UIButton.OnClick #2 suppressed as a duplicate component dispatch within 500 ms
-16.1.1-battle-ui: target UIButton.OnClick #3 suppressed as a duplicate component dispatch within 500 ms
-```
+1. the stock **В бой** route opens without an offline-only warning;
+2. Photon authenticates, creates or joins a room, and loads the map;
+3. HUD, joysticks/movement, firing, weapon switching and the initial loadout are present;
+4. both players see movement, damage and RPC-driven actions;
+5. leaving the match returns to a usable menu;
+6. a second consecutive match works;
+7. locally changed settings/progression survive a restart.
 
-A healthy delegate may omit the fallback warning. Once a mode actually starts Photon, v5 should remove the retired plugin request and record the complete SDK path:
-
-```text
-16.1.1-photon-plugin: removed legacy RoomOptions.Plugins for operation #1; Photon Cloud will use the Default plugin
-16.1.1-photon-status: 1024(Connect) ...
-16.1.1-photon-op: op=227 return=0(Ok) ...
-16.1.1-connection-ui: OnConnectedToMaster ...
-16.1.1-connection-ui: OnFailedToConnect ...
-16.1.1-photon: stock PhotonNetwork.Disconnect requested ...
-```
-
-A successful test must no longer contain `return=32751(PluginMismatch)`. It should instead reach `OnCreatedRoom` or `OnJoinedRoom`. Any new non-zero `photon-op` result identifies the next stock matchmaking dependency without hiding it.
-
-Then verify master connection, room creation/join, a two-device match, RPC synchronization, match exit, and a second consecutive match. A `PHOTON_APP_ID is empty`, `route verification failed`, or `online port incomplete` line means the build must not be treated as a successful online test.
+Any `local-backend: stock completion did not publish a usable session`, `PHOTON_APP_ID is empty`, `route verification failed`, `PluginMismatch`, or `online port incomplete` line is a failed test, not a condition to hide with another global getter override.

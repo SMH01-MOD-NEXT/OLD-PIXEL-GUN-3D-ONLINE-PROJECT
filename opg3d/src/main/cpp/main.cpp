@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "backend_local_1610.h"
 #include "battle_ui_1610.h"
 #include "battle_click_debounce_1610.h"
 #include "config.h"
@@ -36,7 +37,7 @@ size_t assembly_count(void* domain) {
 
 void* init_thread(void*) {
     LOGI("init: libopg3d build %s", OPG3D_BUILD_STAMP);
-    LOGI("init: [0/6] 16.1.1 Photon-online bootstrap started");
+    LOGI("init: [0/6] 16.1.1 local-backend + Photon bootstrap started");
 
     uintptr_t base = 0u;
     bool found = false;
@@ -113,7 +114,8 @@ void* init_thread(void*) {
     }
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 16.1.1 hooks");
 
-    const bool auth_bypass = version_1610::install_runtime_hooks();
+    const bool version_traces = version_1610::install_runtime_hooks();
+    const bool local_backend = backend_local_1610::install_hooks();
     const bool photon_online = photon_1610::install_hooks();
     const bool default_plugin =
         photon_default_plugin_1610::install_hooks();
@@ -121,22 +123,23 @@ void* init_thread(void*) {
     const bool battle_ui = battle_ui_1610::install_hooks();
     const bool click_debounce = battle_ui &&
         battle_click_debounce_1610::install();
-    if (signature_compat && auth_bypass && photon_online && default_plugin &&
-        photon_trace && battle_ui && click_debounce) {
-        LOGI("init: 16.1.1 online port ready — stock offline transition opens "
-             "the menu, the 'В бой' UIButton remains interactive, then PUN "
-             "switches online through the configured Photon Cloud app in EU");
+    if (signature_compat && version_traces && local_backend && photon_online &&
+        default_plugin && photon_trace && battle_ui && click_debounce) {
+        LOGI("init: 16.1.1 online port ready — stock local data will publish "
+             "a FullySynchronized online-compatible backend session before "
+             "the existing Photon Cloud / EU route is used");
     } else {
-        LOGE("init: 16.1.1 online port incomplete: signature=%d auth=%d "
-             "photon=%d plugin=%d trace=%d battle-ui=%d debounce=%d",
-             signature_compat ? 1 : 0, auth_bypass ? 1 : 0,
-             photon_online ? 1 : 0, default_plugin ? 1 : 0,
-             photon_trace ? 1 : 0, battle_ui ? 1 : 0,
-             click_debounce ? 1 : 0);
+        LOGE("init: 16.1.1 online port incomplete: signature=%d traces=%d "
+             "local-backend=%d photon=%d plugin=%d trace=%d battle-ui=%d "
+             "debounce=%d",
+             signature_compat ? 1 : 0, version_traces ? 1 : 0,
+             local_backend ? 1 : 0, photon_online ? 1 : 0,
+             default_plugin ? 1 : 0, photon_trace ? 1 : 0,
+             battle_ui ? 1 : 0, click_debounce ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
-    LOGI("init: 16.1.1 Photon-online bootstrap finished cleanly");
+    LOGI("init: 16.1.1 local-backend + Photon bootstrap finished cleanly");
     return nullptr;
 }
 
