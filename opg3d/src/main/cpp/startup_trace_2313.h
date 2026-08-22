@@ -5,16 +5,20 @@
 // Hooks the three Switcher coroutine iterators (Start, InitializeSwitcher,
 // LoadMainMenu) and the AppsMenu.Start iterator.  At each MoveNext call the
 // hook reads the C# state-machine position (<>1__state) and the Switcher
-// instance's live progress / nextScene fields by known IL2CPP object offsets
-// taken from dump2313.cs.  A throttled heartbeat is emitted every 2 s or
-// whenever the state, progress, or result changes — whichever comes first.
+// instance's live fields by known IL2CPP object offsets taken from
+// dump2313.cs.  A throttled heartbeat is emitted every 2 s or whenever the
+// state, value, or result changes -- whichever comes first.
 //
 // These hooks call through to the original MoveNext with one deliberate
-// exception: loading_stall_guard_2313::should_bypass() ends the
-// InitializeSwitcher iterator instead of entering the step that freezes the
-// game at 90% on the retired 23.1.3 backend.  See loading_stall_guard_2313.h
-// for the log evidence and the RVA cross-check.  The same guard receives the
-// enter/exit timestamps used by its stall watchdog.
+// exception: loading_stall_guard_2313::should_skip_step() skips the single
+// InitializeSwitcher step that freezes the game at 90% on the retired 23.1.3
+// backend, resuming the state machine at the next state so the remaining
+// steps still run.  See loading_stall_guard_2313.h for the log evidence and
+// the RVA cross-check.  The same guard receives the enter/exit timestamps used
+// by its stall watchdog, and a pre-call line for LoadMainMenu state changes:
+// libopg3d is built with -fno-exceptions, so a managed exception thrown by
+// stock code unwinds through the hook frame and no post-call log would ever
+// be emitted.
 //
 // Field layout (dump2313.cs, ARM64 IL2CPP object offsets):
 //
@@ -25,9 +29,10 @@
 //    IEnumerator<float> <>7__wrap1 @ 0x28
 //
 //  Switcher  (MonoBehaviour) instance fields:
-//    float 0x128  (\u4e14\u4e07\u4e1c\u4e45\u4e01\u4e0f\u4e10\u4e18\u4e14)  _progress
-//    float 0x138  (\u4e0f\u4e14\u4e04\u4e45\u4e00\u4e19\u4e0c\u4e1b\u4e0c)  second float
-//    string 0x150 (\u4e17\u4e01\u4e1d\u4e04\u4e52\u4e09\u4e0f\u4e13\u4e1f)  nameNextScene
+//    float 0x128  minimum loading time in seconds (reads 3.000; LoadMainMenu
+//                 compares it against the loading Stopwatch, it is NOT the bar)
+//    float 0x138  the value the iterators yield -- what the bar shows
+//    string 0x150 nameNextScene
 //
 //  Switcher.\u4e1c\u4e03\u4e17\u4e0c\u4e11\u4e05\u4e1e\u4e07\u4e01  (IEnumerable<float>, wraps InitializeSwitcher())
 //    int    <>1__state           @ 0x10
@@ -37,6 +42,7 @@
 //  Switcher.\u4e1d\u4e01\u4e09\u4e1f\u4e10\u4e15\u4e01\u4e0e\u4e0f  (IEnumerable<float>, wraps LoadMainMenu())
 //    int    <>1__state   @ 0x10
 //    Switcher <>4__this  @ 0x20
+//    states: 0 = start, 1 = wait for the 3 s minimum, 2 = tail done
 //
 //  AppsMenu.\u4e19\u4e0b\u4e19\u4e07\u4e09\u4e06\u4e11\u4e01\u4e1a  (IEnumerator<object>, wraps AppsMenu.Start())
 //    int      <>1__state   @ 0x10
@@ -66,11 +72,11 @@ inline MoveNextFn g_am_start_next = nullptr;  // AppsMenu.Start iterator
 
 // Per-hook throttle: suppress identical back-to-back log lines.
 struct Throttle {
-    void*    last_self     = nullptr;
-    int32_t  last_state    = INT32_MIN;
-    bool     last_result   = true;
-    float    last_progress = -1000.0f;
-    uint64_t last_log_ms   = 0u;
+    void*    last_self   = nullptr;
+    int32_t  last_state  = INT32_MIN;
+    bool     last_result = true;
+    float    last_value  = -1000.0f;
+    uint64_t last_log_ms = 0u;
 };
 
 inline Throttle g_th_sw_start;
@@ -87,15 +93,14 @@ static T read_at(const void* base, size_t offset, T fallback) noexcept {
     return v;
 }
 
-// Throttling: emit at most once per 2 s unless state/progress/result changed.
+// Throttling: emit at most once per 2 s unless state/value/result changed.
 static constexpr uint64_t kIntervalMs = 2000u;
 
 static bool need_emit(Throttle& t, void* self,
-                      int32_t state, float progress, bool result) noexcept {
+                      int32_t state, float value, bool result) noexcept {
     const uint64_t now = opg3d_log::monotonic_ms();
-    const float    d   = progress > t.last_progress
-                             ? progress - t.last_progress
-                             : t.last_progress - progress;
+    const float    d   = value > t.last_value ? value - t.last_value
+                                              : t.last_value - value;
     const bool emit =
         self     != t.last_self      ||
         state    != t.last_state     ||
@@ -105,24 +110,24 @@ static bool need_emit(Throttle& t, void* self,
         now < t.last_log_ms          ||
         now - t.last_log_ms >= kIntervalMs;
     if (emit) {
-        t.last_self     = self;
-        t.last_state    = state;
-        t.last_result   = result;
-        t.last_progress = progress;
-        t.last_log_ms   = now;
+        t.last_self   = self;
+        t.last_state  = state;
+        t.last_result = result;
+        t.last_value  = value;
+        t.last_log_ms = now;
     }
     return emit;
 }
 
-// ── hook bodies ─────────────────────────────────────────────────────
+// -- hook bodies ------------------------------------------------------------
 
 // Switcher.\u4e0b\u4e09\u4e0a\u4e1c\u4e13\u4e1a\u4e15\u4e09\u4e0e.MoveNext()
 // Drives the top-level loading coroutine (0 -> 100% bar).
 bool hook_sw_start(void* self, const MethodInfo* method) {
     const int32_t state    = read_at<int32_t>(self,     0x10, INT32_MIN);
     void*   const switcher = read_at<void*>  (self,     0x20, nullptr);
-    const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
-    const float   progress2= read_at<float>  (switcher, 0x138, -1.0f);
+    const float   min_sec  = read_at<float>  (switcher, 0x128, -1.0f);
+    const float   bar      = read_at<float>  (switcher, 0x138, -1.0f);
     void*   const ns_raw   = read_at<void*>  (switcher, 0x150, nullptr);
 
     // Proof that Unity is still scheduling the outer loading coroutine.
@@ -132,10 +137,10 @@ bool hook_sw_start(void* self, const MethodInfo* method) {
                             ? g_sw_start_next(self, method)
                             : false;
 
-    if (need_emit(g_th_sw_start, self, state, progress, result)) {
-        LOGI("23.1.3-swt: Start state=%d progress=%.3f p2=%.3f "
+    if (need_emit(g_th_sw_start, self, state, bar, result)) {
+        LOGI("23.1.3-swt: Start state=%d bar=%.3f minSec=%.3f "
              "next='%s' result=%d",
-             state, progress, progress2,
+             state, bar, min_sec,
              il2cpp::to_utf8(ns_raw, 128).c_str(),
              result ? 1 : 0);
     }
@@ -148,48 +153,61 @@ bool hook_sw_init(void* self, const MethodInfo* method) {
     const int32_t state    = read_at<int32_t>(self,     0x10, INT32_MIN);
     void*   const switcher = read_at<void*>  (self,     0x20, nullptr);
     const uint8_t rancho   = read_at<uint8_t>(self,     0x28, 0);
-    const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
+    const float   min_sec  = read_at<float>  (switcher, 0x128, -1.0f);
+    const float   bar      = read_at<float>  (switcher, 0x138, -1.0f);
 
     // The step resumed at state 35 never returns while the 23.1.3 backend is
-    // retired; ending the iterator here is what lets loading reach the menu.
-    if (loading_stall_guard_2313::should_bypass(self, state)) {
-        LOGW("23.1.3-swt: InitSwitcher state=%d progress=%.3f ranchoOk=%d "
-             "result=0 (stall guard finished the iterator)",
-             state, progress, rancho ? 1 : 0);
-        return false;
+    // retired.  The guard writes the next state and we report a yield, so the
+    // remaining steps of the state machine still run.
+    int32_t resume = state;
+    if (loading_stall_guard_2313::should_skip_step(self, state, &resume)) {
+        const bool keep_going = resume >= 0;
+        LOGW("23.1.3-swt: InitSwitcher state=%d bar=%.3f minSec=%.3f "
+             "ranchoOk=%d result=%d (stall guard %s)",
+             state, bar, min_sec, rancho ? 1 : 0, keep_going ? 1 : 0,
+             keep_going ? "skipped this step" : "finished the iterator");
+        return keep_going;
     }
 
-    loading_stall_guard_2313::note_enter(state);
+    loading_stall_guard_2313::note_init_enter(state);
     const bool result = g_sw_init_next != nullptr
                             ? g_sw_init_next(self, method)
                             : false;
-    loading_stall_guard_2313::note_exit(state, result);
+    loading_stall_guard_2313::note_init_exit(state, result);
 
-    if (need_emit(g_th_sw_init, self, state, progress, result)) {
-        LOGI("23.1.3-swt: InitSwitcher state=%d progress=%.3f "
+    if (need_emit(g_th_sw_init, self, state, bar, result)) {
+        LOGI("23.1.3-swt: InitSwitcher state=%d bar=%.3f minSec=%.3f "
              "ranchoOk=%d result=%d",
-             state, progress, rancho ? 1 : 0, result ? 1 : 0);
+             state, bar, min_sec, rancho ? 1 : 0, result ? 1 : 0);
     }
     return result;
 }
 
 // Switcher.\u4e1d\u4e01\u4e09\u4e1f\u4e10\u4e15\u4e01\u4e0e\u4e0f.MoveNext()
-// Final step: loads the main menu scene.
+// Final step: waits out the minimum loading time, then runs the tail that
+// requests the main menu scene.
 bool hook_sw_menu(void* self, const MethodInfo* method) {
     const int32_t state    = read_at<int32_t>(self,     0x10, INT32_MIN);
     void*   const switcher = read_at<void*>  (self,     0x20, nullptr);
-    const float   progress = read_at<float>  (switcher, 0x128, -1.0f);
+    const float   min_sec  = read_at<float>  (switcher, 0x128, -1.0f);
+    const float   bar      = read_at<float>  (switcher, 0x138, -1.0f);
 
-    // Reaching this iterator means the 90% stall is behind us.
-    loading_stall_guard_2313::note_menu_reached();
+    // Pre-call: with -fno-exceptions a managed exception from the stock tail
+    // unwinds straight through this frame, so this line is the last evidence.
+    if (loading_stall_guard_2313::note_menu_enter(state)) {
+        LOGI("23.1.3-swt: LoadMainMenu entering state=%d bar=%.3f minSec=%.3f",
+             state, bar, min_sec);
+    }
 
     const bool result = g_sw_menu_next != nullptr
                             ? g_sw_menu_next(self, method)
                             : false;
 
-    if (need_emit(g_th_sw_menu, self, state, progress, result)) {
-        LOGI("23.1.3-swt: LoadMainMenu state=%d progress=%.3f result=%d",
-             state, progress, result ? 1 : 0);
+    loading_stall_guard_2313::note_menu_exit(state, result);
+
+    if (need_emit(g_th_sw_menu, self, state, bar, result)) {
+        LOGI("23.1.3-swt: LoadMainMenu state=%d bar=%.3f minSec=%.3f result=%d",
+             state, bar, min_sec, result ? 1 : 0);
     }
     return result;
 }
@@ -223,7 +241,7 @@ static void** orig(Fn* p) { return reinterpret_cast<void**>(p); }
 inline bool install_hooks() {
     int installed = 0;
 
-    // Switcher.Start iterator — drives the 0-100% loading progress bar.
+    // Switcher.Start iterator -- drives the 0-100% loading progress bar.
     // Nested class separator is '/' so il2cpp::find_class splits on it.
     if (hook::install(
             {"" , u8"Switcher/\u4e0b\u4e09\u4e0a\u4e1c\u4e13\u4e1a\u4e15\u4e09\u4e0e",
@@ -252,17 +270,22 @@ inline bool install_hooks() {
              "-- the 90%% loading stall will NOT be bypassed");
     }
 
-    // Switcher.LoadMainMenu iterator.
+    // Switcher.LoadMainMenu iterator -- the last coroutine before the menu
+    // scene, and the one that dies if InitializeSwitcher was cut short.
     if (hook::install(
             {"", u8"Switcher/\u4e1d\u4e01\u4e09\u4e1f\u4e10\u4e15\u4e01\u4e0e\u4e0f",
              "MoveNext", 0},
             detail::repl(&detail::hook_sw_menu),
             detail::orig(&detail::g_sw_menu_next), false)) {
         ++installed;
-        LOGI("23.1.3-swt: Switcher.LoadMainMenu heartbeat armed");
+        LOGI("23.1.3-swt: Switcher.LoadMainMenu heartbeat + abort detection "
+             "armed");
+    } else {
+        LOGE("23.1.3-swt: Switcher.LoadMainMenu MoveNext hook failed "
+             "-- a dying menu coroutine will not be reported");
     }
 
-    // AppsMenu.Start iterator — confirms native patch carries through managed.
+    // AppsMenu.Start iterator -- confirms native patch carries through managed.
     if (hook::install(
             {"", u8"AppsMenu/\u4e19\u4e0b\u4e19\u4e07\u4e09\u4e06\u4e11\u4e01\u4e1a",
              "MoveNext", 0},
@@ -274,7 +297,7 @@ inline bool install_hooks() {
 
     LOGI("23.1.3-swt: %d/4 coroutine heartbeats installed "
          "(Switcher.Start + InitializeSwitcher + LoadMainMenu + "
-         "AppsMenu.Start; state/progress logged every 2 s or on change)",
+         "AppsMenu.Start; state/value logged every 2 s or on change)",
          installed);
 
     // Switcher.Start and InitializeSwitcher are the critical pair: the first
