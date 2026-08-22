@@ -11,6 +11,7 @@
 #include "il2cpp.h"
 #include "log.h"
 #include "obb_provisioner.h"
+#include "photon_1610.h"
 #include "version_1610.h"
 
 namespace {
@@ -31,7 +32,7 @@ size_t assembly_count(void* domain) {
 
 void* init_thread(void*) {
     LOGI("init: libopg3d build %s", OPG3D_BUILD_STAMP);
-    LOGI("init: [0/6] experimental 16.1.x bootstrap started");
+    LOGI("init: [0/6] 16.1.1 Photon-online bootstrap started");
 
     uintptr_t base = 0u;
     bool found = false;
@@ -48,7 +49,7 @@ void* init_thread(void*) {
     const bool signature_compat =
         version_1610::install_early_signature_patch(base);
     if (!signature_compat) {
-        LOGE("init: 16.1.x APK re-sign compatibility was not installed; "
+        LOGE("init: 16.1.1 APK re-sign compatibility was not installed; "
              "the startup tamper route may still win");
     }
 
@@ -106,21 +107,24 @@ void* init_thread(void*) {
         if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
         return nullptr;
     }
-    LOGI("init: [6/6] Assembly-CSharp.dll ready; installing minimal 16.1.x hooks");
+    LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 16.1.1 hooks");
 
     const bool auth_bypass = version_1610::install_runtime_hooks();
-    if (signature_compat && auth_bypass) {
-        LOGI("init: 16.1.x experiment ready — re-sign check accepted and "
-             "backend-first routed through the stock offline transition");
+    const bool photon_online = photon_1610::install_hooks();
+    if (signature_compat && auth_bypass && photon_online) {
+        LOGI("init: 16.1.1 online port ready — stock offline transition opens "
+             "the menu, then PUN switches back online and connects through "
+             "the configured Photon Cloud application in EU");
     } else {
-        LOGE("init: 16.1.x experiment incomplete: signature=%d auth=%d",
-             signature_compat ? 1 : 0, auth_bypass ? 1 : 0);
+        LOGE("init: 16.1.1 online port incomplete: signature=%d auth=%d "
+             "photon=%d", signature_compat ? 1 : 0,
+             auth_bypass ? 1 : 0, photon_online ? 1 : 0);
     }
-    LOGW("init: all 14.1.1 Photon/progression/catalog/raw-RVA modules are "
-         "intentionally disabled on this obfuscated build");
+    LOGW("init: progression/catalog/gameplay modules and the offline 'В бой' "
+         "button remain intentionally disabled; this build ports online only");
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
-    LOGI("init: experimental 16.1.x bootstrap finished cleanly");
+    LOGI("init: 16.1.1 Photon-online bootstrap finished cleanly");
     return nullptr;
 }
 
