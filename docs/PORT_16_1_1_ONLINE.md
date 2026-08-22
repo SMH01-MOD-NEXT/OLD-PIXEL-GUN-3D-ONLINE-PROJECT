@@ -29,6 +29,9 @@ The 16.1.1 dump preserves the PUN type layout and signatures but obfuscates the 
 - NGUI click entry → `UIButton.OnClick()/0`
 - stock multiplayer click core → `MainMenuController.OnClickMultiplyerButtonCore(bool)/1`
 - stock `GoMulty()` → `MainMenuController.丏丛一丐世丂丌万丛/0`
+- `NetworkingPeer` → `丛丗丄与丐与三丐丄`
+- peer diagnostics retain readable names: `DebugReturn`, `OnStatusChanged`, `OnOperationResponse`
+- `PhotonNetwork.Disconnect()` → `上丁丈与丘丟丈专丄.丑丑万丂上丅丌世丝/0`
 
 Mappings were established by matching the unchanged class field order, method order, parameter/return signatures and the PUN 1.91 layout against 14.1.1. No guessed raw RVA is used by the online module.
 
@@ -38,8 +41,10 @@ Mappings were established by matching the unchanged class field order, method or
 2. After `SetUpPhoton`, and again immediately before `ConnectUsingSettings`, the stock `ServerSettings.UseCloud(appId, eu)` method is called. Host type, region and stored AppID are then read back and repaired through metadata fields only if the SDK call did not leave the expected values.
 3. The auth-scene fallback still opens the menu through the game's stock offline transition. The recovered `OfflineModController` gate normally disables a list containing leaderboards, social, multiplayer, quests and friends buttons. The port keeps that stock gate for every entry except the `UIButton` whose `gameObject` is exactly `MainMenuController.multiplayerButton`; no global `UIButton` unlock is performed.
 4. The target `UIButton.OnClick` first runs its original EventDelegate list. If the offline-auth lobby did not bind the multiplayer delegate, the bridge invokes the stock `OnClickMultiplyerButtonCore(true)`. If that core returns before `GoMulty`, it invokes the stock `GoMulty` route. Connect-scene and matchmaking logic are not reimplemented.
-5. Immediately before a real PUN connection, `PhotonNetwork.offlineMode` is cleared through its own setter so the stock connect method does not reject online play.
-6. `FriendsController.Update` is forwarded normally until a Photon connection starts. While PUN is connecting or connected, that dead social/backend tick is quarantined so it cannot run the legacy local disconnect path. Photon callbacks, rooms, RPCs, matchmaking and manual disconnects are untouched.
+5. Device traces showed that this prefab emits three target `UIButton.OnClick` calls for one physical tap, starting `GoMulty` three times within 25 ms. A 500 ms target-only debounce now accepts the first dispatch and suppresses the duplicate component callbacks. Other UIButtons are unaffected.
+6. Immediately before a real PUN connection, `PhotonNetwork.offlineMode` is cleared through its own setter so the stock connect method does not reject online play.
+7. `FriendsController.Update` is forwarded normally until a Photon connection starts. While PUN is connecting or connected, that dead social/backend tick is quarantined so it cannot run the legacy local disconnect path.
+8. Passive diagnostic wrappers report the real Photon status codes, operation response code/message, stock disconnect requests and `ConnectionControl` callbacks, then always call the original implementations. Authentication and response results are not fabricated.
 
 ## Build and device validation
 
@@ -52,9 +57,11 @@ adb logcat -s OPG3D
 Expected startup lines:
 
 ```text
-init: libopg3d build 16.1.1 Photon online + click bridge v3 ...
+init: libopg3d build 16.1.1 Photon trace + click debounce v4 ...
 16.1.1-photon: installed 4 hooks (appid=OK connect=OK backend-guard=OK; ...)
+16.1.1-photon-trace: installed 8/8 hooks (status=OK operation=OK disconnect=OK)
 16.1.1-battle-ui: installed 5 hooks (gate=OK setter=OK onclick=OK core=OK go=OK; ...)
+16.1.1-battle-ui: armed 500 ms target-only click debounce
 init: 16.1.1 online port ready ...
 ```
 
@@ -67,18 +74,25 @@ After the main menu appears, the offline gate should emit this line once:
 On pressing **В бой**, the UI bridge should report which stock stage was missing:
 
 ```text
+16.1.1-battle-ui: accepted one physical target click
 16.1.1-battle-ui: target UIButton.OnClick #1
 16.1.1-battle-ui: target EventDelegate did not invoke MainMenuController; dispatching the stock click core
 16.1.1-battle-ui: stock multiplayer click core entered (playSound=1)
 16.1.1-battle-ui: stock GoMulty entered from target click
+16.1.1-battle-ui: target UIButton.OnClick #2 suppressed as a duplicate component dispatch within 500 ms
+16.1.1-battle-ui: target UIButton.OnClick #3 suppressed as a duplicate component dispatch within 500 ms
 ```
 
-A healthy delegate may omit the fallback warning. Once a mode actually starts Photon:
+A healthy delegate may omit the fallback warning. Once a mode actually starts Photon, v4 records the complete SDK path without exposing credentials:
 
 ```text
-16.1.1-photon: PUN offlineMode was set by the auth-scene fallback; clearing it before online connect
-16.1.1-photon[PUN.ConnectUsingSettings]: ... host=1 region=0 ... ready=1
-16.1.1-photon: ConnectUsingSettings returned 1 ...
+16.1.1-photon-status: 1024(Connect) ...
+16.1.1-photon-op: op=... return=...(reason) debug='...' state=...(state-name)
+16.1.1-connection-ui: OnConnectedToMaster ...
+16.1.1-connection-ui: OnFailedToConnect ...
+16.1.1-photon: stock PhotonNetwork.Disconnect requested ...
 ```
+
+The first non-zero `photon-op` return code, failing `photon-status`, or stock disconnect line identifies whether the remaining failure is authentication, region/CCU, transport, room operation, or game-side cancellation.
 
 Then verify master connection, room creation/join, a two-device match, RPC synchronization, match exit, and a second consecutive match. A `PHOTON_APP_ID is empty`, `route verification failed`, or `online port incomplete` line means the build must not be treated as a successful online test.
