@@ -1,15 +1,18 @@
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "cloud_guard.h"
 #include "hook.h"
+#include "il2cpp.h"
 #include "log.h"
 
 // Version-specific compatibility points for the supplied PG3D 14.1.1 ARMv7
@@ -23,8 +26,35 @@ namespace detail {
 
 using MethodInfo = void;
 using ConnectSquadFn = bool (*)(bool siege_squad, const MethodInfo* method);
+using AppendTimerStringFn = void (*)(void* static_context, void* text,
+                                     const MethodInfo* method);
+using MoveNextFn = bool (*)(void* self, const MethodInfo* method);
+using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
+using AsyncFloatFn = float (*)(void* self, const MethodInfo* method);
+using AsyncBoolFn = bool (*)(void* self, const MethodInfo* method);
 
 inline ConnectSquadFn g_connect_squad = nullptr;
+inline AppendTimerStringFn g_append_timer_string = nullptr;
+inline MoveNextFn g_switcher_start = nullptr;
+inline InstanceVoidFn g_main_menu_awake = nullptr;
+inline AsyncFloatFn g_async_progress = nullptr;
+inline AsyncBoolFn g_async_done = nullptr;
+inline AsyncBoolFn g_async_activate = nullptr;
+inline const MethodInfo* g_mi_async_progress = nullptr;
+inline const MethodInfo* g_mi_async_done = nullptr;
+inline const MethodInfo* g_mi_async_activate = nullptr;
+inline void* g_switcher_iterator_pc = nullptr;
+inline void* g_switcher_iterator_self = nullptr;
+inline void* g_switcher_progress = nullptr;
+inline void* g_switcher_old_progress = nullptr;
+inline void* g_switcher_next_scene = nullptr;
+inline void* g_switcher_load_task = nullptr;
+inline std::atomic<uint32_t> g_loader_steps{0u};
+inline std::atomic<bool> g_main_menu_reached{false};
+inline void* g_last_switcher_iterator = nullptr;
+inline int32_t g_last_switcher_pc = INT32_MIN;
+inline float g_last_switcher_progress = -1000.0f;
+inline uint64_t g_last_switcher_log_ms = 0u;
 
 // AppsMenu.<Start>c__Iterator1.MoveNext(), 14.1.1:
 //   0xA9A980  cmp r0, #0
@@ -70,8 +100,186 @@ void* replacement(ConnectSquadFn fn) {
     return reinterpret_cast<void*>(fn);
 }
 
+template <typename Fn>
+void* trace_replacement(Fn fn) {
+    return reinterpret_cast<void*>(fn);
+}
+
 void** original_slot(ConnectSquadFn* fn) {
     return reinterpret_cast<void**>(fn);
+}
+
+template <typename Fn>
+void** trace_original_slot(Fn* fn) {
+    return reinterpret_cast<void**>(fn);
+}
+
+template <typename T>
+T read_field(void* object, void* field, T fallback) {
+    if (object == nullptr || field == nullptr ||
+        il2cpp::field_get_value == nullptr) {
+        return fallback;
+    }
+    alignas(8) uint8_t scratch[16] = {0};
+    il2cpp::field_get_value(object, field, scratch);
+    T value = fallback;
+    std::memcpy(&value, scratch, sizeof(T));
+    return value;
+}
+
+std::string read_string_field(void* object, void* field) {
+    return il2cpp::to_utf8(read_field<void*>(object, field, nullptr), 160);
+}
+
+void read_async_state(void* operation, float* progress, int* done,
+                      int* activate) {
+    *progress = -1.0f;
+    *done = -1;
+    *activate = -1;
+    if (operation == nullptr) return;
+    if (g_async_progress != nullptr && g_mi_async_progress != nullptr) {
+        *progress = g_async_progress(operation, g_mi_async_progress);
+    }
+    if (g_async_done != nullptr && g_mi_async_done != nullptr) {
+        *done = g_async_done(operation, g_mi_async_done) ? 1 : 0;
+    }
+    if (g_async_activate != nullptr && g_mi_async_activate != nullptr) {
+        *activate = g_async_activate(operation, g_mi_async_activate) ? 1 : 0;
+    }
+}
+
+void hook_append_timer_string(void* static_context, void* text,
+                              const MethodInfo* method) {
+    if (!g_main_menu_reached.load(std::memory_order_acquire)) {
+        const uint32_t step =
+            g_loader_steps.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const std::string value = il2cpp::to_utf8(text, 384);
+        LOGI("startup-trace: loader-step#%" PRIu32 " '%s'",
+             step, value.c_str());
+    }
+    if (g_append_timer_string != nullptr) {
+        g_append_timer_string(static_context, text, method);
+    }
+}
+
+bool hook_switcher_start(void* self, const MethodInfo* method) {
+    const int32_t pc = read_field<int32_t>(
+        self, g_switcher_iterator_pc, INT32_MIN);
+    void* switcher = read_field<void*>(
+        self, g_switcher_iterator_self, nullptr);
+    const float progress = read_field<float>(
+        switcher, g_switcher_progress, -1.0f);
+    const float old_progress = read_field<float>(
+        switcher, g_switcher_old_progress, -1.0f);
+    void* operation = read_field<void*>(
+        switcher, g_switcher_load_task, nullptr);
+    const uint64_t now = opg3d_log::monotonic_ms();
+    const float delta = progress > g_last_switcher_progress
+                            ? progress - g_last_switcher_progress
+                            : g_last_switcher_progress - progress;
+    const bool emit = g_last_switcher_iterator != self ||
+                      g_last_switcher_pc != pc || delta >= 0.005f ||
+                      g_last_switcher_log_ms == 0u ||
+                      now < g_last_switcher_log_ms ||
+                      now - g_last_switcher_log_ms >= 2000u;
+    if (emit) {
+        g_last_switcher_iterator = self;
+        g_last_switcher_pc = pc;
+        g_last_switcher_progress = progress;
+        g_last_switcher_log_ms = now;
+        float operation_progress;
+        int done;
+        int activate;
+        read_async_state(operation, &operation_progress, &done, &activate);
+        LOGI("startup-trace: Switcher.Start ENTER pc=%d progress=%.3f "
+             "old=%.3f next='%s' op=%p opProgress=%.3f done=%d activate=%d",
+             pc, progress, old_progress,
+             read_string_field(switcher, g_switcher_next_scene).c_str(),
+             operation, operation_progress, done, activate);
+    }
+
+    if (g_switcher_start == nullptr) return false;
+    const bool result = g_switcher_start(self, method);
+    if (emit || !result) {
+        switcher = read_field<void*>(self, g_switcher_iterator_self, nullptr);
+        LOGI("startup-trace: Switcher.Start RETURN result=%d pc=%d "
+             "progress=%.3f next='%s'",
+             result ? 1 : 0,
+             read_field<int32_t>(self, g_switcher_iterator_pc, INT32_MIN),
+             read_field<float>(switcher, g_switcher_progress, -1.0f),
+             read_string_field(switcher, g_switcher_next_scene).c_str());
+    }
+    return result;
+}
+
+void hook_main_menu_awake(void* self, const MethodInfo* method) {
+    LOGI("startup-trace: MainMenuController.Awake ENTER self=%p", self);
+    if (g_main_menu_awake != nullptr) g_main_menu_awake(self, method);
+    g_main_menu_reached.store(true, std::memory_order_release);
+    LOGI("startup-trace: MAIN MENU REACHED — MainMenuController.Awake returned");
+}
+
+bool resolve_trace_field(const char* klass, const char* name, void** out) {
+    *out = il2cpp::find_field("", klass, name);
+    if (*out != nullptr) return true;
+    LOGE("startup-trace: cannot resolve field %s.%s", klass, name);
+    return false;
+}
+
+bool resolve_async_getter(const char* name, void** out,
+                          const MethodInfo** method_out) {
+    void* method = il2cpp::find_method_info(
+        "UnityEngine", "AsyncOperation", name, 0);
+    *out = il2cpp::method_pointer(method);
+    *method_out = method;
+    if (*out != nullptr && method != nullptr) return true;
+    LOGE("startup-trace: cannot resolve AsyncOperation.%s", name);
+    return false;
+}
+
+bool install_startup_trace() {
+    const char* iterator = "Switcher.<Start>c__Iterator0";
+    bool resolved = true;
+    resolved &= resolve_trace_field(iterator, "$PC", &g_switcher_iterator_pc);
+    resolved &= resolve_trace_field(iterator, "$this", &g_switcher_iterator_self);
+    resolved &= resolve_trace_field("Switcher", "_progress", &g_switcher_progress);
+    resolved &= resolve_trace_field("Switcher", "oldProgress", &g_switcher_old_progress);
+    resolved &= resolve_trace_field("Switcher", "nameNextScene", &g_switcher_next_scene);
+    resolved &= resolve_trace_field("Switcher", "loadLevelTask", &g_switcher_load_task);
+    resolved &= resolve_async_getter(
+        "get_progress", reinterpret_cast<void**>(&g_async_progress),
+        &g_mi_async_progress);
+    resolved &= resolve_async_getter(
+        "get_isDone", reinterpret_cast<void**>(&g_async_done),
+        &g_mi_async_done);
+    resolved &= resolve_async_getter(
+        "get_allowSceneActivation", reinterpret_cast<void**>(&g_async_activate),
+        &g_mi_async_activate);
+    if (!resolved) {
+        LOGE("startup-trace: metadata/getter resolution incomplete");
+        return false;
+    }
+
+    int installed = 0;
+    if (hook::install({"", "AppsMenu", "AppendTimerString", 1},
+                      trace_replacement(&hook_append_timer_string),
+                      trace_original_slot(&g_append_timer_string), false)) {
+        ++installed;
+    }
+    if (hook::install({"", iterator, "MoveNext", 0},
+                      trace_replacement(&hook_switcher_start),
+                      trace_original_slot(&g_switcher_start), false)) {
+        ++installed;
+    }
+    if (hook::install({"", "MainMenuController", "Awake", 0},
+                      trace_replacement(&hook_main_menu_awake),
+                      trace_original_slot(&g_main_menu_awake), false)) {
+        ++installed;
+    }
+    LOGI("startup-trace: installed %d/3 read-only hooks "
+         "(named milestones + Switcher heartbeat every 2s + menu boundary)",
+         installed);
+    return installed == 3;
 }
 
 bool hook_connect_squad(bool siege_squad, const MethodInfo* method) {
@@ -140,6 +348,13 @@ inline bool install_runtime_hooks() {
         return false;
     }
     LOGI("14.1.1: squad Photon cloud-route hook armed (siege flag preserved)");
+
+    // Diagnostics are deliberately non-blocking: failure to observe loading
+    // must not disable the already working online/progression compatibility.
+    if (!detail::install_startup_trace()) {
+        LOGE("startup-trace: incomplete; gameplay remains enabled but the "
+             "next 90%% stall may not be attributable");
+    }
     return true;
 }
 
