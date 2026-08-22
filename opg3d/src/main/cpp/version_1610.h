@@ -13,37 +13,26 @@
 #include "il2cpp.h"
 #include "log.h"
 
-// Experimental compatibility layer for the supplied 16.1.x ARMv7 binary:
+// Version guard and passive diagnostics for the supplied 16.1.x ARMv7 binary:
 //   libil2cpp.so SHA-256
 //   2aab620cb58a597e86975a78ab20987e71685b507456707ed42fa63fad54032b
 //
-// 16.1.x is partially obfuscated and enters AuthorizationScene before the
-// lobby. The retired HTTP/WebSocket backend therefore blocks menu entry. This
-// module deliberately does only two things:
-//   1) accepts the current APK certificate at the verified AppsMenu branch;
-//   2) enables and invokes the game's own offline transition after auth-scene
-//      initialization, rather than fabricating authorization responses.
-// Every 14.1.1 gameplay/Photon hook remains disabled until independently
-// remapped against this binary.
+// Authentication behavior lives in backend_local_1610.h. This module only
+// accepts the current APK certificate at the verified AppsMenu branch and
+// records lifecycle/auth-state diagnostics. It does not choose an offline or
+// online route and does not fabricate backend responses.
 namespace version_1610 {
 namespace detail {
 
 using MethodInfo = void;
 using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
-using StaticBoolFn = bool (*)(void* static_context, const MethodInfo* method);
 using StaticStateSetterFn = void (*)(void* static_context, int32_t state,
                                      const MethodInfo* method);
 
 inline InstanceVoidFn g_apps_menu_awake = nullptr;
 inline InstanceVoidFn g_auth_awake = nullptr;
-inline InstanceVoidFn g_auth_start = nullptr;
 inline InstanceVoidFn g_main_menu_awake = nullptr;
-inline InstanceVoidFn g_go_offline = nullptr;
-inline const MethodInfo* g_mi_go_offline = nullptr;
-inline StaticBoolFn g_offline_available = nullptr;
 inline StaticStateSetterFn g_set_auth_state = nullptr;
-inline void* g_auth_interface_field = nullptr;
-inline void* g_last_auto_offline_controller = nullptr;
 inline std::atomic<bool> g_main_menu_reached{false};
 
 // AppsMenu.<Start>.MoveNext(), supplied 16.1.x binary:
@@ -96,19 +85,6 @@ void** original_slot(Fn* fn) {
     return reinterpret_cast<void**>(fn);
 }
 
-template <typename T>
-T read_field(void* object, void* field, T fallback) {
-    if (object == nullptr || field == nullptr ||
-        il2cpp::field_get_value == nullptr) {
-        return fallback;
-    }
-    alignas(8) uint8_t scratch[16] = {0};
-    il2cpp::field_get_value(object, field, scratch);
-    T value = fallback;
-    std::memcpy(&value, scratch, sizeof(T));
-    return value;
-}
-
 const char* state_name(int32_t state) {
     switch (state) {
         case -1: return "None";
@@ -132,37 +108,16 @@ const char* state_name(int32_t state) {
     }
 }
 
-bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
-                  const MethodInfo** out_mi) {
-    void* info = il2cpp::find_method_info(target.namespaze, target.klass,
-                                          target.method, target.args_count);
-    void* pointer = il2cpp::method_pointer(info);
-    if (info == nullptr || pointer == nullptr) {
-        LOGE("16.1.x: cannot resolve %s.%s/%d", target.klass, target.method,
-             target.args_count);
-        return false;
-    }
-    *out_fn = pointer;
-    *out_mi = info;
-    return true;
-}
-
 void hook_apps_menu_awake(void* self, const MethodInfo* method) {
     LOGI("16.1.x-trace: AppsMenu.Awake ENTER self=%p", self);
     if (g_apps_menu_awake != nullptr) g_apps_menu_awake(self, method);
     LOGI("16.1.x-trace: AppsMenu.Awake RETURN");
 }
 
-bool hook_offline_available(void* static_context, const MethodInfo* method) {
-    (void)static_context;
-    (void)method;
-    LOGI("16.1.x-auth: stock offline route reported available");
-    return true;
-}
-
 void hook_set_auth_state(void* static_context, int32_t state,
                          const MethodInfo* method) {
-    LOGI("16.1.x-auth: state -> %d (%s)", state, state_name(state));
+    LOGI("16.1.x-auth: direct state setter -> %d (%s)", state,
+         state_name(state));
     if (g_set_auth_state != nullptr) {
         g_set_auth_state(static_context, state, method);
     }
@@ -171,30 +126,8 @@ void hook_set_auth_state(void* static_context, int32_t state,
 void hook_auth_awake(void* self, const MethodInfo* method) {
     LOGI("16.1.x-auth: AuthSceneController.Awake ENTER self=%p", self);
     if (g_auth_awake != nullptr) g_auth_awake(self, method);
-    LOGI("16.1.x-auth: AuthSceneController.Awake RETURN; offline callback "
-         "should now be registered");
-}
-
-void hook_auth_start(void* self, const MethodInfo* method) {
-    LOGI("16.1.x-auth: AuthSceneController.Start ENTER self=%p", self);
-    if (g_auth_start != nullptr) g_auth_start(self, method);
-    LOGI("16.1.x-auth: AuthSceneController.Start RETURN");
-
-    if (self == nullptr || self == g_last_auto_offline_controller) return;
-    void* auth_interface = read_field<void*>(self, g_auth_interface_field, nullptr);
-    if (auth_interface == nullptr || g_go_offline == nullptr ||
-        g_mi_go_offline == nullptr) {
-        LOGE("16.1.x-auth: cannot invoke stock offline route: interface=%p "
-             "method=%p info=%p", auth_interface,
-             reinterpret_cast<void*>(g_go_offline), g_mi_go_offline);
-        return;
-    }
-
-    g_last_auto_offline_controller = self;
-    LOGW("16.1.x-auth: dead backend bypass — invoking stock "
-         "AuthInterfaceController.OnGoOfflineClick after scene init");
-    g_go_offline(auth_interface, g_mi_go_offline);
-    LOGI("16.1.x-auth: stock offline callback returned");
+    LOGI("16.1.x-auth: AuthSceneController.Awake RETURN; local serializers "
+         "and auth listeners initialized by stock code");
 }
 
 void hook_main_menu_awake(void* self, const MethodInfo* method) {
@@ -244,58 +177,37 @@ inline bool install_early_signature_patch(uintptr_t il2cpp_base) {
 }
 
 inline bool install_runtime_hooks() {
-    detail::g_auth_interface_field =
-        il2cpp::find_field("", "AuthSceneController", "_authInterface");
-    if (detail::g_auth_interface_field == nullptr) {
-        LOGE("16.1.x-auth: AuthSceneController._authInterface not found");
-        return false;
-    }
-
-    if (!detail::resolve_call(
-            {"", "AuthInterfaceController", "OnGoOfflineClick", 0},
-            reinterpret_cast<void**>(&detail::g_go_offline),
-            &detail::g_mi_go_offline)) {
-        return false;
-    }
-
-    const bool offline_available = hook::install(
-        {"", "OfflineModController", u8"不丄且且上不丅丌专", 0},
-        detail::replacement(&detail::hook_offline_available),
-        detail::original_slot(&detail::g_offline_available), true);
     const bool auth_awake = hook::install(
         {"", "AuthSceneController", "Awake", 0},
         detail::replacement(&detail::hook_auth_awake),
         detail::original_slot(&detail::g_auth_awake), true);
-    const bool auth_start = hook::install(
-        {"", "AuthSceneController", "Start", 0},
-        detail::replacement(&detail::hook_auth_start),
-        detail::original_slot(&detail::g_auth_start), true);
-    if (!offline_available || !auth_awake || !auth_start) {
-        LOGE("16.1.x-auth: core stock-offline bypass hooks incomplete");
+    if (!auth_awake) {
+        LOGE("16.1.x-trace: AuthSceneController.Awake trace unavailable");
         return false;
     }
 
-    if (!hook::install(
+    int optional = 0;
+    if (hook::install(
             {"", "AuthSceneController", u8"丄东丟丘一丕万丒丑", 1},
             detail::replacement(&detail::hook_set_auth_state),
             detail::original_slot(&detail::g_set_auth_state), false)) {
-        LOGW("16.1.x-trace: auth state transitions unavailable");
+        ++optional;
     }
-    if (!hook::install(
+    if (hook::install(
             {"", "AppsMenu", "Awake", 0},
             detail::replacement(&detail::hook_apps_menu_awake),
             detail::original_slot(&detail::g_apps_menu_awake), false)) {
-        LOGW("16.1.x-trace: AppsMenu.Awake trace unavailable");
+        ++optional;
     }
-    if (!hook::install(
+    if (hook::install(
             {"", "MainMenuController", "Awake", 0},
             detail::replacement(&detail::hook_main_menu_awake),
             detail::original_slot(&detail::g_main_menu_awake), false)) {
-        LOGW("16.1.x-trace: MainMenuController.Awake trace unavailable");
+        ++optional;
     }
 
-    LOGI("16.1.x-auth: experimental backend-first bypass armed via stock "
-         "offline callback; no fabricated backend payloads");
+    LOGI("16.1.x-trace: version diagnostics armed (auth-awake=OK, optional=%d/3)",
+         optional);
     return true;
 }
 
