@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "battle_ui_1610.h"
 #include "config.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
@@ -111,17 +112,17 @@ void* init_thread(void*) {
 
     const bool auth_bypass = version_1610::install_runtime_hooks();
     const bool photon_online = photon_1610::install_hooks();
-    if (signature_compat && auth_bypass && photon_online) {
+    const bool battle_ui = battle_ui_1610::install_hooks();
+    if (signature_compat && auth_bypass && photon_online && battle_ui) {
         LOGI("init: 16.1.1 online port ready — stock offline transition opens "
-             "the menu, then PUN switches back online and connects through "
-             "the configured Photon Cloud application in EU");
+             "the menu, the 'В бой' UIButton remains interactive, then PUN "
+             "switches online through the configured Photon Cloud app in EU");
     } else {
         LOGE("init: 16.1.1 online port incomplete: signature=%d auth=%d "
-             "photon=%d", signature_compat ? 1 : 0,
-             auth_bypass ? 1 : 0, photon_online ? 1 : 0);
+             "photon=%d battle-ui=%d", signature_compat ? 1 : 0,
+             auth_bypass ? 1 : 0, photon_online ? 1 : 0,
+             battle_ui ? 1 : 0);
     }
-    LOGW("init: progression/catalog/gameplay modules and the offline 'В бой' "
-         "button remain intentionally disabled; this build ports online only");
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
     LOGI("init: 16.1.1 Photon-online bootstrap finished cleanly");
