@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "23.1.3 ARM64 Photon Cloud port v2"
+#define OPG3D_BUILD_TAG "23.1.3 ARM64 lobby gate v3"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__

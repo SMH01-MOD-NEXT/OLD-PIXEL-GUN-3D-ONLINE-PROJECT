@@ -33,17 +33,38 @@ inline StaticStateSetterFn g_set_auth_state = nullptr;
 inline std::atomic<bool> g_training_reached{false};
 inline std::atomic<bool> g_main_menu_reached{false};
 
-// AppsMenu.<Start>d__.MoveNext(), supplied 23.1.3 AArch64 binary:
+// AppsMenu.<Start>d__.MoveNext(), supplied 23.1.3 AArch64 binary, has
+// two consecutive String.Compare equality gates before it starts the scene
+// transition coroutine:
+//
 //   0x04372974  bl  String.Compare
-//   0x04372978  cbz w0, 0x04372B04  ; package signature accepted
-// The mismatch path logs and diverts startup. Replace only that verified CBZ
-// with an unconditional B to the same accepted target. This is an A64 encoding
-// derived from the supplied ELF; no 16.1.0 ARM32 opcode is reused.
-inline constexpr uintptr_t kSignatureDecisionRva = 0x04372978u;
-inline constexpr uintptr_t kSignatureAcceptedTargetRva = 0x04372B04u;
-inline constexpr uint32_t kExpectedCompareCall = 0x9404EA68u;
-inline constexpr uint32_t kExpectedDecision = 0x34000C60u;
-inline constexpr uint32_t kAcceptedDecision = 0x14000063u;
+//   0x04372978  cbz w0, 0x04372B04  ; first startup value accepted
+//   ...
+//   0x04372B9C  bl  String.Compare
+//   0x04372BA0  cbz w0, 0x04372C68  ; second startup value accepted
+//
+// The previous patch accepted only the first comparison. Execution then still
+// reached the second mismatch path, which is the last gate before the stock
+// coroutine advances past the 90% loading screen. Validate and accept both
+// exact branches. Every opcode comes from the supplied ELF; no old ARM32 RVA or
+// instruction is reused.
+struct AcceptanceBranch {
+    const char* label;
+    uintptr_t decision_rva;
+    uintptr_t accepted_target_rva;
+    uint32_t expected_compare_call;
+    uint32_t expected_decision;
+    uint32_t accepted_decision;
+};
+
+inline constexpr AcceptanceBranch kFirstAppsMenuGate {
+    "first", 0x04372978u, 0x04372B04u,
+    0x9404EA68u, 0x34000C60u, 0x14000063u
+};
+inline constexpr AcceptanceBranch kSecondAppsMenuGate {
+    "second", 0x04372BA0u, 0x04372C68u,
+    0x9404E9DEu, 0x34000640u, 0x14000032u
+};
 
 bool patch_word(uintptr_t address, uint32_t replacement) {
     const long page_size_raw = sysconf(_SC_PAGESIZE);
@@ -55,7 +76,7 @@ bool patch_word(uintptr_t address, uint32_t replacement) {
     const uintptr_t page = address & ~(page_size - 1u);
     if (mprotect(reinterpret_cast<void*>(page), page_size,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("23.1.3: mprotect RWX failed for signature decision: %s",
+        LOGE("23.1.3: mprotect RWX failed for AppsMenu decision: %s",
              std::strerror(errno));
         return false;
     }
@@ -68,7 +89,7 @@ bool patch_word(uintptr_t address, uint32_t replacement) {
 
     if (mprotect(reinterpret_cast<void*>(page), page_size,
                  PROT_READ | PROT_EXEC) != 0) {
-        LOGW("23.1.3: could not restore RX after signature patch: %s",
+        LOGW("23.1.3: could not restore RX after AppsMenu patch: %s",
              std::strerror(errno));
     }
     return written;
@@ -157,40 +178,67 @@ inline bool install_early_signature_patch(uintptr_t il2cpp_base) {
                   "PG3D 23.1.3 target must be arm64-v8a");
 #endif
     if (il2cpp_base == 0u) {
-        LOGE("23.1.3: no libil2cpp base for signature compatibility patch");
+        LOGE("23.1.3: no libil2cpp base for AppsMenu compatibility patch");
         return false;
     }
 
-    const uintptr_t decision = il2cpp_base + detail::kSignatureDecisionRva;
-    const uint32_t previous =
-        *reinterpret_cast<const volatile uint32_t*>(decision - 4u);
-    const uint32_t current =
-        *reinterpret_cast<const volatile uint32_t*>(decision);
-    if (previous != detail::kExpectedCompareCall) {
-        LOGE("23.1.3: signature patch refused: preceding A64 opcode at RVA "
-             "0x%08" PRIxPTR " is 0x%08" PRIx32,
-             detail::kSignatureDecisionRva - 4u, previous);
-        return false;
-    }
-    if (current == detail::kAcceptedDecision) {
-        LOGI("23.1.3: APK signature decision already patched");
+    const auto validate = [il2cpp_base](const detail::AcceptanceBranch& gate) {
+        const uintptr_t decision = il2cpp_base + gate.decision_rva;
+        const uint32_t previous =
+            *reinterpret_cast<const volatile uint32_t*>(decision - 4u);
+        const uint32_t current =
+            *reinterpret_cast<const volatile uint32_t*>(decision);
+        if (previous != gate.expected_compare_call) {
+            LOGE("23.1.3: %s AppsMenu gate refused: preceding A64 opcode "
+                 "at RVA 0x%08" PRIxPTR " is 0x%08" PRIx32,
+                 gate.label, gate.decision_rva - 4u, previous);
+            return false;
+        }
+        if (current != gate.expected_decision &&
+            current != gate.accepted_decision) {
+            LOGE("23.1.3: %s AppsMenu gate refused: A64 opcode at RVA "
+                 "0x%08" PRIxPTR " is 0x%08" PRIx32
+                 " (expected 0x%08" PRIx32 " or patched 0x%08" PRIx32 ")",
+                 gate.label, gate.decision_rva, current,
+                 gate.expected_decision, gate.accepted_decision);
+            return false;
+        }
         return true;
-    }
-    if (current != detail::kExpectedDecision) {
-        LOGE("23.1.3: signature patch refused: A64 opcode at RVA 0x%08" PRIxPTR
-             " is 0x%08" PRIx32 " (expected 0x%08" PRIx32 ")",
-             detail::kSignatureDecisionRva, current,
-             detail::kExpectedDecision);
+    };
+
+    // Validate the complete pair before changing either instruction. A partial
+    // match means this is not the supplied 23.1.3 binary and must stay stock.
+    if (!validate(detail::kFirstAppsMenuGate) ||
+        !validate(detail::kSecondAppsMenuGate)) {
         return false;
     }
-    if (!detail::patch_word(decision, detail::kAcceptedDecision)) {
-        LOGE("23.1.3: signature acceptance branch was not written");
-        return false;
+
+    const auto apply = [il2cpp_base](const detail::AcceptanceBranch& gate) {
+        const uintptr_t decision = il2cpp_base + gate.decision_rva;
+        const uint32_t current =
+            *reinterpret_cast<const volatile uint32_t*>(decision);
+        if (current == gate.accepted_decision) {
+            LOGI("23.1.3: %s AppsMenu acceptance gate already patched",
+                 gate.label);
+            return true;
+        }
+        if (!detail::patch_word(decision, gate.accepted_decision)) {
+            LOGE("23.1.3: %s AppsMenu acceptance branch was not written",
+                 gate.label);
+            return false;
+        }
+        LOGI("23.1.3: %s AppsMenu acceptance active (A64 RVA 0x%08" PRIxPTR
+             " -> 0x%08" PRIxPTR ")", gate.label, gate.decision_rva,
+             gate.accepted_target_rva);
+        return true;
+    };
+
+    const bool first = apply(detail::kFirstAppsMenuGate);
+    const bool second = apply(detail::kSecondAppsMenuGate);
+    if (first && second) {
+        LOGI("23.1.3: AppsMenu startup compatibility active (2/2 gates)");
     }
-    LOGI("23.1.3: APK re-sign compatibility active (A64 RVA 0x%08" PRIxPTR
-         " -> 0x%08" PRIxPTR ")", detail::kSignatureDecisionRva,
-         detail::kSignatureAcceptedTargetRva);
-    return true;
+    return first && second;
 }
 
 inline bool install_runtime_hooks() {
