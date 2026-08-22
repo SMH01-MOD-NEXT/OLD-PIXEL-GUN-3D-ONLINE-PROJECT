@@ -6,21 +6,13 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#include "backend_local_1610.h"
-#include "battle_ui_1610.h"
-#include "battle_click_debounce_1610.h"
+#include "backend_local_2313.h"
 #include "config.h"
-#include "crafting_1610.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
-#include "lobby_catalog_1610.h"
 #include "log.h"
 #include "obb_provisioner.h"
-#include "photon_1610.h"
-#include "photon_default_plugin_1610.h"
-#include "photon_trace_1610.h"
-#include "progression_1610.h"
-#include "version_1610.h"
+#include "version_2313.h"
 
 namespace {
 
@@ -40,7 +32,7 @@ size_t assembly_count(void* domain) {
 
 void* init_thread(void*) {
     LOGI("init: libopg3d build %s", OPG3D_BUILD_STAMP);
-    LOGI("init: [0/6] 16.1.0 local-backend + Photon + progression + crafts bootstrap started");
+    LOGI("init: [0/6] 23.1.3 ARM64 local-backend bootstrap started");
 
     uintptr_t base = 0u;
     bool found = false;
@@ -55,10 +47,10 @@ void* init_thread(void*) {
     LOGI("init: [1/6] %s found, base=0x%" PRIxPTR, kIl2Cpp, base);
 
     const bool signature_compat =
-        version_1610::install_early_signature_patch(base);
+        version_2313::install_early_signature_patch(base);
     if (!signature_compat) {
-        LOGE("init: 16.1.0 APK re-sign compatibility was not installed; "
-             "the startup tamper route may still win");
+        LOGE("init: exact 23.1.3 APK re-sign compatibility was not installed; "
+             "startup remains fail-closed");
     }
 
     bool resolved = false;
@@ -115,40 +107,21 @@ void* init_thread(void*) {
         if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
         return nullptr;
     }
-    LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 16.1.0 hooks");
+    LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 23.1.3 hooks");
 
-    const bool version_traces = version_1610::install_runtime_hooks();
-    const bool local_backend = backend_local_1610::install_hooks();
-    const bool photon_online = photon_1610::install_hooks();
-    const bool default_plugin =
-        photon_default_plugin_1610::install_hooks();
-    const bool photon_trace = photon_trace_1610::install_hooks();
-    const bool battle_ui = battle_ui_1610::install_hooks();
-    const bool progression = progression_1610::install_hooks();
-    const bool crafting = crafting_1610::install_hooks();
-    const bool lobby_catalog = lobby_catalog_1610::install_hooks();
-    const bool click_debounce = battle_ui &&
-        battle_click_debounce_1610::install();
-    if (signature_compat && version_traces && local_backend && photon_online &&
-        default_plugin && photon_trace && battle_ui && progression && crafting &&
-        lobby_catalog && click_debounce) {
-        LOGI("init: 16.1.0 online + local progression/crafting port ready — "
-             "upgrades use local monotonic UTC, detail/clan recipes are local, "
-             "and lobby ownership uses stock save paths");
+    const bool version_traces = version_2313::install_runtime_hooks();
+    const bool local_backend = backend_local_2313::install_hooks();
+    if (signature_compat && version_traces && local_backend) {
+        LOGI("init: 23.1.3 ARM64 bootstrap armed — stock AppsMenu signature "
+             "success path + mapped Auth completion coroutine");
     } else {
-        LOGE("init: 16.1.0 port incomplete: signature=%d traces=%d "
-             "local-backend=%d photon=%d plugin=%d trace=%d battle-ui=%d "
-             "progression=%d crafting=%d lobby=%d debounce=%d",
-             signature_compat ? 1 : 0, version_traces ? 1 : 0,
-             local_backend ? 1 : 0, photon_online ? 1 : 0,
-             default_plugin ? 1 : 0, photon_trace ? 1 : 0,
-             battle_ui ? 1 : 0, progression ? 1 : 0,
-             crafting ? 1 : 0, lobby_catalog ? 1 : 0,
-             click_debounce ? 1 : 0);
+        LOGE("init: 23.1.3 bootstrap incomplete: signature=%d traces=%d "
+             "local-backend=%d", signature_compat ? 1 : 0,
+             version_traces ? 1 : 0, local_backend ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
-    LOGI("init: 16.1.0 bootstrap finished cleanly");
+    LOGI("init: 23.1.3 bootstrap initialization finished cleanly");
     return nullptr;
 }
 
