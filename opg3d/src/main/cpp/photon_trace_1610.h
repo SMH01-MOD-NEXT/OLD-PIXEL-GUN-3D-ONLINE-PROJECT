@@ -113,6 +113,7 @@ const char* return_name(int32_t value) {
     switch (value) {
         case 0: return "Ok";
         case 32753: return "AuthenticationTicketExpired";
+        case 32751: return "PluginMismatch";
         case 32756: return "InvalidRegion";
         case 32757: return "MaxCcuReached";
         case 32760: return "GameDoesNotExist";
