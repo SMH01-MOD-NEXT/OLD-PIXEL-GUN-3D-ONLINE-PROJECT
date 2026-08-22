@@ -12,7 +12,9 @@ ARM64 build. It is deliberately limited to online transport and compatibility:
   connecting or connected;
 - removal of the legacy custom room-plugin request so a normal Photon Cloud
   application can create rooms with the Default plugin;
-- passive status, operation-response and room callback diagnostics.
+- passive status, operation-response and room callback diagnostics;
+- suppression of the obsolete 25.x update prompt and false retired-backend
+  no-internet modal before Photon startup.
 
 Matchmaking, room creation/join, RPC dispatch and disconnect behavior remain
 stock PUN. This change does not yet port 16.1.0 progression, crafting, lobby
@@ -65,6 +67,19 @@ The fixed bootstrap validates the exact A64 instructions used by
 to be published by `il2cpp_init`. It never calls the unsafe lazy path and does
 not rely on an arbitrary sleep.
 
+## Frozen-client startup guards
+
+The live service now advertises 25.x to the frozen 23.1.3 client, producing a
+mandatory update overlay, while the retired backend causes
+`ConnectionLostChecker` to show a false no-internet modal. Both overlays leave
+the loading screen visually stuck at 90% before Auth/Photon starts.
+
+`startup_guards_2313.h` keeps the stock AppsMenu coroutine but disables the
+live `UpdatesChecker.Start` request, global version-block predicates, all three
+update-banner presentation paths, the retired `ConnectionLostChecker.Update`
+poll, and the exact `InfoWindowController` no-internet panel setter. Other
+information windows and real Photon errors remain untouched.
+
 ## ARM64 ABI change
 
 The old ARM32 generated static methods carried an unused leading static-context
@@ -102,14 +117,17 @@ adb logcat | grep -E "23.1.3|photon|Photon|OnConnectedToMaster|OnCreatedRoom|OnJ
 Expected sequence:
 
 1. `IL2CPP root domain published` appears; there is no crash at `0x1299108`.
-2. All three Photon modules report successful hook installation.
-3. `mapped Switcher AppID selector -> configured credential`.
-4. Cloud route verification reports `host=1 region=0 ... ready=1`.
-5. `ConnectUsingSettings returned 1`.
-6. State/status reaches `ConnectedToMaster` (`16`).
-7. Room creation logs `OnCreatedRoom`, without return code `32751`.
-8. Room join logs `OnJoinedRoom` and state `Joined` (`9`).
-9. A second client using the same AppID/version can discover or join the room.
+2. Startup compatibility reports `installed 8/8 guards`; neither the update
+   nor no-internet modal appears and loading advances past 90%.
+3. All three Photon modules report successful hook installation.
+4. `AuthSceneController.Awake` and the mapped local completion path appear.
+5. `mapped Switcher AppID selector -> configured credential`.
+6. Cloud route verification reports `host=1 region=0 ... ready=1`.
+7. `ConnectUsingSettings returned 1`.
+8. State/status reaches `ConnectedToMaster` (`16`).
+9. Room creation logs `OnCreatedRoom`, without return code `32751`.
+10. Room join logs `OnJoinedRoom` and state `Joined` (`9`).
+11. A second client using the same AppID/version can discover or join the room.
 
 If installation fails, an operation response is nonzero, or the game requests
 a disconnect, preserve the lines immediately before and after that event. The

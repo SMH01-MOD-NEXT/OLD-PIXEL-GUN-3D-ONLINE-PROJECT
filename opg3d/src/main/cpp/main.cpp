@@ -16,6 +16,7 @@
 #include "photon_2313.h"
 #include "photon_default_plugin_2313.h"
 #include "photon_trace_2313.h"
+#include "startup_guards_2313.h"
 #include "version_2313.h"
 
 namespace {
@@ -113,20 +114,22 @@ void* init_thread(void*) {
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 23.1.3 hooks");
 
     const bool version_traces = version_2313::install_runtime_hooks();
+    const bool startup_guards = startup_guards_2313::install_hooks();
     const bool local_backend = backend_local_2313::install_hooks();
     const bool photon_online = photon_2313::install_hooks();
     const bool default_plugin =
         photon_default_plugin_2313::install_hooks();
     const bool photon_trace = photon_trace_2313::install_hooks();
-    if (signature_compat && version_traces && local_backend && photon_online &&
-        default_plugin && photon_trace) {
+    if (signature_compat && version_traces && startup_guards &&
+        local_backend && photon_online && default_plugin && photon_trace) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed — "
-             "EU route, online-mode guard and Default-plugin compatibility "
-             "are active");
+             "retired update/network modals are disabled and the EU/Default "
+             "plugin route is active");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
-             "local-backend=%d photon=%d plugin=%d photon-trace=%d",
-             signature_compat ? 1 : 0, version_traces ? 1 : 0,
+             "startup-guards=%d local-backend=%d photon=%d plugin=%d "
+             "photon-trace=%d", signature_compat ? 1 : 0,
+             version_traces ? 1 : 0, startup_guards ? 1 : 0,
              local_backend ? 1 : 0, photon_online ? 1 : 0,
              default_plugin ? 1 : 0, photon_trace ? 1 : 0);
     }
