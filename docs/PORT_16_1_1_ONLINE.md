@@ -45,6 +45,7 @@ Mappings were established by matching the unchanged class field order, method or
 6. Immediately before a real PUN connection, `PhotonNetwork.offlineMode` is cleared through its own setter so the stock connect method does not reject online play.
 7. `FriendsController.Update` is forwarded normally until a Photon connection starts. While PUN is connecting or connected, that dead social/backend tick is quarantined so it cannot run the legacy local disconnect path.
 8. Passive diagnostic wrappers report the real Photon status codes, operation response code/message, stock disconnect requests and `ConnectionControl` callbacks, then always call the original implementations. Authentication and response results are not fabricated.
+9. The v4 device trace proved that authentication, Master Server and Game Server connections all succeed. Room creation alone failed with `32751 PluginMismatch`: the legacy client requested Pixel Gun's retired custom plugin while the new Photon application reported `Default`. v5 temporarily clears only `RoomOptions.Plugins` while the stock SDK serializes create/join parameters, then restores the field. Custom room properties and all other operation parameters remain stock.
 
 ## Build and device validation
 
@@ -57,8 +58,9 @@ adb logcat -s OPG3D
 Expected startup lines:
 
 ```text
-init: libopg3d build 16.1.1 Photon trace + click debounce v4 ...
+init: libopg3d build 16.1.1 Default Photon plugin v5 ...
 16.1.1-photon: installed 4 hooks (appid=OK connect=OK backend-guard=OK; ...)
+16.1.1-photon-plugin: Default-plugin compatibility hook installed (only ParameterCode.Plugins=204 is omitted)
 16.1.1-photon-trace: installed 8/8 hooks (status=OK operation=OK disconnect=OK)
 16.1.1-battle-ui: installed 5 hooks (gate=OK setter=OK onclick=OK core=OK go=OK; ...)
 16.1.1-battle-ui: armed 500 ms target-only click debounce
@@ -83,16 +85,17 @@ On pressing **В бой**, the UI bridge should report which stock stage was mis
 16.1.1-battle-ui: target UIButton.OnClick #3 suppressed as a duplicate component dispatch within 500 ms
 ```
 
-A healthy delegate may omit the fallback warning. Once a mode actually starts Photon, v4 records the complete SDK path without exposing credentials:
+A healthy delegate may omit the fallback warning. Once a mode actually starts Photon, v5 should remove the retired plugin request and record the complete SDK path:
 
 ```text
+16.1.1-photon-plugin: removed legacy RoomOptions.Plugins for operation #1; Photon Cloud will use the Default plugin
 16.1.1-photon-status: 1024(Connect) ...
-16.1.1-photon-op: op=... return=...(reason) debug='...' state=...(state-name)
+16.1.1-photon-op: op=227 return=0(Ok) ...
 16.1.1-connection-ui: OnConnectedToMaster ...
 16.1.1-connection-ui: OnFailedToConnect ...
 16.1.1-photon: stock PhotonNetwork.Disconnect requested ...
 ```
 
-The first non-zero `photon-op` return code, failing `photon-status`, or stock disconnect line identifies whether the remaining failure is authentication, region/CCU, transport, room operation, or game-side cancellation.
+A successful test must no longer contain `return=32751(PluginMismatch)`. It should instead reach `OnCreatedRoom` or `OnJoinedRoom`. Any new non-zero `photon-op` result identifies the next stock matchmaking dependency without hiding it.
 
 Then verify master connection, room creation/join, a two-device match, RPC synchronization, match exit, and a second consecutive match. A `PHOTON_APP_ID is empty`, `route verification failed`, or `online port incomplete` line means the build must not be treated as a successful online test.

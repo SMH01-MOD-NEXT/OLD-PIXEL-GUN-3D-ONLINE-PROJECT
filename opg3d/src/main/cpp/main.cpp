@@ -14,6 +14,7 @@
 #include "log.h"
 #include "obb_provisioner.h"
 #include "photon_1610.h"
+#include "photon_default_plugin_1610.h"
 #include "photon_trace_1610.h"
 #include "version_1610.h"
 
@@ -114,21 +115,24 @@ void* init_thread(void*) {
 
     const bool auth_bypass = version_1610::install_runtime_hooks();
     const bool photon_online = photon_1610::install_hooks();
+    const bool default_plugin =
+        photon_default_plugin_1610::install_hooks();
     const bool photon_trace = photon_trace_1610::install_hooks();
     const bool battle_ui = battle_ui_1610::install_hooks();
     const bool click_debounce = battle_ui &&
         battle_click_debounce_1610::install();
-    if (signature_compat && auth_bypass && photon_online && photon_trace &&
-        battle_ui && click_debounce) {
+    if (signature_compat && auth_bypass && photon_online && default_plugin &&
+        photon_trace && battle_ui && click_debounce) {
         LOGI("init: 16.1.1 online port ready — stock offline transition opens "
              "the menu, the 'В бой' UIButton remains interactive, then PUN "
              "switches online through the configured Photon Cloud app in EU");
     } else {
         LOGE("init: 16.1.1 online port incomplete: signature=%d auth=%d "
-             "photon=%d trace=%d battle-ui=%d debounce=%d",
+             "photon=%d plugin=%d trace=%d battle-ui=%d debounce=%d",
              signature_compat ? 1 : 0, auth_bypass ? 1 : 0,
-             photon_online ? 1 : 0, photon_trace ? 1 : 0,
-             battle_ui ? 1 : 0, click_debounce ? 1 : 0);
+             photon_online ? 1 : 0, default_plugin ? 1 : 0,
+             photon_trace ? 1 : 0, battle_ui ? 1 : 0,
+             click_debounce ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
