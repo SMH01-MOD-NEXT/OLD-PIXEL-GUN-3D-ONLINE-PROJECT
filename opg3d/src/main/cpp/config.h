@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "16.1.1 Local progression v1"
+#define OPG3D_BUILD_TAG "16.1.0 Local progression + crafts v2"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
