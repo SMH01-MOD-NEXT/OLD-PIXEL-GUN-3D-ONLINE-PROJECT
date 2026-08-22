@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
 
 #include "hook.h"
@@ -19,6 +20,27 @@
 // controller's own successful-completion IEnumerator is scheduled through
 // Unity's uniquely named StartCoroutine_Auto(IEnumerator) overload. The stock
 // completion state machine publishes the auth flags and chooses tutorial/menu.
+//
+// Status after logcat_2026-08-22_17-54-21.txt: the loading screen now finishes
+// and the LoadMainMenu tail hands over to this scene (first
+// AuthSceneController.Awake of the whole boot at +11616 ms), but the completion
+// transaction parks:
+//
+//   +011726ms suppressing retired Auth Start transport (before=0/Initial)
+//   +011726ms ignored retired version gate for the local transaction
+//   +011726ms stock completion coroutine accepted (0x6c395e0360)
+//   +015000ms auth scene destroyed before a ready session was observed
+//   +015003ms AuthSceneController.Awake  (scene reloaded itself)
+//   +025039ms completion still pending after 300 frames (state=0/Initial ready=1)
+//
+// The session-ready flag is already 1 while the state never leaves Initial, so
+// publish_if_ready() can never fire and the scene restarts in a loop. Several
+// sibling completion iterators of this controller await Task<HashSet<string>>
+// remote-slot lookups, which is the prime suspect for a transaction that hangs
+// with the backend retired. Until that is proven, this file only adds
+// visibility: every state/ready transition, the lifetime of each auth scene
+// instance and the restart count are logged so one capture is enough to see
+// where the stock machine parks. No behaviour is guessed.
 namespace backend_local_2313 {
 namespace detail {
 
@@ -32,13 +54,13 @@ using StaticGetIntFn = int32_t (*)(const MethodInfo* method);
 using StaticGetBoolFn = bool (*)(const MethodInfo* method);
 
 inline constexpr const char* kCompletionIteratorMethod =
-    u8"万丕丂丑丄世丈丁丌";
+    u8"\u4e07\u4e15\u4e02\u4e11\u4e04\u4e16\u4e08\u4e01\u4e0c";
 inline constexpr const char* kCompletionBlockerMethod =
-    u8"丑七丏三丌丕丞不丙";
+    u8"\u4e11\u4e03\u4e0f\u4e09\u4e0c\u4e15\u4e1e\u4e0d\u4e19";
 inline constexpr const char* kStateGetterMethod =
-    u8"丒与且丙业丁丏丁三";
+    u8"\u4e12\u4e0e\u4e14\u4e19\u4e1a\u4e01\u4e0f\u4e01\u4e09";
 inline constexpr const char* kSessionReadyGetterMethod =
-    u8"丄不丘丝业且丄丁世";
+    u8"\u4e04\u4e0d\u4e18\u4e1d\u4e1a\u4e14\u4e04\u4e01\u4e16";
 
 inline constexpr int32_t kFullySynchronized = 3;
 inline constexpr int32_t kEmpty = 4;
@@ -62,6 +84,12 @@ inline std::atomic<bool> g_local_transaction{false};
 inline std::atomic<bool> g_runtime_ready{false};
 inline std::atomic<bool> g_gate_logged{false};
 inline std::atomic<uint32_t> g_transaction_frames{0u};
+
+// Diagnostics for the auth-scene restart loop.
+inline std::atomic<uint32_t> g_scene_instances{0u};
+inline std::atomic<uint64_t> g_start_ms{0u};
+inline std::atomic<int32_t> g_traced_state{INT32_MIN};
+inline std::atomic<int32_t> g_traced_ready{-1};
 
 template <typename Fn>
 void* replacement(Fn fn) {
@@ -125,6 +153,22 @@ bool session_ready_flag() {
                : false;
 }
 
+// Logs only on an actual transition, so a parked state machine costs one line
+// instead of one line per frame.
+void trace_transition(const char* where, uint32_t frames) {
+    const int32_t state = auth_state();
+    const int32_t ready = session_ready_flag() ? 1 : 0;
+    const int32_t last_state =
+        g_traced_state.exchange(state, std::memory_order_relaxed);
+    const int32_t last_ready =
+        g_traced_ready.exchange(ready, std::memory_order_relaxed);
+    if (state == last_state && ready == last_ready) return;
+    LOGI("23.1.3-local-backend: %s state=%d/%s ready=%d (was %d/%s ready=%d) "
+         "after %u frame(s)",
+         where, state, state_name(state), ready, last_state,
+         state_name(last_state), last_ready, frames);
+}
+
 bool publish_if_ready() {
     const int32_t state = auth_state();
     const bool ready = session_ready_flag();
@@ -179,6 +223,19 @@ void hook_auth_start(void* self, const MethodInfo* method) {
     g_starting_locally = true;
     g_transaction_frames.store(0u, std::memory_order_relaxed);
     g_gate_logged.store(false, std::memory_order_relaxed);
+    g_traced_state.store(INT32_MIN, std::memory_order_relaxed);
+    g_traced_ready.store(-1, std::memory_order_relaxed);
+
+    const uint64_t now = opg3d_log::monotonic_ms();
+    const uint64_t previous = g_start_ms.exchange(now, std::memory_order_relaxed);
+    const uint32_t instance = g_scene_instances.fetch_add(1u) + 1u;
+    if (instance > 1u) {
+        LOGE("23.1.3-local-backend: auth scene restarted (instance #%u) %" PRIu64
+             " ms after the previous Start; the previous completion never "
+             "published a session",
+             instance, previous != 0u && now >= previous ? now - previous : 0u);
+    }
+
     const int32_t before = auth_state();
     LOGW("23.1.3-local-backend: suppressing retired Auth Start transport; "
          "scheduling mapped stock completion (before=%d/%s)",
@@ -202,6 +259,7 @@ void hook_auth_start(void* self, const MethodInfo* method) {
 
     LOGI("23.1.3-local-backend: stock completion coroutine accepted (%p)",
          coroutine);
+    trace_transition("completion scheduled;", 0u);
     (void)publish_if_ready();
 }
 
@@ -212,6 +270,10 @@ void hook_auth_update(void* self, const MethodInfo* method) {
 
     const uint32_t frames =
         g_transaction_frames.fetch_add(1u, std::memory_order_relaxed) + 1u;
+
+    // One line per real transition of the stock machine; silent while parked.
+    trace_transition("completion advanced to", frames);
+
     if (frames == 300u) {
         const int32_t state = auth_state();
         LOGW("23.1.3-local-backend: completion still pending after 300 frames "
@@ -235,8 +297,15 @@ void hook_auth_destroy(void* self, const MethodInfo* method) {
     const bool was_active =
         g_local_transaction.exchange(false, std::memory_order_acq_rel);
     if (was_active && !g_runtime_ready.load(std::memory_order_acquire)) {
+        const uint64_t now = opg3d_log::monotonic_ms();
+        const uint64_t started = g_start_ms.load(std::memory_order_relaxed);
+        const int32_t state = auth_state();
         LOGE("23.1.3-local-backend: auth scene destroyed before a ready "
-             "session was observed");
+             "session was observed -- %" PRIu64 " ms and %u frame(s) after "
+             "Start, still state=%d/%s ready=%d",
+             started != 0u && now >= started ? now - started : 0u,
+             g_transaction_frames.load(std::memory_order_relaxed), state,
+             state_name(state), session_ready_flag() ? 1 : 0);
     }
 }
 

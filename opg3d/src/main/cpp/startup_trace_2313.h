@@ -3,22 +3,22 @@
 // Loading-progress heartbeat tracing for PG3D 23.1.3.
 //
 // Hooks the three Switcher coroutine iterators (Start, InitializeSwitcher,
-// LoadMainMenu) and the AppsMenu.Start iterator.  At each MoveNext call the
+// LoadMainMenu) and the AppsMenu.Start iterator. At each MoveNext call the
 // hook reads the C# state-machine position (<>1__state) and the Switcher
 // instance's live fields by known IL2CPP object offsets taken from
-// dump2313.cs.  A throttled heartbeat is emitted every 2 s or whenever the
+// dump2313.cs. A throttled heartbeat is emitted every 2 s or whenever the
 // state, value, or result changes -- whichever comes first.
 //
 // These hooks call through to the original MoveNext with one deliberate
 // exception: loading_stall_guard_2313::should_skip_step() skips the single
 // InitializeSwitcher step that freezes the game at 90% on the retired 23.1.3
-// backend, resuming the state machine at the next state so the remaining
-// steps still run.  See loading_stall_guard_2313.h for the log evidence and
-// the RVA cross-check.  The same guard receives the enter/exit timestamps used
-// by its stall watchdog, and a pre-call line for LoadMainMenu state changes:
+// backend, resuming the state machine at the next state so the remaining steps
+// still run. See loading_stall_guard_2313.h for the log evidence and the RVA
+// cross-check. The same guard receives the enter/exit notifications used by its
+// stall watchdog, plus a pre-call line for LoadMainMenu state changes:
 // libopg3d is built with -fno-exceptions, so a managed exception thrown by
-// stock code unwinds through the hook frame and no post-call log would ever
-// be emitted.
+// stock code unwinds through the hook frame and no post-call log would ever be
+// emitted.
 //
 // Field layout (dump2313.cs, ARM64 IL2CPP object offsets):
 //
@@ -32,7 +32,7 @@
 //    float 0x128  minimum loading time in seconds (reads 3.000; LoadMainMenu
 //                 compares it against the loading Stopwatch, it is NOT the bar)
 //    float 0x138  the value the iterators yield -- what the bar shows
-//    string 0x150 nameNextScene
+//    string 0x150 loading-screen caption
 //
 //  Switcher.\u4e1c\u4e03\u4e17\u4e0c\u4e11\u4e05\u4e1e\u4e07\u4e01  (IEnumerable<float>, wraps InitializeSwitcher())
 //    int    <>1__state           @ 0x10
@@ -157,7 +157,7 @@ bool hook_sw_init(void* self, const MethodInfo* method) {
     const float   bar      = read_at<float>  (switcher, 0x138, -1.0f);
 
     // The step resumed at state 35 never returns while the 23.1.3 backend is
-    // retired.  The guard writes the next state and we report a yield, so the
+    // retired. The guard writes the next state and we report a yield, so the
     // remaining steps of the state machine still run.
     int32_t resume = state;
     if (loading_stall_guard_2313::should_skip_step(self, state, &resume)) {
@@ -185,7 +185,8 @@ bool hook_sw_init(void* self, const MethodInfo* method) {
 
 // Switcher.\u4e1d\u4e01\u4e09\u4e1f\u4e10\u4e15\u4e01\u4e0e\u4e0f.MoveNext()
 // Final step: waits out the minimum loading time, then runs the tail that
-// requests the main menu scene.
+// requests the main menu scene. That scene load destroys the Switcher, so the
+// last call of this hook is expected to be the one that advances to state 2.
 bool hook_sw_menu(void* self, const MethodInfo* method) {
     const int32_t state    = read_at<int32_t>(self,     0x10, INT32_MIN);
     void*   const switcher = read_at<void*>  (self,     0x20, nullptr);
@@ -194,7 +195,7 @@ bool hook_sw_menu(void* self, const MethodInfo* method) {
 
     // Pre-call: with -fno-exceptions a managed exception from the stock tail
     // unwinds straight through this frame, so this line is the last evidence.
-    if (loading_stall_guard_2313::note_menu_enter(state)) {
+    if (loading_stall_guard_2313::note_menu_enter(self, state)) {
         LOGI("23.1.3-swt: LoadMainMenu entering state=%d bar=%.3f minSec=%.3f",
              state, bar, min_sec);
     }
@@ -203,7 +204,7 @@ bool hook_sw_menu(void* self, const MethodInfo* method) {
                             ? g_sw_menu_next(self, method)
                             : false;
 
-    loading_stall_guard_2313::note_menu_exit(state, result);
+    loading_stall_guard_2313::note_menu_exit(self, state, result);
 
     if (need_emit(g_th_sw_menu, self, state, bar, result)) {
         LOGI("23.1.3-swt: LoadMainMenu state=%d bar=%.3f minSec=%.3f result=%d",
@@ -214,7 +215,7 @@ bool hook_sw_menu(void* self, const MethodInfo* method) {
 
 // AppsMenu.\u4e19\u4e0b\u4e19\u4e07\u4e09\u4e06\u4e11\u4e01\u4e1a.MoveNext()
 // Traces the AppsMenu coroutine flow after both String.Compare gates are
-// patched by install_early_signature_patch().  Confirms the managed code
+// patched by install_early_signature_patch(). Confirms the managed code
 // actually advances past the gates that were patched in the native binary.
 bool hook_am_start(void* self, const MethodInfo* method) {
     const int32_t state = read_at<int32_t>(self, 0x10, INT32_MIN);
@@ -255,7 +256,7 @@ inline bool install_hooks() {
              "-- 90%% stall attribution will be impaired");
     }
 
-    // Switcher.InitializeSwitcher iterator.  This hook also carries the 90%
+    // Switcher.InitializeSwitcher iterator. This hook also carries the 90%
     // stall bypass, so a failure here means the game will freeze again.
     if (hook::install(
             {"", u8"Switcher/\u4e1c\u4e03\u4e17\u4e0c\u4e11\u4e05\u4e1e\u4e07\u4e01",
