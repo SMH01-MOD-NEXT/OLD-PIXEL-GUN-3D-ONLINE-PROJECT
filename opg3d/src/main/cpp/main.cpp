@@ -10,8 +10,12 @@
 #include "config.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
+#include "il2cpp_runtime_2313.h"
 #include "log.h"
 #include "obb_provisioner.h"
+#include "photon_2313.h"
+#include "photon_default_plugin_2313.h"
+#include "photon_trace_2313.h"
 #include "version_2313.h"
 
 namespace {
@@ -32,7 +36,7 @@ size_t assembly_count(void* domain) {
 
 void* init_thread(void*) {
     LOGI("init: libopg3d build %s", OPG3D_BUILD_STAMP);
-    LOGI("init: [0/6] 23.1.3 ARM64 local-backend bootstrap started");
+    LOGI("init: [0/6] 23.1.3 ARM64 local-backend + Photon Cloud bootstrap started");
 
     uintptr_t base = 0u;
     bool found = false;
@@ -64,13 +68,12 @@ void* init_thread(void*) {
     }
     LOGI("init: [2/6] IL2CPP API resolved");
 
-    void* domain = nullptr;
-    for (int i = 0; i < kWaitSteps && domain == nullptr; ++i) {
-        domain = il2cpp::domain_get();
-        if (domain == nullptr) usleep(kWaitStepUs);
-    }
+    // 23.1.3's il2cpp_domain_get() crashes if used as a pre-init poll. Wait
+    // on the exact build's validated root-domain publication slot instead.
+    void* domain = il2cpp_runtime_2313::wait_for_domain(
+        base, kWaitSteps, kWaitStepUs);
     if (domain == nullptr) {
-        LOGE("init: il2cpp_domain_get() stayed null");
+        LOGE("init: IL2CPP root domain did not become safely available");
         return nullptr;
     }
     LOGI("init: [3/6] domain=%p", domain);
@@ -111,13 +114,21 @@ void* init_thread(void*) {
 
     const bool version_traces = version_2313::install_runtime_hooks();
     const bool local_backend = backend_local_2313::install_hooks();
-    if (signature_compat && version_traces && local_backend) {
-        LOGI("init: 23.1.3 ARM64 bootstrap armed — stock AppsMenu signature "
-             "success path + mapped Auth completion coroutine");
+    const bool photon_online = photon_2313::install_hooks();
+    const bool default_plugin =
+        photon_default_plugin_2313::install_hooks();
+    const bool photon_trace = photon_trace_2313::install_hooks();
+    if (signature_compat && version_traces && local_backend && photon_online &&
+        default_plugin && photon_trace) {
+        LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed — "
+             "EU route, online-mode guard and Default-plugin compatibility "
+             "are active");
     } else {
-        LOGE("init: 23.1.3 bootstrap incomplete: signature=%d traces=%d "
-             "local-backend=%d", signature_compat ? 1 : 0,
-             version_traces ? 1 : 0, local_backend ? 1 : 0);
+        LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
+             "local-backend=%d photon=%d plugin=%d photon-trace=%d",
+             signature_compat ? 1 : 0, version_traces ? 1 : 0,
+             local_backend ? 1 : 0, photon_online ? 1 : 0,
+             default_plugin ? 1 : 0, photon_trace ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
