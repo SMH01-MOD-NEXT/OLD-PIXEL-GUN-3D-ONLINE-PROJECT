@@ -1,129 +1,134 @@
-# 23.1.3 — the auth completion transaction (the remaining "90%" freeze)
+# 23.1.3 auth scene: why the boot parked at 90%
 
-This document covers the freeze that is left **after** the loading stall guard
-does its job. For the `InitializeSwitcher` state 35 stall itself see
-`PORT_23_1_3_LOADING_STALL.md`.
+Capture: `logcat_2026-08-22_19-55-26.txt` (pid 30468, `com.pixel.gun3d`,
+arm64-v8a, ru-RU).
+Binary: `libil2cpp.so` SHA-256
+`f0a130c4e8d9487059eab4b0f08462f6aa7d057510cada0fd6fb3043c77deb5c`.
 
-## The loading screen is no longer the problem
+All RVAs below are analysis references from a static A64 pass over that exact
+binary. Nothing in the runtime code reads them; every entry point is resolved
+by metadata name through IL2CPP.
 
-`logcat_2026-08-22_18-10-20.txt` (build tag `23.1.3 ARM64 lobby gate v3`) shows
-the whole boot pipeline completing:
+## 1. The Switcher half of the boot is healthy
 
-| Time | Event |
+```
+23.1.3-stall: skipping InitializeSwitcher state=35 #1 (ranchoOk=0 minSec=3.000 bar=0.450)
+23.1.3-stall: InitializeSwitcher finished on its own at state=45
+23.1.3-stall: LoadMainMenu tail completed (state 1 -> 2, result=1) ... the loading watchdog is disarmed
+```
+
+No `NullReferenceException`, no v1 regression. Everything the player still sees
+as a frozen 90% loading screen happens afterwards, inside the auth scene.
+
+## 2. What the capture shows in the auth scene
+
+```
++011917ms 23.1.3-auth: AuthSceneController.Awake ENTER / RETURN
++012044ms suppressing retired Auth Start transport; scheduling mapped stock completion (before=0/Initial)
++012044ms stock completion coroutine accepted (0x6c760e5f80); iterator <completion> (0x6df7eb9000)
++012061ms completion iterator advanced -2147483648 -> 1
++013313ms completion iterator advanced 1 -> -1 after 72 frame(s)
++024550ms completion still pending after 300 frames (state=0/Initial ready=1)
+          still parked; chain[0] <completion> state=-1 after 2700 frame(s); this class awaits no Task
+          ignored retired version gate only for the local completion transaction
+```
+
+The scheduled coroutine ran to its end (`<>1__state == -1`), awaited no `Task`,
+and the published `AuthSceneState` never left `0/Initial` while the
+session-ready flag was already `1`.
+
+## 3. Static analysis of the state machine
+
+```
+AuthSceneController.Start()                      0x3DC1BCC
+  FpsManager.<setup>()                           0x2512E74
+  <loadingBar>.<setProgress>(float)              0x35AD0A4
+  ActivityIndicator.<setProgress>(float)         0x1E18DC0
+  <stopAllCoroutines>()                          0x3DC1DB8
+  <resetUi>()                                    0x3DC1E18
+  ldr w1, [x8, #16]        ; static AuthSceneState backing field (+0x10)
+  b   0x3DC1F38            ; TAIL CALL into the dispatcher
+
+<dispatch>(AuthSceneState)                       0x3DC1F38
+  if (<settings>.<localSessionGate>())  -> <startCompletion>()   0x3DC20E8
+                                           = StartCoroutine(<completion>())
+  InfoWindowController.HideServerMessageBox()
+  switch (state) {
+    2 Authorized   -> <cachedCommands>()        0x3DC2410
+    1 Authorizing  -> StartCoroutine(<ping>())  0x3DC6DB0
+    0 Initial      -> login UI / retired transport (0x3DC21B4 / 0x3DC2270)
+    default        -> ret            // 3 FullySynchronized is NOT handled here
+  }
+
+<completion> iterator MoveNext                   0x3DC9320
+  walks a Delegate[] and DynamicInvokes it   ([PROD-32809] OnResetData)
+  strb w9, [x8, #20]     ; static session-ready bool (+0x14) = true
+  <settings>.<setOffline>(false)
+  Storager singleton: commit, subscribe, save
+  loading bar + ActivityIndicator progress
+  never writes the static AuthSceneState (+0x10)
+```
+
+Two facts follow, and both are decisive:
+
+1. **The state transition belongs to `Start -> <dispatch>`, not to the
+   completion coroutine.** The previous revision suppressed `Start` entirely
+   and hand-started the coroutine, so nothing ever moved the state.
+   `publish_if_ready()` requires `ready && (FullySynchronized || Empty)` and
+   therefore could never become true. The mod parked until its fail-closed
+   timeout while the loading screen stayed at 90%.
+2. **Passing `FullySynchronized` to the dispatcher would be a no-op.** It only
+   handles `0`, `1`, `2`; anything else falls through to a bare `ret`. The
+   session has to be published through the static setter, not through the
+   dispatcher.
+
+Supporting observations:
+
+- A caller scan over the whole executable segment (161,400 parsed methods)
+  finds **zero** call sites for the state getter (0x3DC0920), the state setter
+  (0x3DC0968) and the session-ready setter (0x3DC0A04): these
+  `[CompilerGenerated]` accessors are inlined by IL2CPP and stock code writes
+  the static field directly. So the missing setter-trace lines in
+  `version_2313.h` are expected and are not, by themselves, proof that the
+  state never moved -- the polled getter is what proves it.
+- The only caller of the version blocker (0x3DC5F54) is the completion
+  iterator's `MoveNext`, so the blocker mapping is correct and the bypass is
+  scoped to the right transaction. Forcing it to `false` is the right
+  semantics ("not blocked"), and it is not what kept the state at `Initial`.
+
+## 4. The fix
+
+| Step | Behaviour |
 | --- | --- |
-| +001265 ms | watchdog armed (`mode=1`, skip `35`), `8/8 guards`, `4/4 coroutine heartbeats`, `2/2 AppsMenu gates` |
-| +009235 ms | `skipping InitializeSwitcher state=35 #1 (ranchoOk=0 bar=0.450)` |
-| +009268 ms | Unity: `ParseFullSlotConfig: versionDict not contains version 23.1.3` |
-| +009464 ms | `InitializeSwitcher finished on its own at state=45` (bar=0.750) |
-| +011893 ms | `LoadMainMenu tail completed (state 1 -> 2)` — no v1 `NullReferenceException` |
-| +011917 ms | `AuthSceneController.Awake` |
-| +012044 ms | `completion scheduled; state=0/Initial ready=1` |
-| +014636 ms | `auth scene destroyed before a ready session was observed` (2592 ms / 98 frames) |
-| +014721 ms | `auth scene restarted (instance #2)` |
-| +024550 ms | `completion still pending after 300 frames (state=0/Initial ready=1)` |
+| Run the stock `Start` | FpsManager, loading bar, coroutine cleanup, UI reset and the dispatcher all execute as in the stock build. |
+| Force the local-session gate (0x2B71728) | Only while one local auth transaction is active. This is the stock "a local session already exists" branch, so the retired ping/login/transport branches are never selected. |
+| Hook the iterator factory (0x3DC3EE0) | The iterator created by the stock dispatcher is captured for introspection instead of being scheduled by this module. |
+| Publish explicitly | Once the coroutine ends (or after the frame budget), set session-ready `true` (0x3DC0A04) and `AuthSceneState = FullySynchronized` (0x3DC0968) through the controller's own static setters. |
+| Bounded fallbacks | 60 frames: hand-schedule the coroutine if the dispatcher never created it. 900 frames: invoke the stock post-auth continuation (0x3DC2CC4, version banner + SceneLoader) once. 3600 frames: existing fail-closed timeout. |
 
-So the progress the player watches freeze is the auth/session phase that runs
-after the Switcher hands over, not `state=35`.
-
-## The decisive evidence is negative
-
-The direct `AuthSceneState` setter (`0x3DC0968`) is hooked from +001265 ms and
-**never fires once in the entire capture**. The state is not advancing slowly —
-it never moves at all. The scheduled completion machine parks on its very first
-await, and `publish_if_ready()` requires
+## 5. What the next capture should contain
 
 ```
-ready && (state == FullySynchronized(3) || state == Empty(4))
+23.1.3-local-backend: running the stock Auth Start on the local-session route (before=0/Initial ready=0)
+23.1.3-local-backend: reporting an existing local session to the auth dispatcher for this transaction only
+23.1.3-local-backend: the stock dispatcher created the completion iterator <name> (0x...)
+23.1.3-local-backend: completion iterator <name> advanced ... -> -1 after N frame(s)
+23.1.3-local-backend: published the local session explicitly (... state 0/Initial -> 3/FullySynchronized ready=1)
+23.1.3-auth: direct state setter -> 3 (FullySynchronized)          <- version_2313.h trace
+23.1.3-local-backend: the local session is usable (state=3/FullySynchronized readyFlag=1)
 ```
 
-which can therefore never become true, no matter how long the scene lives.
-`ready` is already `1` at frame 0, which is why the mismatch is easy to misread
-as "almost done".
+If `published the local session explicitly` appears but the scene does not
+change, the follow-up line
+`invoking the stock post-auth continuation once` tells the next reviewer that
+the hand-off itself, not the auth state, is the remaining defect.
 
-Supporting managed-side evidence that the remote data backing this step is dead:
+## 6. Known follow-ups (not in this change)
 
-- `ParseFullSlotConfig: versionDict not contains version 23.1.3`
-- `parse client version info fail: nullable image url`
-- `[ConfigSystem.OnWebS_ocketCallback] Unknown configId: None`
-- `TierMatchmakingController config: Unknow mode: Christmas2023`, `map not found: Tournament`
-
-The live config service answers, but it has no 23.1.3 entries at all.
-
-## Why the parked iterator could not simply be assumed
-
-`AuthSceneController` has 20 generated iterator classes. Six of them await a
-`Task` that only the retired backend can complete, and the awaited field is at a
-different offset in each — while three of them share the same field *name*:
-
-| TypeDefIndex | generated class | awaited field | offset | task type | MoveNext RVA |
-| --- | --- | --- | --- | --- | --- |
-| 2030 | `丑丐丘三且且世丆丕` | `<getRemoteSlots>5__2` | 0x28 | `Task<HashSet<string>>` | `0x3DC80B4` |
-| 2031 | `丈丄丒且丏万丝丁丆` | `<getRemoteSlotsTask>5__2` | 0x28 | `Task<HashSet<string>>` | `0x3DC8574` |
-| 2032 | `丝丗东丟业丕丅丂丈` | `<task>5__2` | 0x28 | `Task<HashSet<string>>` | `0x3DC89F4` |
-| 2035 | `丈丈业丛丈丒不丂丏` | `<task>5__2` | 0x40 | `Task<Dictionary<string, object>>` | `0x3DC99A8` |
-| 2036 | `丌与世丐丐丘三一东` | `<task>5__2` | 0x30 | `Task<Dictionary<string, object>>` | `0x3DCA248` |
-| 2037 | `丈丛世万业东丌丆不` | `<task>5__2` | 0x30 | `Task<Dictionary<string, object>>` | `0x3DCA650` |
-
-Neither an offset nor a name identifies the scheduled one on its own, and the
-factory stub `万丕丂丑丄世丈丁丌()` (`0x3DC3EE0`) is not adjacent to any of these
-classes' constructors, so the usual IL2CPP adjacency heuristic does not resolve
-it statically either.
-
-## What the build now logs
-
-`backend_local_2313.h` keeps the pointer to the exact `IEnumerator` instance it
-hands to `StartCoroutine_Auto` and reads its identity out of the live object.
-Every field is resolved **by metadata name** through IL2CPP, never by offset,
-and every read is fail-soft.
-
-New lines, all tagged `23.1.3-local-backend`:
-
-- at schedule time — `stock completion coroutine accepted (...); iterator <class> (<ptr>)`
-- a chain dump at schedule time, at frame 300, every 900 frames while parked,
-  on scene destroy and on fail-closed timeout:
-
-  ```
-  <where> chain[<depth>] <generated class> state=<\<\>1__state> after <n> frame(s);
-      awaits <field> (<task class>) status=<...> flags=0x........ completed=<0|1>
-  ```
-
-- `iterator <class> advanced <a> -> <b>` whenever `<>1__state` actually moves
-  (silent while parked, so a stuck machine costs no log spam)
-
-The chain walk follows `<>2__current` up to 4 levels, so a completion iterator
-that is parked on a *child* iterator reports the child too. `status` decodes
-`System.Threading.Tasks.Task.m_stateFlags`
-(`RanToCompletion` / `Faulted` / `Canceled` / `WaitingForActivation` /
-`Running` / `NotStarted`).
-
-No behaviour is changed by this commit.
-
-## Reading the next capture
-
-Run the build, let the auth scene sit for at least 90 seconds (the fail-closed
-timeout is `kTimeoutFrames = 3600`, roughly 60 s) and **do not background the
-app** — the previous capture ended at `onPause` after only 27 s, which is why
-no timeout verdict was recorded.
-
-Then read `chain[0]`:
-
-- **`awaits ... status=WaitingForActivation` / `Running`, `completed=0`** —
-  confirmed: the transaction is blocked on a remote lookup the retired backend
-  will never answer. Fix belongs in the awaited task: hook the method that
-  produces it and return an already-completed task carrying a local result. The
-  stock machine then drives `Initial -> ... -> FullySynchronized` itself.
-- **`... is null, the lookup was never started`** — the parked step is earlier
-  than the await; the blocker predicate or a preceding yield is the cause.
-- **`status=Faulted`** — the task *did* finish, and the coroutine is swallowing
-  the exception. Fix belongs in the continuation, not in the transport.
-- **`this class awaits no Task`** — the completion iterator is not one of the
-  six above; the chain dump names which class it really is.
-
-## What must not be done
-
-Forcing the state with the direct setter (`0x3DC0968`) to `FullySynchronized`
-looks tempting and is the same mistake as the v1 loading guard: the skipped
-steps never create the singletons the menu dereferences later, `libopg3d` is
-built `-fno-exceptions`, and the resulting managed `NullReferenceException`
-unwinds through hook frames with no usable stack. Complete the awaited work
-instead of skipping it.
+- `loading_stall_guard_2313.h` disarms the watchdog at the
+  `Switcher -> AuthScene` hand-off, so an auth-scene stall is no longer covered
+  by a watchdog. Re-arming it around the auth scene would turn a future hang
+  into a bounded, logged failure.
+- `photon_2313.h` logs the empty `PHOTON_APP_ID` at error severity on the local
+  route, where it is expected; `ParseFullSlotConfig: versionDict not contains
+  version 23.1.3` is likewise expected offline noise.
