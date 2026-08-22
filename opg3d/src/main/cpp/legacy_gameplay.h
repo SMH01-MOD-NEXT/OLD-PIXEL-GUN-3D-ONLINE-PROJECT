@@ -27,6 +27,10 @@ using StoragerSetIntFn = void (*)(void* static_context, ManagedString* key,
                                  const MethodInfo* method);
 using ServerTimeFn = int64_t (*)(void* static_context,
                                  const MethodInfo* method);
+using SetHintObjectFn = void (*)(void* self, void* hint_object,
+                                 const MethodInfo* method);
+using GameObjectSetActiveFn = void (*)(void* self, bool active,
+                                       const MethodInfo* method);
 using GcHandleNewFn = uint32_t (*)(void* object, bool pinned);
 using GcHandleGetTargetFn = void* (*)(uint32_t handle);
 
@@ -36,12 +40,16 @@ inline const MethodInfo* g_mi_set_training_stage = nullptr;
 inline StoragerSetIntFn g_storager_set_int = nullptr;
 inline const MethodInfo* g_mi_storager_set_int = nullptr;
 inline ServerTimeFn g_server_time = nullptr;
+inline SetHintObjectFn g_set_hint_object = nullptr;
+inline GameObjectSetActiveFn g_game_object_set_active = nullptr;
+inline const MethodInfo* g_mi_game_object_set_active = nullptr;
 inline GcHandleNewFn g_gchandle_new = nullptr;
 inline GcHandleGetTargetFn g_gchandle_get_target = nullptr;
 inline uint32_t g_shop_tutorial_key_handle = 0;
 
 inline std::atomic<bool> g_tutorial_persisted{false};
 inline std::atomic<bool> g_time_fallback_logged{false};
+inline std::atomic<bool> g_hint_guard_logged{false};
 inline std::atomic<int32_t> g_last_time{0};
 inline thread_local bool g_persisting_tutorial = false;
 
@@ -95,6 +103,34 @@ bool hook_training_completed(void* static_context,
     return true;
 }
 
+// The supplied 14.1.1 resources occasionally deserialize HintBig without its
+// TrainingHintBig behaviour (Unity reports 32 serialized bytes while the
+// current class expects 216). Stock TrainingHints.SetHintObject then throws a
+// NullReferenceException out of MainMenuController.Awake, leaving the loading
+// UI at 90%. The tutorial is already completed by the hook above, so this one
+// broken, otherwise unused hint root can be disabled instead of aborting the
+// entire main-menu initialization. SetHintObject has exactly one 14.1.1 caller:
+// MainMenuController.Awake at RVA 0x00DF07F0.
+void hook_set_hint_object(void* self, void* hint_object,
+                          const MethodInfo* method) {
+    (void)self;
+    (void)method;
+    if (hint_object != nullptr && g_game_object_set_active != nullptr &&
+        g_mi_game_object_set_active != nullptr) {
+        g_game_object_set_active(hint_object, false,
+                                 g_mi_game_object_set_active);
+    }
+
+    bool expected = false;
+    if (g_hint_guard_logged.compare_exchange_strong(expected, true)) {
+        LOGW("legacy: incompatible 14.1.1 HintBig disabled; skipped "
+             "TrainingHints.SetHintObject so MainMenuController.Awake can "
+             "finish (tutorial is already completed)");
+    }
+    // Intentionally do not call the stock method: it dereferences the missing
+    // TrainingHintBig component and aborts MainMenuController.Awake.
+}
+
 int64_t hook_server_time(void* static_context, const MethodInfo* method) {
     const int64_t stock = g_server_time(static_context, method);
     int64_t candidate = stock;
@@ -133,6 +169,10 @@ inline bool install_hooks() {
         {"", "Storager", "setInt", 4},
         reinterpret_cast<void**>(&detail::g_storager_set_int),
         &detail::g_mi_storager_set_int);
+    ok &= detail::resolve_call(
+        {"UnityEngine", "GameObject", "SetActive", 1},
+        reinterpret_cast<void**>(&detail::g_game_object_set_active),
+        &detail::g_mi_game_object_set_active);
 
     detail::g_gchandle_new = reinterpret_cast<detail::GcHandleNewFn>(
         elfsym::find_symbol("libil2cpp.so", "il2cpp_gchandle_new"));
@@ -164,16 +204,21 @@ inline bool install_hooks() {
         {"", "TrainingController", "get_TrainingCompleted", 0},
         detail::replacement(&detail::hook_training_completed),
         detail::original_slot(&detail::g_training_completed), true);
+    const bool hint_guard = hook::install(
+        {"", "TrainingHints", "SetHintObject", 1},
+        detail::replacement(&detail::hook_set_hint_object),
+        detail::original_slot(&detail::g_set_hint_object), true);
     const bool server_time = hook::install(
         {"", "FriendsController", "get_ServerTime", 0},
         detail::replacement(&detail::hook_server_time),
         detail::original_slot(&detail::g_server_time), true);
-    if (!tutorial || !server_time) {
-        LOGE("legacy: tutorial or server-time hook failed");
+    if (!tutorial || !hint_guard || !server_time) {
+        LOGE("legacy: tutorial, hint guard or server-time hook failed");
         return false;
     }
 
-    LOGI("legacy: tutorial auto-skip and local upgrade/crafting time armed");
+    LOGI("legacy: tutorial auto-skip, broken HintBig guard and local "
+         "upgrade/crafting time armed");
     return true;
 }
 
