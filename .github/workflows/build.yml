@@ -2,9 +2,9 @@ name: build
 
 on:
   push:
-    branches: [main, "13.2.1", "14.1.1", "16.1.1-test"]
+    branches: [main, "13.2.1", "14.1.1", "16.1.0"]
   pull_request:
-    branches: [main, "13.2.1", "14.1.1", "16.1.1-test"]
+    branches: [main, "13.2.1", "14.1.1", "16.1.0"]
   workflow_dispatch:
 
 permissions:
