@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "hook.h"
 #include "il2cpp.h"
@@ -21,26 +23,42 @@
 // Unity's uniquely named StartCoroutine_Auto(IEnumerator) overload. The stock
 // completion state machine publishes the auth flags and chooses tutorial/menu.
 //
-// Status after logcat_2026-08-22_17-54-21.txt: the loading screen now finishes
-// and the LoadMainMenu tail hands over to this scene (first
-// AuthSceneController.Awake of the whole boot at +11616 ms), but the completion
-// transaction parks:
+// Status after logcat_2026-08-22_18-10-20.txt: the loading screen itself is
+// fixed. The guard skips InitializeSwitcher state 35 (bar=0.450), the iterator
+// finishes on its own at state 45 (bar=0.750) and the LoadMainMenu tail
+// completes (state 1 -> 2) without the v1 NullReferenceException. Everything
+// the player still sees as a frozen loading screen happens in this scene:
 //
-//   +011726ms suppressing retired Auth Start transport (before=0/Initial)
-//   +011726ms ignored retired version gate for the local transaction
-//   +011726ms stock completion coroutine accepted (0x6c395e0360)
-//   +015000ms auth scene destroyed before a ready session was observed
-//   +015003ms AuthSceneController.Awake  (scene reloaded itself)
-//   +025039ms completion still pending after 300 frames (state=0/Initial ready=1)
+//   +011917ms AuthSceneController.Awake
+//   +012044ms completion scheduled; state=0/Initial ready=1
+//   +014636ms auth scene destroyed before a ready session was observed
+//             (2592 ms and 98 frames after Start, still state=0/Initial)
+//   +014721ms auth scene restarted (instance #2)
+//   +024550ms completion still pending after 300 frames (state=0/Initial ready=1)
 //
-// The session-ready flag is already 1 while the state never leaves Initial, so
-// publish_if_ready() can never fire and the scene restarts in a loop. Several
-// sibling completion iterators of this controller await Task<HashSet<string>>
-// remote-slot lookups, which is the prime suspect for a transaction that hangs
-// with the backend retired. Until that is proven, this file only adds
-// visibility: every state/ready transition, the lifetime of each auth scene
-// instance and the restart count are logged so one capture is enough to see
-// where the stock machine parks. No behaviour is guessed.
+// The decisive observation is a negative one: the direct AuthSceneState setter
+// is hooked from +001265 ms and does not fire a single time in the whole
+// capture. The state is not advancing slowly, it never moves at all. So the
+// scheduled completion machine parks on its very first await, and
+// publish_if_ready() -- which needs ready && (FullySynchronized || Empty) --
+// can never become true no matter how long the scene lives.
+//
+// Six completion iterators of this controller await a Task that only the
+// retired backend can complete: three Task<HashSet<string>> remote-slot
+// lookups and three Task<Dictionary<string, object>> progress lookups. The
+// awaited field sits at a different offset in each generated class (0x28,
+// 0x30 or 0x40) and three of them share the name "<task>5__2", so neither an
+// offset nor a name alone identifies the scheduled one.
+//
+// This file therefore does not guess. It reads the identity out of the live
+// object that Start already holds: the generated class of the scheduled
+// iterator, the <>1__state it parks on, the chain of iterators it is yielding
+// on, and the m_stateFlags of every Task in that chain. Every field is
+// resolved by metadata name through IL2CPP, never by a hardcoded offset, and
+// every read is fail-soft: a field the class does not declare is skipped.
+//
+// One capture is now enough to decide whether the fix belongs in the awaited
+// task or in the state machine. No behaviour is changed here.
 namespace backend_local_2313 {
 namespace detail {
 
@@ -65,6 +83,34 @@ inline constexpr const char* kSessionReadyGetterMethod =
 inline constexpr int32_t kFullySynchronized = 3;
 inline constexpr int32_t kEmpty = 4;
 inline constexpr uint32_t kTimeoutFrames = 3600u;
+
+// Roslyn iterator fields, resolved by metadata name.
+inline constexpr const char* kIteratorStateField = "<>1__state";
+inline constexpr const char* kIteratorCurrentField = "<>2__current";
+
+// Awaited-task field names used by this controller's completion iterators.
+// "<task>5__2" is declared by four different generated classes at three
+// different offsets, which is exactly why the lookup goes through the class of
+// the live object instead of through a constant.
+inline constexpr const char* kAwaitedTaskFields[] = {
+    "<getRemoteSlots>5__2",
+    "<getRemoteSlotsTask>5__2",
+    "<task>5__2",
+};
+
+// System.Threading.Tasks.Task.m_stateFlags bits.
+inline constexpr int32_t kTaskStarted = 0x00010000;
+inline constexpr int32_t kTaskFaulted = 0x00200000;
+inline constexpr int32_t kTaskCanceled = 0x00400000;
+inline constexpr int32_t kTaskRanToCompletion = 0x01000000;
+inline constexpr int32_t kTaskWaitingForActivation = 0x02000000;
+inline constexpr int32_t kTaskCompletedMask =
+    kTaskFaulted | kTaskCanceled | kTaskRanToCompletion;
+
+// A yielded iterator chain deeper than this is a defect, not a park.
+inline constexpr int kMaxChainDepth = 4;
+inline constexpr uint32_t kChainReportFrames = 300u;
+inline constexpr uint32_t kChainRepeatFrames = 900u;
 
 inline InstanceVoidFn g_auth_start = nullptr;
 inline InstanceVoidFn g_auth_update = nullptr;
@@ -91,6 +137,11 @@ inline std::atomic<uint64_t> g_start_ms{0u};
 inline std::atomic<int32_t> g_traced_state{INT32_MIN};
 inline std::atomic<int32_t> g_traced_ready{-1};
 
+// The exact IEnumerator instance handed to Unity, kept so the parked machine
+// can be identified instead of inferred.
+inline std::atomic<void*> g_completion_object{nullptr};
+inline std::atomic<int32_t> g_iterator_state{INT32_MIN};
+
 template <typename Fn>
 void* replacement(Fn fn) {
     return reinterpret_cast<void*>(fn);
@@ -114,6 +165,50 @@ bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
     *out_fn = pointer;
     *out_mi = info;
     return true;
+}
+
+// Reads a managed field by metadata name. Returns false when the class does
+// not declare it, which is how the awaited-task field is probed.
+template <typename T>
+bool read_managed_field(void* object, const char* name, T* out) {
+    static_assert(sizeof(T) <= 8, "diagnostic field must be scalar/pointer");
+    if (object == nullptr || out == nullptr ||
+        il2cpp::object_get_class == nullptr ||
+        il2cpp::class_get_field_from_name == nullptr ||
+        il2cpp::field_get_value == nullptr) {
+        return false;
+    }
+    void* klass = il2cpp::object_get_class(object);
+    void* field = klass != nullptr
+                      ? il2cpp::class_get_field_from_name(klass, name)
+                      : nullptr;
+    if (field == nullptr) return false;
+    alignas(8) uint8_t scratch[16] = {0};
+    il2cpp::field_get_value(object, field, scratch);
+    std::memcpy(out, scratch, sizeof(T));
+    return true;
+}
+
+// il2cpp_class_get_name is bound outside the required export set, so a layout
+// without it still logs everything else.
+const char* managed_class_name(void* object) {
+    if (object == nullptr || il2cpp::object_get_class == nullptr ||
+        il2cpp::class_get_name == nullptr) {
+        return "<unnamed>";
+    }
+    void* klass = il2cpp::object_get_class(object);
+    if (klass == nullptr) return "<unnamed>";
+    const char* name = il2cpp::class_get_name(klass);
+    return name != nullptr ? name : "<unnamed>";
+}
+
+const char* task_status(int32_t flags) {
+    if ((flags & kTaskRanToCompletion) != 0) return "RanToCompletion";
+    if ((flags & kTaskFaulted) != 0) return "Faulted";
+    if ((flags & kTaskCanceled) != 0) return "Canceled";
+    if ((flags & kTaskWaitingForActivation) != 0) return "WaitingForActivation";
+    if ((flags & kTaskStarted) != 0) return "Running";
+    return "NotStarted";
 }
 
 const char* state_name(int32_t state) {
@@ -151,6 +246,78 @@ bool session_ready_flag() {
                    g_mi_get_session_ready != nullptr
                ? g_get_session_ready(g_mi_get_session_ready)
                : false;
+}
+
+// Walks the yielded-object chain of the scheduled completion iterator. One
+// line per node: which generated class it is, which <>1__state it sits on and
+// the status of the Task it awaits. This is what names the parked machine.
+void log_completion_chain(const char* where, uint32_t frames) {
+    void* node = g_completion_object.load(std::memory_order_acquire);
+    if (node == nullptr) {
+        LOGW("23.1.3-local-backend: %s no completion iterator is recorded",
+             where);
+        return;
+    }
+
+    for (int depth = 0; depth < kMaxChainDepth && node != nullptr; ++depth) {
+        int32_t state = INT32_MIN;
+        (void)read_managed_field<int32_t>(node, kIteratorStateField, &state);
+
+        void* task = nullptr;
+        const char* task_field = nullptr;
+        for (const char* candidate : kAwaitedTaskFields) {
+            void* value = nullptr;
+            if (read_managed_field<void*>(node, candidate, &value)) {
+                task = value;
+                task_field = candidate;
+                break;
+            }
+        }
+
+        if (task_field == nullptr) {
+            LOGW("23.1.3-local-backend: %s chain[%d] %s state=%d after %u "
+                 "frame(s); this class awaits no Task",
+                 where, depth, managed_class_name(node), state, frames);
+        } else if (task == nullptr) {
+            LOGE("23.1.3-local-backend: %s chain[%d] %s state=%d after %u "
+                 "frame(s); %s is null, the lookup was never started",
+                 where, depth, managed_class_name(node), state, frames,
+                 task_field);
+        } else {
+            int32_t flags = 0;
+            const bool has_flags =
+                read_managed_field<int32_t>(task, "m_stateFlags", &flags);
+            LOGE("23.1.3-local-backend: %s chain[%d] %s state=%d after %u "
+                 "frame(s); awaits %s (%s) status=%s flags=0x%08" PRIx32
+                 " completed=%d",
+                 where, depth, managed_class_name(node), state, frames,
+                 task_field, managed_class_name(task),
+                 has_flags ? task_status(flags) : "<no m_stateFlags>",
+                 static_cast<uint32_t>(flags),
+                 has_flags ? ((flags & kTaskCompletedMask) != 0 ? 1 : 0) : -1);
+        }
+
+        void* current = nullptr;
+        if (!read_managed_field<void*>(node, kIteratorCurrentField, &current) ||
+            current == nullptr || current == node) {
+            break;
+        }
+        node = current;
+    }
+}
+
+// Logs only when the scheduled iterator actually advances, so a parked machine
+// stays silent instead of emitting one line per frame.
+void trace_iterator(const char* where, uint32_t frames) {
+    void* node = g_completion_object.load(std::memory_order_acquire);
+    if (node == nullptr) return;
+    int32_t state = INT32_MIN;
+    if (!read_managed_field<int32_t>(node, kIteratorStateField, &state)) return;
+    const int32_t previous =
+        g_iterator_state.exchange(state, std::memory_order_relaxed);
+    if (state == previous) return;
+    LOGI("23.1.3-local-backend: %s iterator %s advanced %d -> %d after %u "
+         "frame(s)", where, managed_class_name(node), previous, state, frames);
 }
 
 // Logs only on an actual transition, so a parked state machine costs one line
@@ -225,6 +392,8 @@ void hook_auth_start(void* self, const MethodInfo* method) {
     g_gate_logged.store(false, std::memory_order_relaxed);
     g_traced_state.store(INT32_MIN, std::memory_order_relaxed);
     g_traced_ready.store(-1, std::memory_order_relaxed);
+    g_completion_object.store(nullptr, std::memory_order_release);
+    g_iterator_state.store(INT32_MIN, std::memory_order_relaxed);
 
     const uint64_t now = opg3d_log::monotonic_ms();
     const uint64_t previous = g_start_ms.exchange(now, std::memory_order_relaxed);
@@ -248,18 +417,21 @@ void hook_auth_start(void* self, const MethodInfo* method) {
         LOGE("23.1.3-local-backend: stock completion returned null iterator");
         return;
     }
+    g_completion_object.store(iterator, std::memory_order_release);
 
     void* coroutine = g_start_coroutine(self, iterator, g_mi_start_coroutine);
     g_starting_locally = false;
     if (coroutine == nullptr) {
         g_local_transaction.store(false, std::memory_order_release);
+        g_completion_object.store(nullptr, std::memory_order_release);
         LOGE("23.1.3-local-backend: Unity rejected the completion iterator");
         return;
     }
 
-    LOGI("23.1.3-local-backend: stock completion coroutine accepted (%p)",
-         coroutine);
+    LOGI("23.1.3-local-backend: stock completion coroutine accepted (%p); "
+         "iterator %s (%p)", coroutine, managed_class_name(iterator), iterator);
     trace_transition("completion scheduled;", 0u);
+    log_completion_chain("completion scheduled;", 0u);
     (void)publish_if_ready();
 }
 
@@ -273,12 +445,17 @@ void hook_auth_update(void* self, const MethodInfo* method) {
 
     // One line per real transition of the stock machine; silent while parked.
     trace_transition("completion advanced to", frames);
+    trace_iterator("completion", frames);
 
-    if (frames == 300u) {
+    if (frames == kChainReportFrames) {
         const int32_t state = auth_state();
-        LOGW("23.1.3-local-backend: completion still pending after 300 frames "
-             "(state=%d/%s ready=%d)", state, state_name(state),
+        LOGW("23.1.3-local-backend: completion still pending after %u frames "
+             "(state=%d/%s ready=%d)", frames, state, state_name(state),
              session_ready_flag() ? 1 : 0);
+        log_completion_chain("still pending;", frames);
+    } else if (frames > kChainReportFrames &&
+               frames % kChainRepeatFrames == 0u) {
+        log_completion_chain("still parked;", frames);
     }
     if (frames >= kTimeoutFrames) {
         g_local_transaction.store(false, std::memory_order_release);
@@ -286,6 +463,8 @@ void hook_auth_update(void* self, const MethodInfo* method) {
         LOGE("23.1.3-local-backend: completion timed out fail-closed after "
              "%u frames (state=%d/%s ready=%d)", frames, state,
              state_name(state), session_ready_flag() ? 1 : 0);
+        log_completion_chain("timed out;", frames);
+        g_completion_object.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -299,14 +478,18 @@ void hook_auth_destroy(void* self, const MethodInfo* method) {
     if (was_active && !g_runtime_ready.load(std::memory_order_acquire)) {
         const uint64_t now = opg3d_log::monotonic_ms();
         const uint64_t started = g_start_ms.load(std::memory_order_relaxed);
+        const uint32_t frames =
+            g_transaction_frames.load(std::memory_order_relaxed);
         const int32_t state = auth_state();
         LOGE("23.1.3-local-backend: auth scene destroyed before a ready "
              "session was observed -- %" PRIu64 " ms and %u frame(s) after "
              "Start, still state=%d/%s ready=%d",
-             started != 0u && now >= started ? now - started : 0u,
-             g_transaction_frames.load(std::memory_order_relaxed), state,
-             state_name(state), session_ready_flag() ? 1 : 0);
+             started != 0u && now >= started ? now - started : 0u, frames,
+             state, state_name(state), session_ready_flag() ? 1 : 0);
+        log_completion_chain("scene destroyed;", frames);
     }
+    g_completion_object.store(nullptr, std::memory_order_release);
+    g_iterator_state.store(INT32_MIN, std::memory_order_relaxed);
 }
 
 } // namespace detail
@@ -369,8 +552,14 @@ inline bool install_hooks() {
         return false;
     }
 
-    LOGI("23.1.3-local-backend: armed mapped stock completion coroutine; "
-         "offline callback and retired auth transport are not used");
+    if (il2cpp::class_get_name == nullptr) {
+        LOGW("23.1.3-local-backend: il2cpp_class_get_name is not bound; "
+             "completion iterator classes will be logged as <unnamed>");
+    }
+
+    LOGI("23.1.3-local-backend: armed mapped stock completion coroutine with "
+         "live iterator introspection; offline callback and retired auth "
+         "transport are not used");
     return true;
 }
 
