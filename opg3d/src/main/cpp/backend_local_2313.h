@@ -15,50 +15,50 @@
 // f0a130c4e8d9487059eab4b0f08462f6aa7d057510cada0fd6fb3043c77deb5c).
 //
 // Obfuscated names are version-local lookup keys only. Their roles were mapped
-// from 16.1.0 -> 21.2.3 -> 23.1.3 by method order/signature, iterator state
-// machines and native call graph. No ARM32 RVA, opcode or field offset is used.
+// from the supplied dump.cs plus the A64 call graph of this exact binary. No
+// RVA, opcode or field offset is used at runtime: every entry point is resolved
+// by metadata name through IL2CPP. The RVAs in the comments are analysis
+// references for reviewers, nothing reads them.
+// docs/PORT_23_1_3_AUTH_COMPLETION.md carries the full evidence.
 //
-// Awake stays stock. Start's retired transport route is suppressed and the
-// controller's own successful-completion IEnumerator is scheduled through
-// Unity's uniquely named StartCoroutine_Auto(IEnumerator) overload. The stock
-// completion state machine publishes the auth flags and chooses tutorial/menu.
+// Why the boot parked at 90% (logcat_2026-08-22_19-55-26.txt): the previous
+// revision suppressed AuthSceneController.Start completely and started the
+// completion coroutine by hand. In this build Start (0x3DC1BCC) tail-calls the
+// auth state dispatcher (0x3DC1F38) with the static AuthSceneState, and the
+// dispatcher is the only thing that moves the state; the completion iterator
+// (MoveNext 0x3DC9320) sets the session-ready bool, clears the offline flag,
+// commits Storager and drives the loading bar, but never writes the state. So
+// the coroutine ran to its end (state 1 -> -1 after 72 frames, awaiting no
+// Task), the state stayed 0/Initial forever, publish_if_ready() -- which needs
+// ready && (FullySynchronized || Empty) -- could never become true, and the
+// transaction parked until the fail-closed timeout while the loading screen
+// sat at 90%.
 //
-// Status after logcat_2026-08-22_18-10-20.txt: the loading screen itself is
-// fixed. The guard skips InitializeSwitcher state 35 (bar=0.450), the iterator
-// finishes on its own at state 45 (bar=0.750) and the LoadMainMenu tail
-// completes (state 1 -> 2) without the v1 NullReferenceException. Everything
-// the player still sees as a frozen loading screen happens in this scene:
+// This revision therefore:
+//   1. runs the stock Start, so the FpsManager setup, loading bar, coroutine
+//      cleanup, UI reset and the dispatcher all happen as in the stock build;
+//   2. avoids the retired transport at the branch that selects it, by forcing
+//      the persisted local-session gate (0x2B71728) the dispatcher consults to
+//      true while, and only while, the local auth transaction is active -- the
+//      stock "a local session already exists" route;
+//   3. publishes the session explicitly through the controller's own static
+//      setters (session-ready = true, AuthSceneState = FullySynchronized) once
+//      the coroutine has ended, instead of waiting for a transition that
+//      nothing in this build performs;
+//   4. keeps every step bounded and fail-soft: hand-scheduling if the
+//      dispatcher never created the iterator, one invocation of the stock
+//      post-auth continuation if the scene still does not move, and the
+//      existing fail-closed timeout.
 //
-//   +011917ms AuthSceneController.Awake
-//   +012044ms completion scheduled; state=0/Initial ready=1
-//   +014636ms auth scene destroyed before a ready session was observed
-//             (2592 ms and 98 frames after Start, still state=0/Initial)
-//   +014721ms auth scene restarted (instance #2)
-//   +024550ms completion still pending after 300 frames (state=0/Initial ready=1)
-//
-// The decisive observation is a negative one: the direct AuthSceneState setter
-// is hooked from +001265 ms and does not fire a single time in the whole
-// capture. The state is not advancing slowly, it never moves at all. So the
-// scheduled completion machine parks on its very first await, and
-// publish_if_ready() -- which needs ready && (FullySynchronized || Empty) --
-// can never become true no matter how long the scene lives.
-//
-// Six completion iterators of this controller await a Task that only the
-// retired backend can complete: three Task<HashSet<string>> remote-slot
-// lookups and three Task<Dictionary<string, object>> progress lookups. The
-// awaited field sits at a different offset in each generated class (0x28,
-// 0x30 or 0x40) and three of them share the name "<task>5__2", so neither an
-// offset nor a name alone identifies the scheduled one.
-//
-// This file therefore does not guess. It reads the identity out of the live
-// object that Start already holds: the generated class of the scheduled
-// iterator, the <>1__state it parks on, the chain of iterators it is yielding
-// on, and the m_stateFlags of every Task in that chain. Every field is
-// resolved by metadata name through IL2CPP, never by a hardcoded offset, and
-// every read is fail-soft: a field the class does not declare is skipped.
-//
-// One capture is now enough to decide whether the fix belongs in the awaited
-// task or in the state machine. No behaviour is changed here.
+// Mapped 23.1.3 entry points (all resolved by metadata name):
+//   AuthSceneController.<completion>()        0x3DC3EE0  iterator factory
+//   AuthSceneController.<versionGate>()       0x3DC5F54  blocker predicate
+//   AuthSceneController.<getState>()          0x3DC0920
+//   AuthSceneController.<setState>(state)     0x3DC0968
+//   AuthSceneController.<getSessionReady>()   0x3DC09BC
+//   AuthSceneController.<setSessionReady>(b)  0x3DC0A04
+//   AuthSceneController.<postAuthContinue>()  0x3DC2CC4  banner + SceneLoader
+//   <settings>.<localSessionGate>()           0x2B71728  PlayerPrefs-backed
 namespace backend_local_2313 {
 namespace detail {
 
@@ -70,6 +70,8 @@ using StartCoroutineFn = void* (*)(void* self, void* iterator,
                                    const MethodInfo* method);
 using StaticGetIntFn = int32_t (*)(const MethodInfo* method);
 using StaticGetBoolFn = bool (*)(const MethodInfo* method);
+using StaticSetIntFn = void (*)(int32_t value, const MethodInfo* method);
+using StaticSetBoolFn = void (*)(bool value, const MethodInfo* method);
 
 inline constexpr const char* kCompletionIteratorMethod =
     u8"\u4e07\u4e15\u4e02\u4e11\u4e04\u4e16\u4e08\u4e01\u4e0c";
@@ -77,16 +79,37 @@ inline constexpr const char* kCompletionBlockerMethod =
     u8"\u4e11\u4e03\u4e0f\u4e09\u4e0c\u4e15\u4e1e\u4e0d\u4e19";
 inline constexpr const char* kStateGetterMethod =
     u8"\u4e12\u4e0e\u4e14\u4e19\u4e1a\u4e01\u4e0f\u4e01\u4e09";
+inline constexpr const char* kStateSetterMethod =
+    u8"\u4e02\u4e19\u4e1d\u4e12\u4e16\u4e07\u4e13\u4e11\u4e1a";
 inline constexpr const char* kSessionReadyGetterMethod =
     u8"\u4e04\u4e0d\u4e18\u4e1d\u4e1a\u4e14\u4e04\u4e01\u4e16";
+inline constexpr const char* kSessionReadySetterMethod =
+    u8"\u4e19\u4e1a\u4e09\u4e0f\u4e19\u4e19\u4e1e\u4e17\u4e0c";
+// Post-auth continuation: NewVersionBanner/VersionBlocker check, then the
+// SceneLoader hand-off out of the auth scene.
+inline constexpr const char* kSceneContinuationMethod =
+    u8"\u4e14\u4e0c\u4e07\u4e18\u4e1a\u4e14\u4e10\u4e05\u4e0d";
+// Static settings holder whose PlayerPrefs-backed predicate the auth
+// dispatcher consults before it chooses a route.
+inline constexpr const char* kLocalSessionGateClass =
+    u8"\u4e19\u4e00\u4e1a\u4e09\u4e05\u4e07\u4e02\u4e19\u4e1e";
+inline constexpr const char* kLocalSessionGateMethod =
+    u8"\u4e14\u4e1c\u4e19\u4e13\u4e11\u4e09\u4e19\u4e06\u4e15";
 
 inline constexpr int32_t kFullySynchronized = 3;
 inline constexpr int32_t kEmpty = 4;
-inline constexpr uint32_t kTimeoutFrames = 3600u;
+
+// Frame budget of one local auth transaction, in Update ticks.
+inline constexpr uint32_t kScheduleGraceFrames = 60u;    // dispatcher grace
+inline constexpr uint32_t kSettleFrames = 30u;           // after MoveNext ends
+inline constexpr uint32_t kPublishDeadlineFrames = 300u; // publish regardless
+inline constexpr uint32_t kContinuationFrames = 900u;    // stock scene hand-off
+inline constexpr uint32_t kTimeoutFrames = 3600u;        // fail closed
 
 // Roslyn iterator fields, resolved by metadata name.
 inline constexpr const char* kIteratorStateField = "<>1__state";
 inline constexpr const char* kIteratorCurrentField = "<>2__current";
+inline constexpr int32_t kIteratorFinished = -1;
 
 // Awaited-task field names used by this controller's completion iterators.
 // "<task>5__2" is declared by four different generated classes at three
@@ -120,15 +143,26 @@ inline const MethodInfo* g_mi_completion_iterator = nullptr;
 inline StartCoroutineFn g_start_coroutine = nullptr;
 inline const MethodInfo* g_mi_start_coroutine = nullptr;
 inline InstanceBoolFn g_completion_blocker = nullptr;
+inline StaticGetBoolFn g_local_session_gate = nullptr;
 inline StaticGetIntFn g_get_state = nullptr;
 inline const MethodInfo* g_mi_get_state = nullptr;
+inline StaticSetIntFn g_set_state = nullptr;
+inline const MethodInfo* g_mi_set_state = nullptr;
 inline StaticGetBoolFn g_get_session_ready = nullptr;
 inline const MethodInfo* g_mi_get_session_ready = nullptr;
+inline StaticSetBoolFn g_set_session_ready = nullptr;
+inline const MethodInfo* g_mi_set_session_ready = nullptr;
+inline InstanceVoidFn g_scene_continuation = nullptr;
+inline const MethodInfo* g_mi_scene_continuation = nullptr;
 
 inline thread_local bool g_starting_locally = false;
 inline std::atomic<bool> g_local_transaction{false};
 inline std::atomic<bool> g_runtime_ready{false};
 inline std::atomic<bool> g_gate_logged{false};
+inline std::atomic<bool> g_local_gate_logged{false};
+inline std::atomic<bool> g_published{false};
+inline std::atomic<bool> g_scheduled_by_hand{false};
+inline std::atomic<bool> g_continuation_done{false};
 inline std::atomic<uint32_t> g_transaction_frames{0u};
 
 // Diagnostics for the auth-scene restart loop.
@@ -137,8 +171,8 @@ inline std::atomic<uint64_t> g_start_ms{0u};
 inline std::atomic<int32_t> g_traced_state{INT32_MIN};
 inline std::atomic<int32_t> g_traced_ready{-1};
 
-// The exact IEnumerator instance handed to Unity, kept so the parked machine
-// can be identified instead of inferred.
+// The exact IEnumerator instance Unity is running, captured from the stock
+// factory so the machine is identified instead of inferred.
 inline std::atomic<void*> g_completion_object{nullptr};
 inline std::atomic<int32_t> g_iterator_state{INT32_MIN};
 
@@ -248,9 +282,20 @@ bool session_ready_flag() {
                : false;
 }
 
+// True once the scheduled completion state machine has run to its end.
+bool completion_finished() {
+    void* node = g_completion_object.load(std::memory_order_acquire);
+    if (node == nullptr) return false;
+    int32_t state = INT32_MIN;
+    if (!read_managed_field<int32_t>(node, kIteratorStateField, &state)) {
+        return false;
+    }
+    return state == kIteratorFinished;
+}
+
 // Walks the yielded-object chain of the scheduled completion iterator. One
 // line per node: which generated class it is, which <>1__state it sits on and
-// the status of the Task it awaits. This is what names the parked machine.
+// the status of the Task it awaits. This is what names a parked machine.
 void log_completion_chain(const char* where, uint32_t frames) {
     void* node = g_completion_object.load(std::memory_order_acquire);
     if (node == nullptr) {
@@ -346,15 +391,95 @@ bool publish_if_ready() {
     const bool first = !g_runtime_ready.exchange(true, std::memory_order_acq_rel);
     g_local_transaction.store(false, std::memory_order_release);
     if (first) {
-        LOGI("23.1.3-local-backend: stock completion published a usable "
-             "session (state=%d/%s readyFlag=1)", state, state_name(state));
+        LOGI("23.1.3-local-backend: the local session is usable (state=%d/%s "
+             "readyFlag=1)", state, state_name(state));
     }
     return true;
 }
 
+// The stock completion coroutine of 23.1.3 sets the session-ready flag but
+// never writes AuthSceneState: that write belongs to Start -> dispatcher,
+// which only the retired transport used to drive to the end. Publish it
+// explicitly through the controller's own static setters. version_2313.h
+// traces the setter, so the write shows up in the next capture.
+bool publish_local_session(const char* why, uint32_t frames) {
+    if (g_published.exchange(true, std::memory_order_acq_rel)) {
+        return publish_if_ready();
+    }
+    if (g_set_state == nullptr || g_mi_set_state == nullptr) {
+        LOGE("23.1.3-local-backend: cannot publish the local session (%s), the "
+             "state setter was not resolved", why);
+        return false;
+    }
+
+    const int32_t before = auth_state();
+    if (!session_ready_flag() && g_set_session_ready != nullptr &&
+        g_mi_set_session_ready != nullptr) {
+        g_set_session_ready(true, g_mi_set_session_ready);
+    }
+    g_set_state(kFullySynchronized, g_mi_set_state);
+
+    const int32_t after = auth_state();
+    LOGW("23.1.3-local-backend: published the local session explicitly (%s "
+         "after %u frame(s); state %d/%s -> %d/%s ready=%d)",
+         why, frames, before, state_name(before), after, state_name(after),
+         session_ready_flag() ? 1 : 0);
+    return publish_if_ready();
+}
+
+// Fallback only: the stock dispatcher normally creates and schedules this
+// iterator. If it did not, schedule it exactly as the previous revision did,
+// so a metadata mismatch degrades instead of hanging.
+bool schedule_completion(void* self, uint32_t frames) {
+    if (self == nullptr || g_completion_iterator == nullptr ||
+        g_mi_completion_iterator == nullptr || g_start_coroutine == nullptr ||
+        g_mi_start_coroutine == nullptr) {
+        return false;
+    }
+    if (g_scheduled_by_hand.exchange(true, std::memory_order_acq_rel)) {
+        return false;
+    }
+
+    g_starting_locally = true;
+    void* iterator = g_completion_iterator(self, g_mi_completion_iterator);
+    void* coroutine =
+        iterator != nullptr
+            ? g_start_coroutine(self, iterator, g_mi_start_coroutine)
+            : nullptr;
+    g_starting_locally = false;
+    if (coroutine == nullptr) {
+        LOGE("23.1.3-local-backend: fallback scheduling of the completion "
+             "coroutine failed after %u frame(s)", frames);
+        return false;
+    }
+
+    g_completion_object.store(iterator, std::memory_order_release);
+    g_iterator_state.store(INT32_MIN, std::memory_order_relaxed);
+    LOGW("23.1.3-local-backend: the stock dispatcher did not schedule the "
+         "completion coroutine within %u frame(s); scheduled it by hand "
+         "(iterator %s)", frames, managed_class_name(iterator));
+    return true;
+}
+
+// The dispatcher asks this persisted predicate before it chooses a route.
+// True means "a local session already exists" and selects the completion
+// coroutine; false selects the retired ping/login transport. Force it only
+// while the one local auth transaction is active.
+bool hook_local_session_gate(const MethodInfo* method) {
+    if (g_local_transaction.load(std::memory_order_acquire)) {
+        if (!g_local_gate_logged.exchange(true, std::memory_order_relaxed)) {
+            LOGI("23.1.3-local-backend: reporting an existing local session to "
+                 "the auth dispatcher for this transaction only");
+        }
+        return true;
+    }
+    return g_local_session_gate != nullptr ? g_local_session_gate(method)
+                                           : false;
+}
+
 // The completion coroutine asks a VersionBlocker-backed predicate before it
-// can publish FullySynchronized. Ignore that retired backend decision only
-// while the one local completion transaction is active.
+// can finish. Ignore that retired backend decision only while the one local
+// completion transaction is active.
 bool hook_completion_blocker(void* self, const MethodInfo* method) {
     if (g_local_transaction.load(std::memory_order_acquire)) {
         if (!g_gate_logged.exchange(true, std::memory_order_relaxed)) {
@@ -368,28 +493,51 @@ bool hook_completion_blocker(void* self, const MethodInfo* method) {
                : true;
 }
 
+// Captures the iterator the stock dispatcher creates, so introspection keeps
+// working without this module scheduling anything itself.
+void* hook_completion_factory(void* self, const MethodInfo* method) {
+    void* iterator = g_completion_iterator != nullptr
+                         ? g_completion_iterator(self, method)
+                         : nullptr;
+    if (iterator != nullptr &&
+        g_local_transaction.load(std::memory_order_acquire)) {
+        g_completion_object.store(iterator, std::memory_order_release);
+        g_iterator_state.store(INT32_MIN, std::memory_order_relaxed);
+        LOGI("23.1.3-local-backend: the stock dispatcher created the "
+             "completion iterator %s (%p)", managed_class_name(iterator),
+             iterator);
+    }
+    return iterator;
+}
+
 void hook_auth_start(void* self, const MethodInfo* method) {
-    (void)method;
-    if (self == nullptr || g_completion_iterator == nullptr ||
-        g_mi_completion_iterator == nullptr || g_start_coroutine == nullptr ||
-        g_mi_start_coroutine == nullptr) {
-        LOGE("23.1.3-local-backend: completion dependencies missing; "
-             "retired transport remains blocked");
+    if (g_auth_start == nullptr) {
+        LOGE("23.1.3-local-backend: the stock Auth Start is unavailable; the "
+             "auth scene cannot be driven");
         return;
     }
-    if (g_starting_locally) return;
+    if (self == nullptr || g_starting_locally) {
+        g_auth_start(self, method);
+        return;
+    }
 
     bool expected = false;
     if (!g_local_transaction.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel)) {
-        LOGW("23.1.3-local-backend: duplicate AuthSceneController.Start "
-             "ignored while local completion is active");
+        LOGW("23.1.3-local-backend: duplicate AuthSceneController.Start while a "
+             "local transaction is active; running the stock Start only");
+        g_starting_locally = true;
+        g_auth_start(self, method);
+        g_starting_locally = false;
         return;
     }
 
-    g_starting_locally = true;
     g_transaction_frames.store(0u, std::memory_order_relaxed);
     g_gate_logged.store(false, std::memory_order_relaxed);
+    g_local_gate_logged.store(false, std::memory_order_relaxed);
+    g_published.store(false, std::memory_order_relaxed);
+    g_scheduled_by_hand.store(false, std::memory_order_relaxed);
+    g_continuation_done.store(false, std::memory_order_relaxed);
     g_traced_state.store(INT32_MIN, std::memory_order_relaxed);
     g_traced_ready.store(-1, std::memory_order_relaxed);
     g_completion_object.store(nullptr, std::memory_order_release);
@@ -400,38 +548,29 @@ void hook_auth_start(void* self, const MethodInfo* method) {
     const uint32_t instance = g_scene_instances.fetch_add(1u) + 1u;
     if (instance > 1u) {
         LOGE("23.1.3-local-backend: auth scene restarted (instance #%u) %" PRIu64
-             " ms after the previous Start; the previous completion never "
+             " ms after the previous Start; the previous transaction never "
              "published a session",
              instance, previous != 0u && now >= previous ? now - previous : 0u);
     }
 
     const int32_t before = auth_state();
-    LOGW("23.1.3-local-backend: suppressing retired Auth Start transport; "
-         "scheduling mapped stock completion (before=%d/%s)",
-         before, state_name(before));
+    LOGW("23.1.3-local-backend: running the stock Auth Start on the "
+         "local-session route (before=%d/%s ready=%d)",
+         before, state_name(before), session_ready_flag() ? 1 : 0);
 
-    void* iterator = g_completion_iterator(self, g_mi_completion_iterator);
-    if (iterator == nullptr) {
-        g_local_transaction.store(false, std::memory_order_release);
-        g_starting_locally = false;
-        LOGE("23.1.3-local-backend: stock completion returned null iterator");
-        return;
-    }
-    g_completion_object.store(iterator, std::memory_order_release);
-
-    void* coroutine = g_start_coroutine(self, iterator, g_mi_start_coroutine);
+    // The stock Start prepares the scene and tail-calls the auth state
+    // dispatcher, which schedules the completion coroutine because the local
+    // session gate above answers true for this transaction.
+    g_starting_locally = true;
+    g_auth_start(self, method);
     g_starting_locally = false;
-    if (coroutine == nullptr) {
-        g_local_transaction.store(false, std::memory_order_release);
-        g_completion_object.store(nullptr, std::memory_order_release);
-        LOGE("23.1.3-local-backend: Unity rejected the completion iterator");
-        return;
-    }
 
-    LOGI("23.1.3-local-backend: stock completion coroutine accepted (%p); "
-         "iterator %s (%p)", coroutine, managed_class_name(iterator), iterator);
-    trace_transition("completion scheduled;", 0u);
-    log_completion_chain("completion scheduled;", 0u);
+    trace_transition("stock Start returned;", 0u);
+    trace_iterator("stock Start returned;", 0u);
+    if (g_completion_object.load(std::memory_order_acquire) == nullptr) {
+        LOGW("23.1.3-local-backend: the stock Start did not schedule a "
+             "completion coroutine yet; Update will retry");
+    }
     (void)publish_if_ready();
 }
 
@@ -446,6 +585,40 @@ void hook_auth_update(void* self, const MethodInfo* method) {
     // One line per real transition of the stock machine; silent while parked.
     trace_transition("completion advanced to", frames);
     trace_iterator("completion", frames);
+
+    // Step 1: the dispatcher should have scheduled the coroutine by now.
+    if (frames == kScheduleGraceFrames &&
+        g_completion_object.load(std::memory_order_acquire) == nullptr) {
+        (void)schedule_completion(self, frames);
+    }
+
+    // Step 2: publish once the machine has finished, or when it overruns its
+    // budget. The coroutine of this build never publishes the state itself.
+    const bool finished = completion_finished();
+    if ((finished && frames >= kSettleFrames) ||
+        frames >= kPublishDeadlineFrames) {
+        const char* why =
+            finished ? "the completion coroutine ended without a state write"
+                     : "the completion coroutine overran its frame budget";
+        if (publish_local_session(why, frames)) return;
+    }
+
+    // Step 3: the session is published but the scene is still up, so run the
+    // stock post-auth continuation (version banner check + SceneLoader) once.
+    if (frames >= kContinuationFrames &&
+        g_published.load(std::memory_order_acquire) &&
+        !g_continuation_done.exchange(true, std::memory_order_acq_rel)) {
+        if (g_scene_continuation != nullptr &&
+            g_mi_scene_continuation != nullptr) {
+            LOGW("23.1.3-local-backend: the auth scene is still alive %u "
+                 "frame(s) after the session was published; invoking the stock "
+                 "post-auth continuation once", frames);
+            g_scene_continuation(self, g_mi_scene_continuation);
+        } else {
+            LOGE("23.1.3-local-backend: the stock post-auth continuation was "
+                 "not resolved; the scene hand-off is left to the game");
+        }
+    }
 
     if (frames == kChainReportFrames) {
         const int32_t state = auth_state();
@@ -469,8 +642,11 @@ void hook_auth_update(void* self, const MethodInfo* method) {
 }
 
 void hook_auth_destroy(void* self, const MethodInfo* method) {
-    if (g_local_transaction.load(std::memory_order_acquire)) {
-        (void)publish_if_ready();
+    if (g_local_transaction.load(std::memory_order_acquire) &&
+        !publish_if_ready() && completion_finished()) {
+        (void)publish_local_session(
+            "the auth scene is being destroyed",
+            g_transaction_frames.load(std::memory_order_relaxed));
     }
     if (g_auth_destroy != nullptr) g_auth_destroy(self, method);
     const bool was_active =
@@ -512,13 +688,19 @@ inline bool install_hooks() {
         {"", "AuthSceneController", detail::kStateGetterMethod, 0},
         reinterpret_cast<void**>(&detail::g_get_state),
         &detail::g_mi_get_state);
+    // The completion coroutine of this build never writes the state, so the
+    // setter is a hard dependency of the local route, not a diagnostic.
+    resolved &= detail::resolve_call(
+        {"", "AuthSceneController", detail::kStateSetterMethod, 1},
+        reinterpret_cast<void**>(&detail::g_set_state),
+        &detail::g_mi_set_state);
     resolved &= detail::resolve_call(
         {"", "AuthSceneController", detail::kSessionReadyGetterMethod, 0},
         reinterpret_cast<void**>(&detail::g_get_session_ready),
         &detail::g_mi_get_session_ready);
     // StartCoroutine has two one-argument overloads. The obsolete _Auto entry
     // has a unique name and the exact IEnumerator ABI, avoiding an ambiguous
-    // args-count-only lookup.
+    // args-count-only lookup. Only the fallback path uses it.
     resolved &= detail::resolve_call(
         {"UnityEngine", "MonoBehaviour", "StartCoroutine_Auto", 1},
         reinterpret_cast<void**>(&detail::g_start_coroutine),
@@ -528,7 +710,38 @@ inline bool install_hooks() {
         return false;
     }
 
-    const bool blocker = hook::install(
+    // Optional: publication works without them, they only make it tidier.
+    if (!detail::resolve_call(
+            {"", "AuthSceneController", detail::kSessionReadySetterMethod, 1},
+            reinterpret_cast<void**>(&detail::g_set_session_ready),
+            &detail::g_mi_set_session_ready)) {
+        LOGW("23.1.3-local-backend: the session-ready setter is unavailable; "
+             "only the state will be published");
+    }
+    if (!detail::resolve_call(
+            {"", "AuthSceneController", detail::kSceneContinuationMethod, 0},
+            reinterpret_cast<void**>(&detail::g_scene_continuation),
+            &detail::g_mi_scene_continuation)) {
+        LOGW("23.1.3-local-backend: the post-auth continuation is unavailable; "
+             "the scene hand-off is left to the game");
+    }
+
+    // Optional: without it the dispatcher may still pick the retired transport
+    // branch, and the explicit publication below is what keeps the boot alive.
+    const bool gate = hook::install(
+        {"", detail::kLocalSessionGateClass, detail::kLocalSessionGateMethod, 0},
+        detail::replacement(&detail::hook_local_session_gate),
+        detail::original_slot(&detail::g_local_session_gate), false);
+    if (!gate) {
+        LOGW("23.1.3-local-backend: the local-session gate could not be "
+             "hooked; the dispatcher may choose the retired transport branch");
+    }
+
+    const bool factory = hook::install(
+        {"", "AuthSceneController", detail::kCompletionIteratorMethod, 0},
+        detail::replacement(&detail::hook_completion_factory),
+        detail::original_slot(&detail::g_completion_iterator), true);
+    const bool blocker = factory && hook::install(
         {"", "AuthSceneController", detail::kCompletionBlockerMethod, 0},
         detail::replacement(&detail::hook_completion_blocker),
         detail::original_slot(&detail::g_completion_blocker), true);
@@ -545,10 +758,10 @@ inline bool install_hooks() {
         {"", "AuthSceneController", "Start", 0},
         detail::replacement(&detail::hook_auth_start),
         detail::original_slot(&detail::g_auth_start), true);
-    if (!blocker || !update || !destroy || !start) {
-        LOGE("23.1.3-local-backend: hooks incomplete (blocker=%d update=%d "
-             "destroy=%d start=%d)", blocker ? 1 : 0, update ? 1 : 0,
-             destroy ? 1 : 0, start ? 1 : 0);
+    if (!factory || !blocker || !update || !destroy || !start) {
+        LOGE("23.1.3-local-backend: hooks incomplete (factory=%d blocker=%d "
+             "update=%d destroy=%d start=%d)", factory ? 1 : 0,
+             blocker ? 1 : 0, update ? 1 : 0, destroy ? 1 : 0, start ? 1 : 0);
         return false;
     }
 
@@ -557,9 +770,9 @@ inline bool install_hooks() {
              "completion iterator classes will be logged as <unnamed>");
     }
 
-    LOGI("23.1.3-local-backend: armed mapped stock completion coroutine with "
-         "live iterator introspection; offline callback and retired auth "
-         "transport are not used");
+    LOGI("23.1.3-local-backend: armed the stock auth state machine on the "
+         "local-session route (gate=%d) with explicit session publication; "
+         "the retired auth transport is not used", gate ? 1 : 0);
     return true;
 }
 
