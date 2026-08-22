@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "16.1.1 Photon online + battle UI v2"
+#define OPG3D_BUILD_TAG "16.1.1 Photon online + click bridge v3"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__
