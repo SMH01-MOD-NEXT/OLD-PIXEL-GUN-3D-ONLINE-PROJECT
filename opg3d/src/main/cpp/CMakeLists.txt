@@ -107,12 +107,13 @@ target_include_directories(shadowhook_static
 target_link_libraries(shadowhook_static PUBLIC log dl)
 
 # --- Our library --------------------------------------------------------------
+# photon_hooks.cpp is the legacy 13.2.1 ARM32 implementation and is
+# intentionally excluded from this 23.1.3 ARM64 bootstrap.
 add_library(opg3d SHARED
     main.cpp
     elf_sym.cpp
     il2cpp.cpp
     hook.cpp
-    photon_hooks.cpp
 )
 
 target_include_directories(opg3d PRIVATE .)
