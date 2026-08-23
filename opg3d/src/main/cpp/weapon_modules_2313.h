@@ -165,7 +165,7 @@ constexpr bool contains_bytes(const char* haystack, const char* needle) {
 }
 
 // U+5341 十, the character revision 1 substituted for 丐 and 丒.
-constexpr const char* kMojibake = "\\xE5\\x8D\\x81";
+constexpr const char* kMojibake = "\xE5\x8D\x81";
 
 static_assert(!contains_bytes(kCurrentLevel, kMojibake) &&
                   !contains_bytes(kModuleClass, kMojibake) &&
@@ -181,43 +181,43 @@ static_assert(!contains_bytes(kCurrentLevel, kMojibake) &&
 
 static_assert(
     equal_bytes(kCurrentLevel,
-                "\\xE4\\xB8\\x83"   // U+4E03 七
-                "\\xE4\\xB8\\x94"   // U+4E14 且
-                "\\xE4\\xB8\\x90"   // U+4E10 丐  (revision 1 corrupted this)
-                "\\xE4\\xB8\\x9C"   // U+4E1C 东
-                "\\xE4\\xB8\\x92"   // U+4E12 丒  (revision 1 corrupted this)
-                "\\xE4\\xB8\\x86"   // U+4E06 丆
-                "\\xE4\\xB8\\x91"   // U+4E11 丑
-                "\\xE4\\xB8\\x88"   // U+4E08 丈
-                "\\xE4\\xB8\\x87"), // U+4E07 万
+                "\xE4\xB8\x83"   // U+4E03 七
+                "\xE4\xB8\x94"   // U+4E14 且
+                "\xE4\xB8\x90"   // U+4E10 丐  (revision 1 corrupted this)
+                "\xE4\xB8\x9C"   // U+4E1C 东
+                "\xE4\xB8\x92"   // U+4E12 丒  (revision 1 corrupted this)
+                "\xE4\xB8\x86"   // U+4E06 丆
+                "\xE4\xB8\x91"   // U+4E11 丑
+                "\xE4\xB8\x88"   // U+4E08 丈
+                "\xE4\xB8\x87"), // U+4E07 万
     "kCurrentLevel must stay byte-identical to 0x024B0BB0 as spelled in the "
     "23.1.3 metadata; a corrupted identifier silently disables the module");
 
 static_assert(
     equal_bytes(kInventoryModules,
-                "\\xE4\\xB8\\x85"   // U+4E05 丅
-                "\\xE4\\xB8\\x8E"   // U+4E0E 与
-                "\\xE4\\xB8\\x96"   // U+4E16 世
-                "\\xE4\\xB8\\x95"   // U+4E15 丕
-                "\\xE4\\xB8\\x9A"   // U+4E1A 业
-                "\\xE4\\xB8\\x98"   // U+4E18 丘
-                "\\xE4\\xB8\\x8D"   // U+4E0D 不
-                "\\xE4\\xB8\\x82"   // U+4E02 丂
-                "\\xE4\\xB8\\x88"), // U+4E08 丈
+                "\xE4\xB8\x85"   // U+4E05 丅
+                "\xE4\xB8\x8E"   // U+4E0E 与
+                "\xE4\xB8\x96"   // U+4E16 世
+                "\xE4\xB8\x95"   // U+4E15 丕
+                "\xE4\xB8\x9A"   // U+4E1A 业
+                "\xE4\xB8\x98"   // U+4E18 丘
+                "\xE4\xB8\x8D"   // U+4E0D 不
+                "\xE4\xB8\x82"   // U+4E02 丂
+                "\xE4\xB8\x88"), // U+4E08 丈
     "kInventoryModules must stay byte-identical to ModulesController +0x30, "
     "the List<module> every storage reader enumerates");
 
 static_assert(
     equal_bytes(kInventorySets,
-                "\\xE4\\xB8\\x8B"   // U+4E0B 下
-                "\\xE4\\xB8\\x98"   // U+4E18 丘
-                "\\xE4\\xB8\\x8C"   // U+4E0C 丌
-                "\\xE4\\xB8\\x80"   // U+4E00 一
-                "\\xE4\\xB8\\x9E"   // U+4E1E 丞
-                "\\xE4\\xB8\\x9B"   // U+4E1B 丛
-                "\\xE4\\xB8\\x82"   // U+4E02 丂
-                "\\xE4\\xB8\\x89"   // U+4E09 三
-                "\\xE4\\xB8\\x97"), // U+4E17 丗
+                "\xE4\xB8\x8B"   // U+4E0B 下
+                "\xE4\xB8\x98"   // U+4E18 丘
+                "\xE4\xB8\x8C"   // U+4E0C 丌
+                "\xE4\xB8\x80"   // U+4E00 一
+                "\xE4\xB8\x9E"   // U+4E1E 丞
+                "\xE4\xB8\x9B"   // U+4E1B 丛
+                "\xE4\xB8\x82"   // U+4E02 丂
+                "\xE4\xB8\x89"   // U+4E09 三
+                "\xE4\xB8\x97"), // U+4E17 丗
     "kInventorySets must stay byte-identical to ModulesController +0x38");
 
 // ---------------------------------------------------------------------------
