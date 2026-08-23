@@ -130,7 +130,7 @@ void* init_thread(void*) {
     const bool progression     = progression_2313::install_hooks();
     const bool crafting        = crafting_2313::install_hooks();
     const bool lobby_catalog   = lobby_catalog_2313::install_hooks();
-    const bool weapon_modules  = weapon_modules_2313::install_hooks();
+    const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&

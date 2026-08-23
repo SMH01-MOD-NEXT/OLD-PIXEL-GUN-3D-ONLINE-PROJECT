@@ -7,6 +7,7 @@
 #include "hook.h"
 #include "il2cpp.h"
 #include "log.h"
+#include "weapon_modules_2313.h"
 
 // Offline progression for the exact supplied 23.1.3 ARM64 libil2cpp.so:
 // currency (coins + gems) and player level.
@@ -243,6 +244,10 @@ inline void maybe_grant() {
 inline void menu_update_hook(void* self, void* method) {
     reinterpret_cast<InstanceVoidFn>(g_menu_update_orig)(self, method);
     maybe_grant();
+    // The module inventory grant runs stock managed transactions, so it
+    // needs a game thread and a live main menu: this Update slot is the
+    // only such point this port already owns.
+    weapon_modules_2313::pump_from_main_menu();
 }
 
 inline bool install() {
