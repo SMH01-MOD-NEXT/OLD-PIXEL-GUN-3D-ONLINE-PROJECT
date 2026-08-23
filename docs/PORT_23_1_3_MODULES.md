@@ -1,192 +1,158 @@
-# Модули оружия — порт 23.1.3 (arm64-v8a)
+# Pixel Gun 3D 23.1.3 ARM64 — weapon and armor modules
 
-## Задача
+This document describes only the weapon and armor module unlock in
+`weapon_modules_2313.h`. Module crafting, weapon crafting, clan crafting, and
+per-item equipped-module state are outside this change.
 
-В сборке 23.1.3 модули оружия падали и отключались. Требуется: все модули
-добавляются игроку и все имеют **10 уровень (X)**.
+## Scope
 
-## Текущий статус
+The 23.1.3 `ModuleData.ModuleCategory` values are:
 
-| Требование | Состояние |
+| Value | Category |
+|---:|---|
+| 1 | Primary |
+| 2 | Backup |
+| 3 | Melee |
+| 4 | Special |
+| 5 | Sniper |
+| 6 | Premium |
+| 7 | Armor |
+
+All seven categories use the same `PGCompany` module class, so the two hooks in
+this port cover both weapon modules and armor modules. The catalog contains 42
+module definitions in total.
+
+## Verified target
+
+The implementation is branch-specific and was verified against the installed
+23.1.3 ARM64 package:
+
+| Artifact | SHA-256 |
 |---|---|
-| Уровень модулей = X | ✅ подтверждено на устройстве |
-| Хуки не падают и не отключаются | ✅ подтверждено |
-| Игра не падает на старте | ✅ исправлено в r5 (r4 крашил сплеш) |
-| Каталог 42 модуля + 42 набора читается в рантайме | ✅ подтверждено в r3 |
-| Модули в инвентаре «Арсенал → Модули» | 🟡 r5, ждёт теста |
+| `libil2cpp.so` | `f0a130c4e8d9487059eab4b0f08462f6aa7d057510cada0fd6fb3043c77deb5c` |
+| `global-metadata.dat` | `28b8bddf53a8ebdaf70aec1e672d3bdea6e46ca2b2e478f1b7e66e69884c99dd` |
+| ELF Build ID | `57fcc18d2db06212416d480d53c0f881ee47c52a` |
 
-## Два разных списка
+The pre-existing `analys2313/dump1321.cs` identifies itself as 13.2.1, and the
+pre-existing `analys2313/libil2cpp.so` is a 32-bit ARM ELF. Neither matches the
+23.1.3 ARM64 target. The exact installed APK was therefore extracted from the
+connected test device and used to regenerate the 23.1.3 dump. No address or
+managed identifier from the 13.2.1 artifacts is used by this fix.
 
-Главная ошибка этой работы: «модули игрока» и «модули предмета» — разные
-сущности.
+## Root cause
 
-| Список | Где живёт | Смысл |
-|---|---|---|
-| Инвентарь | `ModulesController` `+0x30` / `+0x38` | что есть у игрока |
-| Установленные | `丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟()` `0x28DB524` | что вставлено в **один** предмет |
+The previous implementation treated these `ModulesController` fields as owned
+inventory:
 
-`丟丅丁不丄丟不丑丁` (TypeDefIndex 12005) — модель хранилища одного предмета:
-
-```
-int                              <id>       @ 0x10
-ModuleData.ModuleRarity          <rarity>   @ 0x14
-ModuleData.ModuleCategory        <category> @ 0x18
-Dictionary<string, module>       slots      @ 0x20
-丅丏丏丛丕丁丟上丞 itemRecord()                 0x28DB2F8
+```text
++0x30  List<module>
++0x38  List<moduleSet>
 ```
 
-`七丌丑世丂丟丞丞丟()` — единственный во всём образе вызывающий
-`专丂丄丈一丂世丑丏.丆丌丌丆且丙七丌丞(int)` (`0x171F9D8`), то есть выборку профильных
-записей по id предмета.
+That interpretation is incorrect for 23.1.3. `ModulesController.OnInstanceCreated`
+clears and materializes the normal definition lists from `ModulesContainer`.
+They already contain 42 module entries before the mod attempts a grant.
 
-## Карта данных
+A separate static catalog also contains 42 module objects, but they are
+different managed instances. `List<T>.Contains` compares those objects by
+reference, so appending the static catalog reports:
 
-| RVA | Значение | Прямых вызовов |
-|---|---|---|
-| `0x24B0BB0` | `module.七且丐东丒丆丑丈万()` — уровень | 24 |
-| `0x2EF431C` → `0x2F399B0` | `.cctor` каталога (42 + 42) | — |
-| `0x3048A5C` / `0x3048AB4` | каталог: модули / наборы | 0 / 0 |
-| `0x281473C` / `0x2814784` | геттеры инвентаря (заинлайнены) | **0 / 0** |
-| `0x2814810` | `ModulesController.OnInstanceCreated()` | 0 |
-| `0x28DCBB4` | `ModuleStorageView.上专丅丑丘丟丙东与()` | 0 |
-| `0x23B6680` | `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与()` | — |
-| `0x23BA03C` | `ModuleInsertPanel.上丘与丛丝业丆万丁()` | — |
-| `0x28DB524` | `model.七丌丑世丂丟丞丞丟()` — цель r3, снята | 34 |
-| `0x171F9D8` | `профиль.丆丌丌丆且丙七丌丞(int)` | 1 (из `0x28DB524`) |
-
-Поля `ModulesController`: `+0x18 ModulesContainer`, `+0x20` и `+0x28` словари,
-**`+0x30 List<module> 丅与世丕业丘不丂丈`**, **`+0x38 List<moduleSet> 下丘丌一丞丛丂三丗`**,
-`+0x40` / `+0x48` карты моделей предметов.
-
-## История ревизий
-
-### r1 — хук не встал
-
-Find/replace испортил два символа в имени геттера уровня: `丐` (U+4E10) и
-`丒` (U+4E12) стали `十` (U+5341). U+5341 не встречается в дампе 23.1.3 ни
-разу, длина в байтах сохранилась, обязательный хук не разрешился и модуль
-отключился целиком. Лечится пином точных байтов через `static_assert`.
-
-### r2 — запись в нечитаемые поля
-
-Каталог писался в `+0x40` / `+0x48` — это карты моделей предметов, а не
-инвентарь. No-op на экране.
-
-### r3 — мерж сработал, но не туда
-
-Каталог вливался в `0x28DB524`, то есть в список модулей, установленных на
-текущем предмете. На устройстве: панель `Module Effects` переполнилась и
-наложила эффекты друг на друга, вся сетка погасла с `Same mod type already in
-use`, счётчик инвентаря не изменился. Побочная польза: доказано, что чтение
-каталога из хука UI-потока полностью безопасно.
-
-### r4 — краш на старте
-
-`install()` заканчивался проверкой каталога. Первое чтение статического
-списка каталога запускает его `.cctor`, а тот тянет определения модулей через
-`PGCompany.AssetBundles_v3` → выборку конфига. На ~950 мс после старта
-процесса этот слой ещё не поднят:
-
-```
-E/Unity  Settings are null.
-         PGCompany.AssetBundles_v3.丏丄丛丟丏丛上专丁:上丈丛丁丕丟且上业(String, String, T&, String&)
-E/CRASH  signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x68
-         Cause: null pointer dereference
-         #00 pc 00000000004e975c  /apex/com.android.art/lib64/libart.so
+```text
+modules 42 +42 -> 84
 ```
 
-Поток `Thread-20` — это bootstrap-поток `init_thread`. Он привязан к рантайму
-IL2CPP через `il2cpp_thread_attach`, но **никогда не привязан к JVM**, поэтому
-любой managed-путь, доходящий до JNI, получает нулевой `JNIEnv` и роняет
-процесс внутри `libart`. В логе видно, что установка хуков успела пройти
-полностью (`inventory routes installed 4/4`), а строки `armed:` уже нет — это
-и локализует краш до одной инструкции.
+This is duplicate catalog data, not ownership. The old `>= 42` completion check
+then produced a false success result even though the authoritative ownership
+path had not changed.
 
-### r5 — managed-код только с игровых потоков
+## Authoritative ownership path
 
-1. `verify_catalog()` убран из `install()`; стал ленивым одноразовым
-   `verify_catalog_once()` и вызывается из `grant_inventory()`.
-2. `install()` запоминает свой `pthread_self()`, а `managed_calls_allowed()`
-   отклоняет любой managed-вызов, пришедший с этого потока.
-3. `install()` теперь делает только резолв метаданных и патч кода.
+The relevant 23.1.3 methods are:
 
-Маршруты гранта (все — на игровых потоках):
+| Role | Managed identifier | RVA |
+|---|---|---:|
+| Module inventory count | `与丏一丗七丝一七丏()` | `0x024B0C38` |
+| Module current level | `七且丐东丒丆丑丈万()` | `0x024B0BB0` |
+| Progress level lookup | `Progress.丟一业丏一万万专丌::丁丒万不丙丛丂丏丗(module)` | `0x0171EEE4` |
+| Stock progress increment | `Progress.丟一业丏一万万专丌::东东一丝丆与专丑且(module)` | `0x0171EFA8` |
 
-| Маршрут | Когда |
-|---|---|
-| `ModulesController.OnInstanceCreated` | захват синглтона, грант после оригинала |
-| `ModuleStorageView.上专丅丑丘丟丙东与` | перед перестроением сетки |
-| `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与` | перед обновлением экрана |
-| `ModuleInsertPanel.上丘与丛丝业丆万丁` | перед панелью вставки |
-| `MainMenuController.Update` | пульс каждые 30 кадров |
+The current-level method first calls the inventory-count method. If the result
+is below one, it returns level zero without consulting the module Progress
+store. Only an owned module reaches the Progress lookup.
 
-Объект списка никогда не подменяется — только `Contains` + `Add`, иначе
-заинлайненные читатели остались бы со старой ссылкой. Модели предметов не
-трогаются вообще.
+That gate explains the reported symptom: the old level hook made level X work
+for modules already shown, while armory paths that queried the raw inventory
+count still rejected missing weapon and armor modules.
 
-## Защита от регресса r1
+The stock progress increment is not used as a bootstrap grant here. It writes
+persistent Progress state, derives the next value through the current-level
+method, and emits stock events once per increment. Calling it in a bulk unlock
+would mix a process-local mod with profile mutation and could over-increment
+while a level hook is active.
 
-* `static_assert` пинит точные UTF-8 байты `kCurrentLevel`, `kInventoryModules`
-  и `kInventorySets`;
-* отдельный `static_assert` проверяет, что ни в одном из девяти обфусцированных
-  имён нет байтов U+5341.
+## Implemented fix
 
-Любая порча имени ломает сборку, а не устройство.
+`weapon_modules_2313.h` installs two required hooks:
 
-## Как проверять
+1. **Inventory count:** call the stock method and change only `0` to `1`.
+2. **Current level:** call the stock method and clamp values below `10` to `10`.
 
+The controller and static catalog lists are never modified. This keeps the
+normal 42-definition catalog, avoids reference duplicates, and makes the
+stock ownership gate consistently report every weapon and armor module as
+available.
+
+### Safety properties
+
+- Existing positive inventory quantities are preserved.
+- Negative initialization/error sentinels are preserved by the count hook.
+- Levels above 10 are preserved; lower values are promoted to 10.
+- The original functions still run, preserving their normal read-side behavior.
+- No Progress/profile value is written.
+- `ModulesContainer`, module sets, and per-item equipped-module storage remain
+  untouched.
+- No managed method is invoked from the bootstrap thread. The logic runs only
+  when the game calls the hooked methods on its own threads.
+- Both hooks are required. A missing class, method, or trampoline makes module
+  installation fail closed.
+- Exact UTF-8 byte assertions protect all obfuscated identifiers from visual
+  transcription errors.
+
+## Runtime diagnostics
+
+Expected installation lines:
+
+```text
+23.1.3-modules.inventory-count: installed
+23.1.3-modules.current-level: installed
+23.1.3-modules: armed: weapon and armor definitions remain in the stock catalog; zero inventory counts become one and levels are clamped to X
 ```
-g++ -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion \
-    -Werror -fsyntax-only tu.cpp
+
+When previously missing modules are evaluated, the first calls also report:
+
+```text
+23.1.3-modules: inventory count 0 -> 1 (promotion=N)
+23.1.3-modules: level OLD -> 10 (call=N)
 ```
 
-Плюс сверка всех обфусцированных имён с `dump2313.cs` и негативный тест:
-подмена любого символа в пиненой константе на `十` должна валить сборку
-(проверено — по два срабатывания `static_assert` на каждую из трёх констант).
+Logs are sampled after an initial burst so normal armory redraws do not flood
+`logcat`.
 
-На устройстве:
+The obsolete success pattern must not appear:
 
-```
-adb logcat -c
-adb logcat -s OPG3D | grep 23.1.3-modules
-```
-
-Ожидаемая последовательность:
-
-```
-inventory routes installed 4/4
-armed: level X guaranteed, catalogue granted into the ModulesController
-       inventory lists from game threads only (expect 42 modules, 42 module sets)
-modules controller captured
-catalogue verified (42 modules, 42 sets)
-inventory grant (controller ready): modules 4 +38 -> 42, sets 3 +39 -> 42
-module inventory complete (42/42 modules, 42/42 sets)
+```text
+inventory grant ... 42 +42 -> 84
+module inventory complete (84/42 ...)
 ```
 
-Лог нужно снимать **после** захода в «Арсенал → Модули»: строки гранта
-появляются только на игровых потоках, а не во время загрузки.
+## Validation checklist
 
-Диагностика отказов:
-
-| Строка | Что означает |
-|---|---|
-| `managed call refused` | попытка managed-вызова с bootstrap-потока (не должна появляться) |
-| `controller instance not seen yet` | `OnInstanceCreated` не перехвачен |
-| `inventory field missing` | поле `+0x30` не найдено |
-| `inventory list is null` | поле есть, список не создан |
-| `catalogue mismatch` | каталог отдал не 42 + 42 |
-
-## Если счётчик всё ещё не растёт
-
-Следующие цели по приоритету:
-
-1. `ModulesContainer.Modules_v2` `+0x18` и `Storages` `+0x20` через поле
-   `ModulesController.丟三一丄丈丒三丈丞` `+0x18`;
-2. прямой вызов `丝丈丞上一下丅丁丘(module)` `0x281667C` (0 вызывающих, но метод
-   существует);
-3. профильный writer `世丏七丟业业丑丄上(int, int)` `0x172035C`.
-
-Тупики, проверенные и закрытые: `AddAllModulesDEV` и `AddAllMaxModulesDEV` —
-заглушки из 4 байт (`D65F03C0`); `与丕专丐专丐七丗丛` `0x2817230` — 0 вызывающих;
-`0x23B8D34` и `0x2816ED8` — только из `GadgetRecipesUI`; `0x28196BC` — мутирует
-профиль, использовать нельзя.
+1. Build branch `23.1.3` for `arm64-v8a`.
+2. Confirm both required module hooks install.
+3. Open the armory module screens.
+4. Verify all weapon categories and the armor category are populated.
+5. Verify each module reports level X.
+6. Equip weapon and armor modules and reopen the screens to verify stable state.
+7. Confirm the catalog remains at its stock definition count and no `42 -> 84`
+   duplicate append is logged.
+8. Confirm no crafting or per-item module-storage path changed in the diff.

@@ -142,7 +142,7 @@ void* init_thread(void*) {
              "and level progression are granted from the main menu, weapon "
              "and clan crafting run off a local clock and local stock, the "
              "lobby craft catalogue is granted locally, and every weapon "
-             "module is unlocked at level 10");
+             "and armor module is unlocked at level 10");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "

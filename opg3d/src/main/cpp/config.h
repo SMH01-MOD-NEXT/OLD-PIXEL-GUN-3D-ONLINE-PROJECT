@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "23.1.3 ARM64 lobby gate v5 + progression + crafts + modules"
+#define OPG3D_BUILD_TAG "23.1.3 ARM64 lobby gate v5 + progression + crafts + weapon/armor modules"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__

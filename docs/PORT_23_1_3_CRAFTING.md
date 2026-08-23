@@ -97,60 +97,16 @@ off the concrete object with `il2cpp_object_get_class` +
 
 ## 5 — `weapon_modules_2313.h`
 
-`ModulesController : Singleton<ModulesController>` keeps the player's inventory
-in two private lists:
+The weapon and armor module unlock is documented separately in
+[`PORT_23_1_3_MODULES.md`](PORT_23_1_3_MODULES.md). The important correction is
+that the `ModulesController` lists at `+0x30/+0x38` are materialized definition
+lists, not proof of ownership. Appending a second 42-object static catalog only
+created reference duplicates.
 
-```
-private List<module>     <owned modules>   // +0x30
-private List<moduleSet>  <owned sets>      // +0x38
-```
-
-The build also ships a static catalogue class (`PGCompany`, TypeDefIndex 11697)
-whose type initialiser at `0x02EF431C` constructs one instance of **every**
-module — 42 of them — into two static lists that carry the *same* obfuscated
-field names, and therefore the same element types, as the two controller fields
-above. That catalogue is exactly what the stripped `AddAllModulesDEV()` used to
-publish.
-
-So the grant is a list substitution rather than object fabrication:
-
-| Role | Kind | RVA |
-|------|------|-----|
-| Catalogue modules | resolve only, static → `List<module>` | `0x03048A5C` |
-| Catalogue sets | resolve only, static → `List<moduleSet>` | `0x03048AB4` |
-| Owned modules getter | **hook** → catalogue | `0x0281473C` |
-| Owned sets getter | **hook** → catalogue | `0x02814784` |
-| Module current level | **hook** → `clamp(10, max)` | `0x024B13C8` |
-| Module max level | resolve only | `0x024B14EC` |
-
-### Safety properties
-
-* **Never shrinks.** The substitution only happens when the catalogue list is
-  strictly longer than what the game would have returned.
-* **Cannot recurse.** The max-level getter is resolved but never hooked, and its
-  body calls only the owned-count and count→level helpers (`0x024B0BB0`,
-  `0x024B0C38`, `0x024B140C`) — never the current-level getter. A `thread_local`
-  latch additionally keeps the list hooks pass-through while the catalogue type
-  initialiser runs.
-* **Per-module clamp.** Level 10 is clamped to each module's own maximum, so a
-  module whose upgrade table tops out lower reports its real ceiling instead of
-  a level the `Ups` dictionary cannot describe.
-* **No save writes.** Nothing here touches `Progress`, so there is no save
-  round-trip and no cheat-detection churn. The grant is process-scoped.
-
-### Traps avoided
-
-* `ModulesController::AddAllModulesDEV()` `0x028178E4` and
-  `AddAllMaxModulesDEV()` `0x028178E8` are dead single-`RET` stubs
-  (`D65F03C0`). Calling them does nothing.
-* The controller's `add-by-id`-looking method `0x0281702C` is actually a
-  *remove/unequip* path: it resolves an `ItemRecord`, checks
-  `get_Category() == 6`, and ends in the set's remove-module call `0x028DBED0`.
-* `0x0281667C` is a next-level *preview* allocator, not a grant.
-* The catalogue-membership predicate `0x0281661C` is a plain
-  `Dictionary<string, ModuleData>.ContainsKey`. It is **not** hooked: its two
-  callers (`ItemViewer`, `GameEventItem.get_AvailableToDrop`) ask it about
-  arbitrary item ids, so forcing it `true` would misclassify non-module items.
+The corrected implementation leaves the stock catalog untouched and hooks the
+module inventory-count and current-level read paths. It promotes only a zero
+count to one and clamps the reported level to X. It does not modify crafting,
+Progress/profile values, module sets, or per-item equipped-module storage.
 
 ## Metadata name generation
 
