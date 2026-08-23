@@ -7,6 +7,7 @@
 #include "hook.h"
 #include "il2cpp.h"
 #include "log.h"
+#include "weapon_modules_2313.h"
 
 // Offline progression for the exact supplied 23.1.3 ARM64 libil2cpp.so:
 // currency (coins + gems) and player level.
@@ -26,76 +27,39 @@ namespace detail {
 
 static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 
-// ---------------------------------------------------------------------------
-// Tunables
-// ---------------------------------------------------------------------------
-
-// Both wallets are topped up to this value. Kept identical to the 16.1.0 port
-// so the two branches behave the same for a reviewer comparing them.
 constexpr int32_t kCurrencyTarget = 999999999;
-
-// ExperienceController.maxLevel is 65 in 23.1.3 (it was 45 in 16.1.0). The
-// constant is re-derived here rather than carried over.
 constexpr int32_t kLevelCap = 65;
-
-// Experience handed to the stock AddExperience routine per level tick. The
-// game's own routine consumes it, raises the level and stops at maxLevel, so
-// the exact per-level table never has to be replicated.
 constexpr int32_t kExpGrantPerTick = 9999999;
-
-// Main-menu frame intervals. Level converges quickly, currency is refreshed
-// rarely because the stock add path also writes the save.
 constexpr uint64_t kLevelIntervalFrames = 5;
 constexpr uint64_t kCurrencyIntervalFrames = 120;
-
-// Frames to let the main menu settle before the first managed call.
 constexpr uint64_t kWarmupFrames = 60;
-
-// ---------------------------------------------------------------------------
-// 23.1.3 metadata names (obfuscated, emitted byte-exact from the dump)
-// ---------------------------------------------------------------------------
 
 constexpr const char* kGlobalNs = "";
 constexpr const char* kProgressNs = "Progress";
-
-// Progress service facade: owns the canonical add-currency transaction.
 constexpr const char* kServiceClass = "东丝丂丄业丕且丙丑";
-constexpr const char* kServiceInstance = "丞丏业丐丒与业丗与";  // static, 0 args
-constexpr const char* kAddCurrency = "丄丝丄丙且丝丟上丒";      // instance, 5 args
-
-// Wallet model and the static holder that returns it.
+constexpr const char* kServiceInstance = "丞丏业丐丒与业丗与";
+constexpr const char* kAddCurrency = "丄丝丄丙且丝丟上丒";
 constexpr const char* kWalletHolderClass = "与丅丟丈丕上东丟丁";
-constexpr const char* kWalletInstance = "万丒丗丅丆丗丗下三";   // static, 0 args
+constexpr const char* kWalletInstance = "万丒丗丅丆丗丗下三";
 constexpr const char* kWalletClass = "丁丞万上专上万丞丂";
-constexpr const char* kCoins = "丄业丛三丒丌专丈世";            // instance, 0 args -> int
-constexpr const char* kGems = "丗丛七丝专丄业不丂";             // instance, 0 args -> int
-constexpr const char* kWalletKeyed = "丐世东丑上丙丗丕丁";      // instance, 1 arg  -> int
-
-// Level / experience.
+constexpr const char* kCoins = "丄业丛三丒丌专丈世";
+constexpr const char* kGems = "丗丛七丝专丄业不丂";
+constexpr const char* kWalletKeyed = "丐世东丑上丙丗丕丁";
 constexpr const char* kExperienceClass = "ExperienceController";
-constexpr const char* kLevel = "世丐丙丆业一丄丙丒";            // static, 0 args -> int
-constexpr const char* kExperience = "丕三丙上丏与下与丟";       // static, 0 args -> int
-constexpr const char* kAddExperience = "东丙丑万且专丞世丂";    // instance, 3 args
-constexpr const char* kSharedController = "sharedController";     // static field
-
-// Cheat-detection punishment routines (the save shield).
+constexpr const char* kLevel = "世丐丙丆业一丄丙丒";
+constexpr const char* kExperience = "丕三丙上丏与下与丟";
+constexpr const char* kAddExperience = "东丙丑万且专丞世丂";
+constexpr const char* kSharedController = "sharedController";
 constexpr const char* kBannerClass = "CheatDetectedBanner";
-constexpr const char* kBannerWipe = "丏万且丝上丙丐下丗";       // static, 0 args
-constexpr const char* kBannerKick = "丈且丁丞丛丅丄七上";       // static, 0 args
-
-// Main-menu tick that drives the grants.
+constexpr const char* kBannerWipe = "丏万且丝上丙丐下丗";
+constexpr const char* kBannerKick = "丈且丁丞丛丅丄七上";
 constexpr const char* kMenuClass = "MainMenuController";
 constexpr const char* kMenuUpdate = "Update";
-
-// ---------------------------------------------------------------------------
-// AArch64 managed signatures
-// ---------------------------------------------------------------------------
 
 using StaticObjFn = void* (*)(void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using InstanceKeyedIntFn = int32_t (*)(void* self, void* key, void* method);
 using StaticIntFn = int32_t (*)(void* method);
-using StaticVoidFn = void (*)(void* method);
 using InstanceVoidFn = void (*)(void* self, void* method);
 using AddCurrencyFn = void (*)(void* self, void* key, int32_t amount,
                                int32_t accrual, bool indicate, bool silent,
@@ -128,10 +92,6 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Resolved state
-// ---------------------------------------------------------------------------
-
 inline Managed g_service{};
 inline Managed g_add_currency{};
 inline Managed g_wallet{};
@@ -141,34 +101,18 @@ inline Managed g_level{};
 inline Managed g_experience{};
 inline Managed g_add_experience{};
 inline void* g_shared_field = nullptr;
-
 inline void* g_wallet_keyed_orig = nullptr;
 inline void* g_menu_update_orig = nullptr;
 inline void* g_banner_wipe_orig = nullptr;
 inline void* g_banner_kick_orig = nullptr;
-
 inline bool g_installed = false;
 inline bool g_keys_ready = false;
 inline uint64_t g_frames = 0u;
-
-// Canonical wallet keys, captured from the stock code path rather than
-// hard-coded. See capture_keys().
 inline std::string g_coin_key;
 inline std::string g_gem_key;
 
 enum class Capture { None, Coin, Gem };
 inline Capture g_capture = Capture::None;
-
-// ---------------------------------------------------------------------------
-// Save shield
-// ---------------------------------------------------------------------------
-//
-// CheatDetectedBanner::丏万且丝上丙丐下丗() is the punishment routine: it calls
-// UnityEngine.PlayerPrefs::DeleteAll() + Save(), rewrites the tamper flag and
-// starts the wipe coroutine. CheatDetectedBanner::丈且丁丞丛丅丄七上() force
-// disconnects Photon and unloads the bundle. Neither may ever run while
-// synthetic values are present, so both become no-ops. Grants are refused
-// outright if these two hooks cannot be installed.
 
 inline void banner_wipe_hook(void* /*method*/) {
     LOGI("23.1.3-progression: suppressed CheatDetectedBanner save wipe");
@@ -177,15 +121,6 @@ inline void banner_wipe_hook(void* /*method*/) {
 inline void banner_kick_hook(void* /*method*/) {
     LOGI("23.1.3-progression: suppressed CheatDetectedBanner disconnect");
 }
-
-// ---------------------------------------------------------------------------
-// Wallet key capture
-// ---------------------------------------------------------------------------
-//
-// The no-argument coin and gem getters both funnel into the keyed getter
-// 丐世东丑上丙丗丕丁(string). Instead of guessing the two key literals out of
-// metadata, the keyed getter is hooked and the stock no-argument getters are
-// invoked once; whatever key the game itself passes is the canonical one.
 
 inline int32_t wallet_keyed_hook(void* self, void* key, void* method) {
     if (g_capture != Capture::None && key != nullptr) {
@@ -225,8 +160,7 @@ inline bool capture_keys() {
     if (g_coin_key.empty() || g_gem_key.empty()) return false;
     if (g_coin_key == g_gem_key) {
         LOGE("23.1.3-progression: coin and gem keys are identical ('%s'); "
-             "refusing to grant",
-             g_coin_key.c_str());
+             "refusing to grant", g_coin_key.c_str());
         g_coin_key.clear();
         g_gem_key.clear();
         return false;
@@ -234,17 +168,11 @@ inline bool capture_keys() {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Grants
-// ---------------------------------------------------------------------------
-
 inline void add_currency(void* service, const std::string& key,
                          int32_t amount) {
     if (service == nullptr || amount <= 0) return;
     void* managed_key = il2cpp::string_new(key.c_str());
     if (managed_key == nullptr) return;
-    // accrual = 0 (default reason), indicate = false so the stock
-    // CoinsMessage popup is not spawned for a synthetic top-up.
     reinterpret_cast<AddCurrencyFn>(g_add_currency.ptr)(
         service, managed_key, amount, 0, false, false, g_add_currency.info);
 }
@@ -284,9 +212,6 @@ inline void raise_level() {
 
     void* controller = shared_controller();
     if (controller == nullptr) return;
-
-    // reason = 0, payload = null: the stock routine treats this as a plain
-    // grant and runs its own level-up bookkeeping and UI events.
     reinterpret_cast<AddExperienceFn>(g_add_experience.ptr)(
         controller, kExpGrantPerTick, 0, nullptr, g_add_experience.info);
 }
@@ -318,12 +243,12 @@ inline void maybe_grant() {
 
 inline void menu_update_hook(void* self, void* method) {
     reinterpret_cast<InstanceVoidFn>(g_menu_update_orig)(self, method);
+    // This hook is already known to execute every main-menu frame. Drive the
+    // module grant from here so it no longer depends on a UI/lifecycle method
+    // that may have run before the native hooks were installed.
+    weapon_modules_2313::pump_from_main_menu();
     maybe_grant();
 }
-
-// ---------------------------------------------------------------------------
-// Install
-// ---------------------------------------------------------------------------
 
 inline bool install() {
     if (g_installed) return true;
@@ -352,20 +277,16 @@ inline bool install() {
         return false;
     }
 
-    // The shield goes in first and is mandatory: without it a synthetic
-    // balance can reach the punishment routine and wipe PlayerPrefs.
-    const bool shield_wipe =
-        hook::install({kGlobalNs, kBannerClass, kBannerWipe, 0},
-                      reinterpret_cast<void*>(&banner_wipe_hook),
-                      &g_banner_wipe_orig, true);
-    const bool shield_kick =
-        hook::install({kGlobalNs, kBannerClass, kBannerKick, 0},
-                      reinterpret_cast<void*>(&banner_kick_hook),
-                      &g_banner_kick_orig, true);
+    const bool shield_wipe = hook::install(
+        {kGlobalNs, kBannerClass, kBannerWipe, 0},
+        reinterpret_cast<void*>(&banner_wipe_hook), &g_banner_wipe_orig, true);
+    const bool shield_kick = hook::install(
+        {kGlobalNs, kBannerClass, kBannerKick, 0},
+        reinterpret_cast<void*>(&banner_kick_hook), &g_banner_kick_orig, true);
     if (!shield_wipe || !shield_kick) {
         LOGE("23.1.3-progression: save shield unavailable (wipe=%d kick=%d); "
-             "refusing to grant anything",
-             shield_wipe ? 1 : 0, shield_kick ? 1 : 0);
+             "refusing to grant anything", shield_wipe ? 1 : 0,
+             shield_kick ? 1 : 0);
         return false;
     }
 
@@ -379,15 +300,13 @@ inline bool install() {
     if (!hook::install({kGlobalNs, kMenuClass, kMenuUpdate, 0},
                        reinterpret_cast<void*>(&menu_update_hook),
                        &g_menu_update_orig, true)) {
-        LOGE("23.1.3-progression: MainMenuController.Update could not be "
-             "hooked");
+        LOGE("23.1.3-progression: MainMenuController.Update could not be hooked");
         return false;
     }
 
     g_installed = true;
     LOGI("23.1.3-progression: installed (currency target %" PRId32
-         ", level cap %" PRId32 ")",
-         kCurrencyTarget, kLevelCap);
+         ", level cap %" PRId32 ")", kCurrencyTarget, kLevelCap);
     return true;
 }
 

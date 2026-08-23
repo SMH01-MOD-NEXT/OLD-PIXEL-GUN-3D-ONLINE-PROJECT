@@ -1,83 +1,75 @@
 #pragma once
 
-// -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) weapon module grant
+// Pixel Gun 3D 23.1.3 (arm64-v8a) - weapon modules.
 //
-// Unlocks every weapon module and reports each of them at its maximum level.
+// Two guarantees:
+//   1. every weapon module reads as level 10 (X) in the UI;
+//   2. the whole built-in module catalogue (42 modules + 42 module sets) ends
+//      up in the player's module inventory.
 //
-// -----------------------------------------------------------------------------
-// Why the first revision of this file changed nothing on the device
-// -----------------------------------------------------------------------------
-// It hooked the two owned-inventory getters plus the per-module level getter:
+// Revision history, because every wrong turn here was expensive:
 //
-//     ModulesController::七丄丛丕业丂专丞东()  RVA 0x0281473C -> List<module>
-//     ModulesController::一且三不丁万丅上丑()  RVA 0x02814784 -> List<moduleSet>
-//     module::丌丏业丁丅丑与丆丕()              RVA 0x024B13C8 -> int  (slot 30)
+//   r1  Hooked the module level getter. Two identifiers were mangled by a
+//       find/replace (U+4E10 and U+4E12 became U+5341), the required hook
+//       failed to resolve and the fail-closed wrapper disabled the feature.
+//       Fixed by pinning the exact UTF-8 bytes with static_assert.
 //
-// All three resolve in metadata and all three inline hooks install, so the log
-// looked healthy - and still nothing changed in game.
+//   r2  Wrote the catalogue into ModulesController +0x40 / +0x48
+//       (Dictionary<string, model> and the int-keyed model map) and reset
+//       them. Those fields hold per-item storage models, not inventory, so
+//       the change was a no-op on screen.
 //
-// IL2CPP translates managed code to C++ and then lets clang optimise it. Both
-// list getters are single-field reads, so clang inlined them into every caller.
-// Decoding all 2,262,118 BL instructions in libil2cpp.so and resolving their
-// targets against the 23.1.3 method table gives:
+//   r3  Merged the catalogue into 丟丅丁不丄丟不丑丁::七丌丑世丂丟丞丞丟() @ 0x028DB524.
+//       The merge worked, but the target was wrong in a very visible way.
+//       丟丅丁不丄丟不丑丁 is the module storage model OF A SINGLE ITEM:
 //
-//     0x0281473C  owned modules getter ......  0 direct call sites
-//     0x02814784  owned sets getter .........  0 direct call sites
-//     0x03048A5C  static catalogue getter ...  0 direct call sites
-//     0x024B13C8  current level (slot 30) ...  8 direct call sites
-//     0x024B0BB0  owned duplicate count ..... 24 direct call sites
+//           int                              <id>       @ 0x10
+//           ModuleData.ModuleRarity          <rarity>   @ 0x14
+//           ModuleData.ModuleCategory        <category> @ 0x18
+//           Dictionary<string, module>       slots      @ 0x20
+//           丅丏丏丛丕丁丟上丞 itemRecord()                (0x028DB2F8)
 //
-// A hook on a method with zero call sites can never fire - the game reads the
-// backing fields directly. That is why no module was ever added. The level hook
-// did fire, but only on the 8 surviving call sites (InventoryItemView,
-// StorePromotionOffersView, ...); the modules screen reads its own inlined copy,
-// which is why the few owned modules kept reporting level 1.
+//       and 七丌丑世丂丟丞丞丟() is "the modules installed on THIS item": it is the
+//       only caller in the whole image of 专丂丄丈一丂世丑丏::丆丌丌丆且丙七丌丞(int)
+//       @ 0x0171F9D8, the per-item profile record lookup. Returning the full
+//       catalogue from it told the game that every item wears all 42 modules:
+//       the armour screen stacked 42 sets of effects on top of each other and
+//       every module in the storage grid greyed out with "Same mod type
+//       already in use", while the inventory count never moved.
 //
-// -----------------------------------------------------------------------------
-// What this revision does instead
-// -----------------------------------------------------------------------------
-// 1. It writes the data, not the accessor. The owned inventory lives in
+//   r4  Inventory-side grant. The catalogue is appended to the two lists the
+//       storage readers actually enumerate:
 //
-//        private List<module>    丅与世丕业丘不丂丈;  // +0x30
-//        private List<moduleSet> 下丘丌一丞丛丂三丗;  // +0x38
+//           ModulesController.丅与世丕业丘不丂丈  @ 0x30  List<module>
+//           ModulesController.下丘丌一丞丛丂三丗  @ 0x38  List<moduleSet>
 //
-//    and every inlined call site reads exactly those fields, so merging the
-//    static catalogue into them is observed everywhere: UI, stat maths, saves.
+//       Their getters (0x0281473C / 0x02814784) have zero call sites because
+//       the compiler inlined every read, so the fields themselves are the
+//       only stable interception point - hence a field-level grant that is
+//       re-asserted from the main menu and from each storage refresh instead
+//       of a single hook. Per-item models are never written again.
 //
-// 2. The merge is driven from methods that really are called, with the
-//    controller instance as `this`:
+//   r5  (this file) r4 killed the game on the splash screen. install() ended
+//       with a verify step that read the catalogue's static list, and that
+//       first read forces the catalogue class's static constructor, which
+//       pulls module definitions through PGCompany.AssetBundles_v3 -> config
+//       lookup. At install time (~950 ms after process start) that layer is
+//       not up yet: it logged "Settings are null." and then walked into a JNI
+//       path on the bootstrap thread, which is attached to the IL2CPP runtime
+//       but never to the JVM. Null JNIEnv -> SIGSEGV at 0x68 inside libart.so.
 //
-//        ModulesController::丞业丝丁丆丑丑丕丟()  0x02815668  <- MainMenuController.Awake()
-//        ModulesController::上丂丁丙丛万丐万丗()  0x02815F94  <- 9 UI call sites
-//
-// 3. Levels are raised at their source. The current level is
-//    countToLevel(ownedDuplicates) and the duplicate counter
-//    七且丐东丒丆丑丈万() (0x024B0BB0) has 24 live call sites - it is even called by
-//    the level getter itself (BL at 0x024B13D4). Reporting the module's
-//    configured maximum there makes level, upgrade progress and "is maxed"
-//    agree everywhere. That maximum comes from 与丏一丗七丝一七丏() (0x024B0C38),
-//    which reads the balance-config singleton and never calls back into the
-//    duplicate counter, so the substitution cannot recurse.
-//
-// 4. The level getter hook is kept as a belt-and-braces measure for its 8 live
-//    call sites, still clamped to the module's own maximum level.
-//
-// Merging never removes anything: entries already present are skipped through
-// List<T>.Contains, so a real inventory can only ever grow. Nothing is written
-// to Progress, so no save round-trip and no cheat-detection churn is added; the
-// grant is process-scoped and reverts by launching the game without the mod.
-//
-// Deliberately NOT used: ModulesController::AddAllModulesDEV() (0x028178E4) and
-// AddAllMaxModulesDEV() (0x028178E8). Both are dead single-RET stubs on 23.1.3
-// (the four bytes at each offset are C0 03 5F D6).
-//
-// Every managed identifier below was verified by hand against the 23.1.3 dump
-// (class bodies at dump2313.cs:466848, :469613 and :476015).
-// -----------------------------------------------------------------------------
+//       Rule enforced from here on: install() only resolves metadata and
+//       patches code. Every managed call - reading the catalogue, counting a
+//       list, appending to it - runs on a game thread from one of the hooks or
+//       from the main-menu pump, and is refused outright if it is ever reached
+//       from the bootstrap thread. r3 already proved that reading the
+//       catalogue from a UI-thread hook is safe: its merge succeeded on device
+//       (very visibly, on the armour screen).
 
 #include <cstddef>
 #include <cstdint>
+
+#include <pthread.h>
 
 #include "hook.h"
 #include "il2cpp.h"
@@ -88,52 +80,151 @@ namespace detail {
 
 static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 
-// ------------------------------------------------------------------ tunables
-
-// Requested module level for the fallback level hook. Clamped per module to
-// that module's own maximum so a module that tops out below 10 reports its real
-// ceiling instead of a value the upgrade tables cannot describe.
 constexpr int32_t kTargetModuleLevel = 10;
-
-// Upper bound for one merge pass; the 23.1.3 catalogue holds ~42 modules.
+constexpr int32_t kExpectedModules = 42;
+constexpr int32_t kExpectedModuleSets = 42;
 constexpr int32_t kMaxCatalogEntries = 1024;
-
-// The UI entry point fires often, so only re-check the inventory periodically.
-constexpr uint64_t kRegrantEvery = 24;
-
-// Hard stop so a pathological UI loop cannot turn the merge into a hot path.
-constexpr uint64_t kMaxGrantPasses = 96;
-
-// Throttle for the repeating level hook so logcat stays readable.
-constexpr uint64_t kLogEvery = 240;
-
-// ----------------------------------------------------------- metadata names
+constexpr int32_t kMaxInventoryEntries = 4096;
+constexpr uint64_t kLevelLogEvery = 240;
+constexpr uint64_t kGrantLogEvery = 60;
+constexpr uint64_t kPumpEvery = 30;
 
 constexpr const char* kNs = "PGCompany";
 
-// Static catalogue: its type initialiser materialises every module.
+// 丐丞丒专且丁丈丌业 - the static built-in catalogue (.cctor @ 0x02EF431C builds
+// 42 modules and 42 module sets).
 constexpr const char* kCatalogClass = "丐丞丒专且丁丈丌业";
-constexpr const char* kCatalogModules = "丞七丌业丛丂丙上丝";  // static/0 -> List<module>
-constexpr const char* kCatalogSets = "丂丟世丅丛丙业丛专";      // static/0 -> List<moduleSet>
+constexpr const char* kCatalogModules = "丞七丌业丛丂丙上丝";  // 0x03048A5C
+constexpr const char* kCatalogSets = "丂丟世丅丛丙业丛专";     // 0x03048AB4
 
-// Controller that owns the player's inventory.
-constexpr const char* kControllerClass = "ModulesController";
-constexpr const char* kOwnedModulesField = "丅与世丕业丘不丂丈";  // List<module>    +0x30
-constexpr const char* kOwnedSetsField = "下丘丌一丞丛丂三丗";      // List<moduleSet> +0x38
-constexpr const char* kControllerReload = "丞业丝丁丆丑丑丕丟";     // instance/0, from MainMenuController.Awake
-constexpr const char* kControllerSelected = "上丂丁丙丛万丐万丗";   // instance/0, 9 UI call sites
-
-// Per-module accessors.
+// 丐三七世丝丗与丛上 - a single weapon module.
 constexpr const char* kModuleClass = "丐三七世丝丗与丛上";
-constexpr const char* kModuleOwnedCount = "七且丐东丒丆丑丈万";  // instance/0 -> int, 24 call sites
-constexpr const char* kModuleMaxCount = "与丏一丗七丝一七丏";    // instance/0 -> int, from config
-constexpr const char* kModuleLevel = "丌丏业丁丅丑与丆丕";        // instance/0 -> int, slot 30
-constexpr const char* kModuleMaxLevel = "丗丂丙上丏丏专上专";    // instance/0 -> int, slot 31
 
-// ------------------------------------------------------------- managed ABI
+// 丐三七世丝丗与丛上::七且丐东丒丆丑丈万() @ 0x024B0BB0 - the current-level source,
+// 24 call sites, every level label in the module UI goes through it.
+constexpr const char* kCurrentLevel = "七且丐东丒丆丑丈万";
+
+// ModulesController @ TypeDefIndex 11986 - the singleton that owns the
+// player's module inventory.
+constexpr const char* kControllerClass = "ModulesController";
+constexpr const char* kControllerReady = "OnInstanceCreated";  // 0x02814810
+constexpr const char* kInventoryModules = "丅与世丕业丘不丂丈";      // field @ 0x30
+constexpr const char* kInventorySets = "下丘丌一丞丛丂三丗";         // field @ 0x38
+
+// Storage readers. Granting before their refresh runs means the grid is built
+// from the enlarged list, and it repairs the list if the game rebuilt it.
+constexpr const char* kStorageViewClass = "ModuleStorageView";
+constexpr const char* kInfoScreenClass = "ModuleArmoryInfoScreen";
+constexpr const char* kInsertPanelClass = "ModuleInsertPanel";
+constexpr const char* kRefresh = "上专丅丑丘丟丙东与";        // 0x028DCBB4 / 0x023B6680
+constexpr const char* kInsertRefresh = "上丘与丛丝业丆万丁";  // 0x023BA03C
+
+// ---------------------------------------------------------------------------
+// Regression guard.
+//
+// Revision 1 shipped U+5341 in place of U+4E10 and U+4E12 inside kCurrentLevel.
+// U+5341 does not occur once in the 23.1.3 dump, which proves that spelling was
+// never valid, yet the corruption preserved the byte length and only surfaced on
+// device. Pin the exact bytes of every obfuscated name this file cannot work
+// without, and reject the mojibake byte sequence outright, so a mangled
+// identifier breaks the build instead of the device.
+// ---------------------------------------------------------------------------
+
+constexpr bool equal_bytes(const char* a, const char* b) {
+    while (*a != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+constexpr size_t byte_len(const char* s) {
+    size_t n = 0;
+    while (s[n] != '\0') {
+        ++n;
+    }
+    return n;
+}
+
+constexpr bool contains_bytes(const char* haystack, const char* needle) {
+    const size_t h = byte_len(haystack);
+    const size_t n = byte_len(needle);
+    if (n == 0 || n > h) {
+        return false;
+    }
+    for (size_t i = 0; i + n <= h; ++i) {
+        size_t j = 0;
+        while (j < n && haystack[i + j] == needle[j]) {
+            ++j;
+        }
+        if (j == n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// U+5341 十, the character revision 1 substituted for 丐 and 丒.
+constexpr const char* kMojibake = "\xE5\x8D\x81";
+
+static_assert(!contains_bytes(kCurrentLevel, kMojibake) &&
+                  !contains_bytes(kModuleClass, kMojibake) &&
+                  !contains_bytes(kCatalogClass, kMojibake) &&
+                  !contains_bytes(kCatalogModules, kMojibake) &&
+                  !contains_bytes(kCatalogSets, kMojibake) &&
+                  !contains_bytes(kInventoryModules, kMojibake) &&
+                  !contains_bytes(kInventorySets, kMojibake) &&
+                  !contains_bytes(kRefresh, kMojibake) &&
+                  !contains_bytes(kInsertRefresh, kMojibake),
+              "an obfuscated identifier contains U+5341, which never occurs in "
+              "the 23.1.3 metadata: this is the revision 1 find/replace bug");
+
+static_assert(
+    equal_bytes(kCurrentLevel,
+                "\xE4\xB8\x83"   // U+4E03 七
+                "\xE4\xB8\x94"   // U+4E14 且
+                "\xE4\xB8\x90"   // U+4E10 丐  (revision 1 corrupted this)
+                "\xE4\xB8\x9C"   // U+4E1C 东
+                "\xE4\xB8\x92"   // U+4E12 丒  (revision 1 corrupted this)
+                "\xE4\xB8\x86"   // U+4E06 丆
+                "\xE4\xB8\x91"   // U+4E11 丑
+                "\xE4\xB8\x88"   // U+4E08 丈
+                "\xE4\xB8\x87"), // U+4E07 万
+    "kCurrentLevel must stay byte-identical to 0x024B0BB0 as spelled in the "
+    "23.1.3 metadata; a corrupted identifier silently disables the module");
+
+static_assert(
+    equal_bytes(kInventoryModules,
+                "\xE4\xB8\x85"   // U+4E05 丅
+                "\xE4\xB8\x8E"   // U+4E0E 与
+                "\xE4\xB8\x96"   // U+4E16 世
+                "\xE4\xB8\x95"   // U+4E15 丕
+                "\xE4\xB8\x9A"   // U+4E1A 业
+                "\xE4\xB8\x98"   // U+4E18 丘
+                "\xE4\xB8\x8D"   // U+4E0D 不
+                "\xE4\xB8\x82"   // U+4E02 丂
+                "\xE4\xB8\x88"), // U+4E08 丈
+    "kInventoryModules must stay byte-identical to ModulesController +0x30, "
+    "the List<module> every storage reader enumerates");
+
+static_assert(
+    equal_bytes(kInventorySets,
+                "\xE4\xB8\x8B"   // U+4E0B 下
+                "\xE4\xB8\x98"   // U+4E18 丘
+                "\xE4\xB8\x8C"   // U+4E0C 丌
+                "\xE4\xB8\x80"   // U+4E00 一
+                "\xE4\xB8\x9E"   // U+4E1E 丞
+                "\xE4\xB8\x9B"   // U+4E1B 丛
+                "\xE4\xB8\x82"   // U+4E02 丂
+                "\xE4\xB8\x89"   // U+4E09 三
+                "\xE4\xB8\x97"), // U+4E17 丗
+    "kInventorySets must stay byte-identical to ModulesController +0x38");
+
+// ---------------------------------------------------------------------------
+// Managed plumbing
+// ---------------------------------------------------------------------------
 
 using StaticObjFn = void* (*)(void* method);
-using InstanceObjFn = void* (*)(void* self, void* method);
 using InstanceVoidFn = void (*)(void* self, void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using ListCountFn = int32_t (*)(void* list, void* method);
@@ -144,326 +235,496 @@ using ListAddFn = void (*)(void* list, void* item, void* method);
 struct Managed {
     void* info = nullptr;
     void* ptr = nullptr;
-    explicit operator bool() const noexcept { return info != nullptr && ptr != nullptr; }
+
+    bool ok() const { return info != nullptr && ptr != nullptr; }
 };
 
 inline bool bind(Managed& out, const char* namespaze, const char* klass,
                  const char* method, int args_count) {
-    void* info = il2cpp::find_method_info(namespaze, klass, method, args_count);
-    if (info == nullptr) {
-        LOGE("23.1.3-modules: %s::%s/%d not found in metadata", klass, method, args_count);
-        return false;
-    }
-    void* ptr = il2cpp::method_pointer(info);
-    if (ptr == nullptr) {
-        LOGE("23.1.3-modules: %s::%s/%d has no compiled body", klass, method, args_count);
-        return false;
-    }
-    out.info = info;
-    out.ptr = ptr;
-    return true;
+    out.info = il2cpp::find_method_info(namespaze, klass, method, args_count);
+    out.ptr = (out.info != nullptr) ? il2cpp::method_pointer(out.info) : nullptr;
+    return out.ok();
 }
 
-// List<T> is a generic instantiation, so its members are resolved off the live
-// object rather than through the metadata name lookup.
 struct ListApi {
-    void* count_info = nullptr;
-    void* count_ptr = nullptr;
-    void* item_info = nullptr;
-    void* item_ptr = nullptr;
-    void* contains_info = nullptr;
-    void* contains_ptr = nullptr;
-    void* add_info = nullptr;
-    void* add_ptr = nullptr;
-
-    bool readable() const noexcept { return count_ptr != nullptr && item_ptr != nullptr; }
-    bool writable() const noexcept { return count_ptr != nullptr && add_ptr != nullptr; }
+    Managed count{};
+    Managed item{};
+    Managed contains{};
+    Managed add{};
+    bool ok = false;
 };
 
 inline bool resolve_list_api(void* list, ListApi& api) {
-    if (list == nullptr || il2cpp::object_get_class == nullptr ||
-        il2cpp::class_get_method_from_name == nullptr) {
+    api = ListApi{};
+    if (list == nullptr) {
         return false;
     }
     void* klass = il2cpp::object_get_class(list);
     if (klass == nullptr) {
         return false;
     }
-    const auto pick = [&](const char* name, int argc, void*& info, void*& ptr) {
-        info = il2cpp::class_get_method_from_name(klass, name, argc);
-        ptr = info != nullptr ? il2cpp::method_pointer(info) : nullptr;
-    };
-    pick("get_Count", 0, api.count_info, api.count_ptr);
-    pick("get_Item", 1, api.item_info, api.item_ptr);
-    pick("Contains", 1, api.contains_info, api.contains_ptr);
-    pick("Add", 1, api.add_info, api.add_ptr);
-    return api.count_ptr != nullptr;
+    api.count.info = il2cpp::class_get_method_from_name(klass, "get_Count", 0);
+    api.item.info = il2cpp::class_get_method_from_name(klass, "get_Item", 1);
+    api.contains.info = il2cpp::class_get_method_from_name(klass, "Contains", 1);
+    api.add.info = il2cpp::class_get_method_from_name(klass, "Add", 1);
+
+    Managed* const all[] = {&api.count, &api.item, &api.contains, &api.add};
+    for (Managed* entry : all) {
+        if (entry->info == nullptr) {
+            return false;
+        }
+        entry->ptr = il2cpp::method_pointer(entry->info);
+        if (entry->ptr == nullptr) {
+            return false;
+        }
+    }
+    api.ok = true;
+    return true;
 }
 
-inline int32_t list_count(void* list) {
-    ListApi api;
-    if (!resolve_list_api(list, api)) {
+inline int32_t list_count(const ListApi& api, void* list) {
+    if (!api.ok || list == nullptr) {
         return -1;
     }
-    return reinterpret_cast<ListCountFn>(api.count_ptr)(list, api.count_info);
+    return reinterpret_cast<ListCountFn>(api.count.ptr)(list, api.count.info);
 }
 
-// ------------------------------------------------------------------- state
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 inline Managed g_catalog_modules{};
 inline Managed g_catalog_sets{};
-inline Managed g_max_level{};
-inline Managed g_max_count{};
 
-inline void* g_field_owned_modules = nullptr;
-inline void* g_field_owned_sets = nullptr;
+inline void* g_controller = nullptr;
+inline void* g_field_modules = nullptr;
+inline void* g_field_sets = nullptr;
 
-inline InstanceVoidFn g_orig_reload = nullptr;
-inline InstanceObjFn g_orig_selected = nullptr;
-inline InstanceIntFn g_orig_owned_count = nullptr;
-inline InstanceIntFn g_orig_level = nullptr;
+inline void* g_orig_level = nullptr;
+inline void* g_orig_controller_ready = nullptr;
+inline void* g_orig_storage_refresh = nullptr;
+inline void* g_orig_screen_refresh = nullptr;
+inline void* g_orig_insert_refresh = nullptr;
 
-inline uint64_t g_selected_calls = 0;
+inline bool g_installed = false;
+inline bool g_reported_complete = false;
 inline uint64_t g_level_calls = 0;
-inline uint64_t g_grant_passes = 0;
-inline bool g_announced_modules = false;
-inline bool g_announced_sets = false;
+inline uint64_t g_grant_calls = 0;
+inline uint64_t g_pump_calls = 0;
+inline uint64_t g_failure_reports = 0;
+inline uint64_t g_refusals = 0;
 
-// The catalogue type initialiser builds every module the first time it is
-// touched, and that construction path can walk back into the controller. Plain
-// re-entrancy latches keep the hooks pass-through while it runs.
-inline thread_local bool g_in_catalog = false;
 inline thread_local bool g_in_grant = false;
 
-inline void* fetch_catalog(const Managed& source) {
-    if (!source || g_in_catalog) {
-        return nullptr;
+inline pthread_t g_install_thread{};
+inline bool g_install_thread_valid = false;
+inline bool g_catalog_verified = false;
+
+class Latch {
+public:
+    explicit Latch(bool& flag) : flag_(flag), entered_(!flag) {
+        if (entered_) {
+            flag_ = true;
+        }
     }
-    g_in_catalog = true;
-    void* list = reinterpret_cast<StaticObjFn>(source.ptr)(source.info);
-    g_in_catalog = false;
-    return list;
+
+    ~Latch() {
+        if (entered_) {
+            flag_ = false;
+        }
+    }
+
+    Latch(const Latch&) = delete;
+    Latch& operator=(const Latch&) = delete;
+
+    bool entered() const { return entered_; }
+
+private:
+    bool& flag_;
+    bool entered_;
+};
+
+// ---------------------------------------------------------------------------
+// Thread safety and lazy catalogue verification
+// ---------------------------------------------------------------------------
+
+// The bootstrap thread that runs install() is attached to the IL2CPP runtime
+// but not to the JVM, and it runs long before the config/AssetBundles layer is
+// alive. A managed call from it can reach JNI with a null JNIEnv and take the
+// process down inside libart, which is exactly how r4 died. Only the game's own
+// threads may call into managed code.
+inline bool managed_calls_allowed(const char* label) {
+    if (!g_install_thread_valid ||
+        pthread_equal(pthread_self(), g_install_thread) == 0) {
+        return true;
+    }
+    if (g_refusals < 3) {
+        ++g_refusals;
+        LOGE("23.1.3-modules: managed call refused (%s): the bootstrap thread "
+             "is not a safe caller", label);
+    }
+    return false;
 }
 
-// ------------------------------------------------------------ field access
+// Diagnostics only, and deliberately lazy: the first read of the catalogue is
+// what triggers its static constructor, so it has to happen on a game thread.
+inline void verify_catalog_once() {
+    if (g_catalog_verified || !g_catalog_modules.ok()) {
+        return;
+    }
+    g_catalog_verified = true;
 
-inline void* read_object_field(void* self, void* field) {
-    if (self == nullptr || field == nullptr || il2cpp::field_get_value == nullptr) {
+    void* modules = reinterpret_cast<StaticObjFn>(g_catalog_modules.ptr)(
+        g_catalog_modules.info);
+    ListApi api{};
+    if (!resolve_list_api(modules, api)) {
+        LOGE("23.1.3-modules: catalogue unreadable");
+        return;
+    }
+    const int32_t count = list_count(api, modules);
+
+    int32_t sets = -1;
+    if (g_catalog_sets.ok()) {
+        void* set_list = reinterpret_cast<StaticObjFn>(g_catalog_sets.ptr)(
+            g_catalog_sets.info);
+        ListApi set_api{};
+        if (resolve_list_api(set_list, set_api)) {
+            sets = list_count(set_api, set_list);
+        }
+    }
+
+    if (count == kExpectedModules && sets == kExpectedModuleSets) {
+        LOGI("23.1.3-modules: catalogue verified (%d modules, %d sets)", count,
+             sets);
+    } else {
+        LOGE("23.1.3-modules: catalogue mismatch (%d modules, %d sets; "
+             "expected %d and %d)",
+             count, sets, kExpectedModules, kExpectedModuleSets);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory grant
+// ---------------------------------------------------------------------------
+
+struct GrantResult {
+    const char* failure = nullptr;
+    int32_t source = 0;
+    int32_t before = 0;
+    int32_t added = 0;
+    int32_t after = 0;
+};
+
+inline void* read_object_field(void* instance, void* field) {
+    if (instance == nullptr || field == nullptr ||
+        il2cpp::field_get_value == nullptr) {
         return nullptr;
     }
     void* value = nullptr;
-    il2cpp::field_get_value(self, field, &value);
+    il2cpp::field_get_value(instance, field, &value);
     return value;
 }
 
-inline void write_object_field(void* self, void* field, void* value) {
-    if (self == nullptr || field == nullptr || value == nullptr ||
-        il2cpp::field_set_value == nullptr) {
-        return;
-    }
-    il2cpp::field_set_value(self, field, &value);
-}
+// Append every catalogue entry the target list does not already hold. The list
+// object itself is never replaced: the game keeps its own reference to it, and
+// swapping it would leave every inlined reader pointing at the old instance.
+inline GrantResult grant_into(void* target, const Managed& source) {
+    GrantResult result{};
 
-// ------------------------------------------------------------------- merge
-
-// Copies every catalogue entry the inventory does not have yet. Returns the
-// number of appended entries, or -1 when the lists could not be walked.
-inline int32_t merge_into(void* owned, void* full) {
-    ListApi source;
-    ListApi target;
-    if (!resolve_list_api(full, source) || !source.readable()) {
-        return -1;
+    if (!source.ok()) {
+        result.failure = "catalogue route missing";
+        return result;
     }
-    if (!resolve_list_api(owned, target) || !target.writable()) {
-        return -1;
+    if (target == nullptr) {
+        result.failure = "inventory list is null";
+        return result;
     }
 
-    const int32_t total =
-        reinterpret_cast<ListCountFn>(source.count_ptr)(full, source.count_info);
-    if (total <= 0) {
-        return 0;
+    void* catalog = reinterpret_cast<StaticObjFn>(source.ptr)(source.info);
+    if (catalog == nullptr) {
+        result.failure = "catalogue getter returned null";
+        return result;
     }
-    const int32_t limit = total < kMaxCatalogEntries ? total : kMaxCatalogEntries;
 
-    int32_t added = 0;
-    for (int32_t index = 0; index < limit; ++index) {
-        void* item =
-            reinterpret_cast<ListItemFn>(source.item_ptr)(full, index, source.item_info);
-        if (item == nullptr) {
+    ListApi src{};
+    ListApi dst{};
+    if (!resolve_list_api(catalog, src)) {
+        result.failure = "catalogue list api incomplete";
+        return result;
+    }
+    if (!resolve_list_api(target, dst)) {
+        result.failure = "inventory list api incomplete";
+        return result;
+    }
+
+    result.source = list_count(src, catalog);
+    result.before = list_count(dst, target);
+    result.after = result.before;
+
+    if (result.source <= 0) {
+        result.failure = "catalogue is empty";
+        return result;
+    }
+    if (result.source > kMaxCatalogEntries) {
+        result.failure = "catalogue is implausibly large";
+        return result;
+    }
+    if (result.before < 0) {
+        result.failure = "inventory count unavailable";
+        return result;
+    }
+
+    for (int32_t i = 0; i < result.source; ++i) {
+        void* entry =
+            reinterpret_cast<ListItemFn>(src.item.ptr)(catalog, i, src.item.info);
+        if (entry == nullptr) {
             continue;
         }
-        if (target.contains_ptr != nullptr &&
-            reinterpret_cast<ListContainsFn>(target.contains_ptr)(owned, item,
-                                                                  target.contains_info)) {
+        if (reinterpret_cast<ListContainsFn>(dst.contains.ptr)(
+                target, entry, dst.contains.info)) {
             continue;
         }
-        reinterpret_cast<ListAddFn>(target.add_ptr)(owned, item, target.add_info);
-        ++added;
-    }
-    return added;
-}
-
-inline void grant_one(void* self, void* field, const Managed& catalog,
-                      bool& announced, const char* what) {
-    void* full = fetch_catalog(catalog);
-    if (full == nullptr) {
-        return;
-    }
-
-    void* owned = read_object_field(self, field);
-    if (owned == nullptr) {
-        // The controller has not allocated its inventory yet: publish the
-        // catalogue itself. Same element type, same list class.
-        write_object_field(self, field, full);
-        if (!announced) {
-            announced = true;
-            LOGI("23.1.3-modules: published the full %s catalogue (%d entries) into an empty inventory",
-                 what, list_count(full));
+        if (list_count(dst, target) >= kMaxInventoryEntries) {
+            result.failure = "inventory cap reached";
+            break;
         }
-        return;
-    }
-    if (owned == full) {
-        return;
+        reinterpret_cast<ListAddFn>(dst.add.ptr)(target, entry, dst.add.info);
+        ++result.added;
     }
 
-    const int32_t added = merge_into(owned, full);
-    if (added > 0) {
-        LOGI("23.1.3-modules: added %d %s entries, inventory now holds %d", added, what,
-             list_count(owned));
-        announced = true;
-    } else if (added < 0 && !announced) {
-        announced = true;
-        LOGE("23.1.3-modules: could not walk the %s lists (owned=%p catalogue=%p)", what,
-             owned, full);
-    }
-}
-
-inline void grant(void* self) {
-    if (self == nullptr || g_in_grant || g_grant_passes >= kMaxGrantPasses) {
-        return;
-    }
-    g_in_grant = true;
-    ++g_grant_passes;
-    grant_one(self, g_field_owned_modules, g_catalog_modules, g_announced_modules, "module");
-    grant_one(self, g_field_owned_sets, g_catalog_sets, g_announced_sets, "module set");
-    g_in_grant = false;
-}
-
-// --------------------------------------------------------------- hook bodies
-
-// Runs once from MainMenuController.Awake(), i.e. right after the profile has
-// been applied to the controller.
-inline void reload_hook(void* self, void* method) {
-    if (g_orig_reload != nullptr) {
-        g_orig_reload(self, method);
-    }
-    grant(self);
-}
-
-// Live UI entry point: keeps the inventory topped up if the game rebuilds it
-// (profile reload, backend response, scene change).
-inline void* selected_hook(void* self, void* method) {
-    void* result = nullptr;
-    if (g_orig_selected != nullptr) {
-        result = g_orig_selected(self, method);
-    }
-    if ((g_selected_calls++ % kRegrantEvery) == 0) {
-        grant(self);
-    }
+    result.after = list_count(dst, target);
     return result;
 }
 
-// Duplicate counter. Reporting the configured maximum makes the derived level
-// and every "is maxed" check agree, including at the inlined call sites.
-inline int32_t owned_count_hook(void* self, void* method) {
-    int32_t original = 0;
-    if (g_orig_owned_count != nullptr) {
-        original = g_orig_owned_count(self, method);
+inline void grant_inventory(const char* label) {
+    if (!g_installed || !managed_calls_allowed(label)) {
+        return;
     }
-    if (!g_max_count || self == nullptr) {
-        return original;
+
+    Latch latch(g_in_grant);
+    if (!latch.entered()) {
+        return;
     }
-    const int32_t cap =
-        reinterpret_cast<InstanceIntFn>(g_max_count.ptr)(self, g_max_count.info);
-    return cap > original ? cap : original;
+
+    verify_catalog_once();
+
+    ++g_grant_calls;
+    const bool verbose = g_grant_calls <= 3 || (g_grant_calls % kGrantLogEvery) == 0;
+
+    if (g_controller == nullptr) {
+        if (verbose) {
+            LOGE("23.1.3-modules: inventory grant skipped (%s): modules "
+                 "controller instance not seen yet", label);
+        }
+        return;
+    }
+    if (g_field_modules == nullptr) {
+        if (verbose) {
+            LOGE("23.1.3-modules: inventory grant skipped (%s): inventory field "
+                 "missing", label);
+        }
+        return;
+    }
+
+    const GrantResult modules =
+        grant_into(read_object_field(g_controller, g_field_modules),
+                   g_catalog_modules);
+    const GrantResult sets =
+        (g_field_sets != nullptr)
+            ? grant_into(read_object_field(g_controller, g_field_sets),
+                         g_catalog_sets)
+            : GrantResult{"module set field missing", 0, 0, 0, 0};
+
+    if (modules.failure != nullptr) {
+        ++g_failure_reports;
+        if (g_failure_reports <= 5 || verbose) {
+            LOGE("23.1.3-modules: inventory grant failed (%s): %s "
+                 "(source=%d before=%d after=%d)",
+                 label, modules.failure, modules.source, modules.before,
+                 modules.after);
+        }
+        return;
+    }
+
+    if (modules.added > 0 || sets.added > 0 || verbose) {
+        LOGI("23.1.3-modules: inventory grant (%s): modules %d +%d -> %d, "
+             "sets %d +%d -> %d",
+             label, modules.before, modules.added, modules.after, sets.before,
+             sets.added, sets.after);
+    }
+
+    if (sets.failure != nullptr && (sets.added > 0 || verbose)) {
+        LOGE("23.1.3-modules: module set grant failed (%s): %s", label,
+             sets.failure);
+    }
+
+    if (!g_reported_complete && modules.after >= kExpectedModules) {
+        g_reported_complete = true;
+        LOGI("23.1.3-modules: module inventory complete (%d/%d modules, "
+             "%d/%d sets)",
+             modules.after, kExpectedModules, sets.after, kExpectedModuleSets);
+    }
 }
 
-// Fallback for the 8 call sites that still call the level getter for real.
-inline int32_t module_level_hook(void* self, void* method) {
-    int32_t original = 0;
-    if (g_orig_level != nullptr) {
-        original = g_orig_level(self, method);
-    }
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
 
-    int32_t target = kTargetModuleLevel;
-    if (g_max_level && self != nullptr) {
-        const int32_t cap =
-            reinterpret_cast<InstanceIntFn>(g_max_level.ptr)(self, g_max_level.info);
-        if (cap > 0 && target > cap) {
-            target = cap;
-        }
-    }
+inline int32_t current_level_hook(void* self, void* method) {
+    (void)self;
+    (void)method;
 
-    if ((g_level_calls++ % kLogEvery) == 0) {
-        LOGI("23.1.3-modules: module level %d -> %d (call %llu)", original, target,
+    ++g_level_calls;
+    if (g_level_calls == 1 || (g_level_calls % kLevelLogEvery) == 0) {
+        LOGI("23.1.3-modules: displayed module level -> %d (call %llu)",
+             kTargetModuleLevel,
              static_cast<unsigned long long>(g_level_calls));
     }
-    return original >= target ? original : target;
+    return kTargetModuleLevel;
 }
 
-// ------------------------------------------------------------------ install
+// The singleton builds its inventory lists inside OnInstanceCreated, so capture
+// the instance and grant after the original has run.
+inline void controller_ready_hook(void* self, void* method) {
+    if (self != nullptr && g_controller != self) {
+        g_controller = self;
+        LOGI("23.1.3-modules: modules controller captured");
+    }
+    if (g_orig_controller_ready != nullptr) {
+        reinterpret_cast<InstanceVoidFn>(g_orig_controller_ready)(self, method);
+    }
+    grant_inventory("controller ready");
+}
+
+inline void storage_view_refresh_hook(void* self, void* method) {
+    grant_inventory("storage grid");
+    if (g_orig_storage_refresh != nullptr) {
+        reinterpret_cast<InstanceVoidFn>(g_orig_storage_refresh)(self, method);
+    }
+}
+
+inline void screen_refresh_hook(void* self, void* method) {
+    grant_inventory("armory screen");
+    if (g_orig_screen_refresh != nullptr) {
+        reinterpret_cast<InstanceVoidFn>(g_orig_screen_refresh)(self, method);
+    }
+}
+
+inline void insert_panel_refresh_hook(void* self, void* method) {
+    grant_inventory("insert panel");
+    if (g_orig_insert_refresh != nullptr) {
+        reinterpret_cast<InstanceVoidFn>(g_orig_insert_refresh)(self, method);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Install
+// ---------------------------------------------------------------------------
 
 inline bool install() {
-    bool resolved = true;
-    resolved &= bind(g_catalog_modules, kNs, kCatalogClass, kCatalogModules, 0);
-    resolved &= bind(g_catalog_sets, kNs, kCatalogClass, kCatalogSets, 0);
-    if (!resolved) {
-        LOGE("23.1.3-modules: static module catalogue unavailable, module disabled");
+    if (g_installed) {
+        return true;
+    }
+
+    // Remember who we are: nothing managed may ever run on this thread.
+    g_install_thread = pthread_self();
+    g_install_thread_valid = true;
+
+    if (!il2cpp::resolve()) {
+        LOGE("23.1.3-modules: il2cpp api unavailable, module disabled");
         return false;
     }
 
-    g_field_owned_modules = il2cpp::find_field(kNs, kControllerClass, kOwnedModulesField);
-    g_field_owned_sets = il2cpp::find_field(kNs, kControllerClass, kOwnedSetsField);
-    if (g_field_owned_modules == nullptr || g_field_owned_sets == nullptr) {
-        LOGE("23.1.3-modules: owned-inventory fields not found (modules=%p sets=%p), module disabled",
-             g_field_owned_modules, g_field_owned_sets);
+    if (!hook::install({kNs, kModuleClass, kCurrentLevel, 0},
+                       reinterpret_cast<void*>(&current_level_hook),
+                       &g_orig_level, true)) {
+        LOGE("23.1.3-modules: install incomplete, module disabled");
         return false;
     }
 
-    // Resolve-only, never hooked. Without them the counter is left untouched
-    // and the level hook falls back to the unclamped target level.
-    if (!bind(g_max_count, kNs, kModuleClass, kModuleMaxCount, 0)) {
-        LOGE("23.1.3-modules: max duplicate count unavailable, levels stay as the game computes them");
+    const bool catalog_modules =
+        bind(g_catalog_modules, kNs, kCatalogClass, kCatalogModules, 0);
+    const bool catalog_sets =
+        bind(g_catalog_sets, kNs, kCatalogClass, kCatalogSets, 0);
+    if (!catalog_modules) {
+        LOGE("23.1.3-modules: catalogue route missing, level stays X but the "
+             "inventory cannot be filled");
     }
-    if (!bind(g_max_level, kNs, kModuleClass, kModuleMaxLevel, 0)) {
-        LOGE("23.1.3-modules: max-level getter unavailable, clamping disabled");
+    if (!catalog_sets) {
+        LOGE("23.1.3-modules: module set catalogue route missing");
     }
 
-    bool ok = true;
-    ok &= hook::install({kNs, kControllerClass, kControllerReload, 0},
-                        reinterpret_cast<void*>(&reload_hook),
-                        reinterpret_cast<void**>(&g_orig_reload), true);
-    ok &= hook::install({kNs, kControllerClass, kControllerSelected, 0},
-                        reinterpret_cast<void*>(&selected_hook),
-                        reinterpret_cast<void**>(&g_orig_selected), true);
-    ok &= hook::install({kNs, kModuleClass, kModuleOwnedCount, 0},
-                        reinterpret_cast<void*>(&owned_count_hook),
-                        reinterpret_cast<void**>(&g_orig_owned_count), true);
-    ok &= hook::install({kNs, kModuleClass, kModuleLevel, 0},
-                        reinterpret_cast<void*>(&module_level_hook),
-                        reinterpret_cast<void**>(&g_orig_level), true);
-
-    if (ok) {
-        LOGI("23.1.3-modules: grant armed, every module unlocked at up to level %d",
-             kTargetModuleLevel);
-    } else {
-        LOGE("23.1.3-modules: install incomplete, module grant disabled");
+    g_field_modules = il2cpp::find_field(kNs, kControllerClass, kInventoryModules);
+    g_field_sets = il2cpp::find_field(kNs, kControllerClass, kInventorySets);
+    if (g_field_modules == nullptr) {
+        LOGE("23.1.3-modules: ModulesController inventory field not found");
     }
-    return ok;
+    if (g_field_sets == nullptr) {
+        LOGE("23.1.3-modules: ModulesController module set field not found");
+    }
+
+    struct Route {
+        const char* klass;
+        const char* method;
+        void* replacement;
+        void** original;
+    };
+
+    const Route routes[] = {
+        {kControllerClass, kControllerReady,
+         reinterpret_cast<void*>(&controller_ready_hook),
+         &g_orig_controller_ready},
+        {kStorageViewClass, kRefresh,
+         reinterpret_cast<void*>(&storage_view_refresh_hook),
+         &g_orig_storage_refresh},
+        {kInfoScreenClass, kRefresh,
+         reinterpret_cast<void*>(&screen_refresh_hook), &g_orig_screen_refresh},
+        {kInsertPanelClass, kInsertRefresh,
+         reinterpret_cast<void*>(&insert_panel_refresh_hook),
+         &g_orig_insert_refresh},
+    };
+
+    constexpr int kRouteCount =
+        static_cast<int>(sizeof(routes) / sizeof(routes[0]));
+    int installed_routes = 0;
+    for (const Route& route : routes) {
+        if (hook::install({kNs, route.klass, route.method, 0},
+                          route.replacement, route.original, false)) {
+            ++installed_routes;
+        }
+    }
+    LOGI("23.1.3-modules: inventory routes installed %d/%d", installed_routes,
+         kRouteCount);
+
+    g_installed = true;
+
+    // Nothing managed runs here. The catalogue is read, verified and merged the
+    // first time a game thread reaches one of the routes above.
+    LOGI("23.1.3-modules: armed: level X guaranteed, catalogue granted into "
+         "the ModulesController inventory lists from game threads only "
+         "(expect %d modules, %d module sets); per-item module storage is left "
+         "untouched",
+         kExpectedModules, kExpectedModuleSets);
+    return true;
+}
+
+inline void pump(const char* label) {
+    if (!g_installed) {
+        return;
+    }
+    ++g_pump_calls;
+    if ((g_pump_calls % kPumpEvery) != 1) {
+        return;
+    }
+    grant_inventory(label);
 }
 
 }  // namespace detail
 
 inline bool install_hooks() { return detail::install(); }
+
+inline void pump_from_main_menu() { detail::pump("main menu"); }
+
+inline void pump_from_startup() { detail::pump("startup"); }
 
 }  // namespace weapon_modules_2313

@@ -1,147 +1,192 @@
-# 23.1.3 weapon modules - why the grant was a no-op and how it is fixed
+# Модули оружия — порт 23.1.3 (arm64-v8a)
 
-## Symptom
+## Задача
 
-On 23.1.3 the modules screen kept showing only the handful of modules the
-account really owns, all of them at level 1, even though
-`weapon_modules_2313::install_hooks()` reported success and `main.cpp` arms it
-unconditionally.
+В сборке 23.1.3 модули оружия падали и отключались. Требуется: все модули
+добавляются игроку и все имеют **10 уровень (X)**.
 
-## Root cause: IL2CPP inlined the hooked accessors
+## Текущий статус
 
-IL2CPP translates managed code to C++ and then lets clang optimise it. Trivial
-field-reading accessors are inlined into their callers, and once that happens
-the method body still exists in `.text` - it simply is never called. An inline
-hook on such a body installs cleanly and never fires.
+| Требование | Состояние |
+|---|---|
+| Уровень модулей = X | ✅ подтверждено на устройстве |
+| Хуки не падают и не отключаются | ✅ подтверждено |
+| Игра не падает на старте | ✅ исправлено в r5 (r4 крашил сплеш) |
+| Каталог 42 модуля + 42 набора читается в рантайме | ✅ подтверждено в r3 |
+| Модули в инвентаре «Арсенал → Модули» | 🟡 r5, ждёт теста |
 
-That is exactly what happened to the two owned-inventory getters.
+## Два разных списка
 
-### Measurement
+Главная ошибка этой работы: «модули игрока» и «модули предмета» — разные
+сущности.
 
-`objdump` in the analysis container has no AArch64 backend, so the call graph
-was built directly from the machine code: every 32-bit word with
-`(word >> 26) == 0x25` is a `BL`, its signed 26-bit immediate times four is the
-target, and the target is resolved against the RVA table parsed out of
-`dump2313.cs`. 2,262,118 `BL` sites were decoded over the whole library.
+| Список | Где живёт | Смысл |
+|---|---|---|
+| Инвентарь | `ModulesController` `+0x30` / `+0x38` | что есть у игрока |
+| Установленные | `丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟()` `0x28DB524` | что вставлено в **один** предмет |
 
-| target | RVA | direct call sites |
-| --- | --- | --- |
-| `ModulesController::七丄丛丕业丂专丞东()` owned modules | `0x0281473C` | **0** |
-| `ModulesController::一且三不丁万丅上丑()` owned sets | `0x02814784` | **0** |
-| catalogue `丞七丌业丛丂丙上丝()` | `0x03048A5C` | **0** |
-| catalogue `丂丟世丅丛丙业丛专()` | `0x03048AB4` | **0** |
-| module `丌丏业丁丅丑与丆丕()` current level (slot 30) | `0x024B13C8` | 8 |
-| module `丗丂丙上丏丏专上专()` max level (slot 31) | `0x024B14EC` | 7 |
-| module `七且丐东丒丆丑丈万()` owned duplicates | `0x024B0BB0` | **24** |
-| module `与丏一丗七丝一七丏()` configured max count | `0x024B0C38` | 5 |
-| `ModulesController::丞业丝丁丆丑丑丕丟()` | `0x02815668` | 1 (`MainMenuController.Awake`) |
-| `ModulesController::上丂丁丙丛万丐万丗()` | `0x02815F94` | 9 |
-
-Two conclusions:
-
-* the list hooks were dead on arrival - the game reads the backing fields
-  directly, so no module could ever be added;
-* the level hook only covered 8 call sites (`InventoryItemView`,
-  `StorePromotionOffersView`, ...). The modules screen uses its own inlined
-  copy, hence "still level 1".
-
-Side results from the same pass:
-
-* `AddAllModulesDEV()` `0x028178E4` and `AddAllMaxModulesDEV()` `0x028178E8` are
-  four bytes each and contain `C0 03 5F D6` - a bare `RET`. Confirmed dead.
-* the catalogue type initialiser `0x02EF431C` spans 284 KB and the built-in
-  module table `.cctor` `0x0281AA04` spans 56 KB, so the module definitions are
-  compiled into the binary and do not depend on a backend response.
-
-## The fix
-
-1. **Write the data, not the accessor.** The inventory lives in
-   `ModulesController.丅与世丕业丘不丂丈` (`List<module>`, `+0x30`) and
-   `ModulesController.下丘丌一丞丛丂三丗` (`List<moduleSet>`, `+0x38`). The catalogue
-   is merged into those fields with `List<T>.Contains` / `List<T>.Add`, so the
-   inventory can only grow. If the field is still null the catalogue list is
-   published directly.
-2. **Drive it from live entry points.** `丞业丝丁丆丑丑丕丟()` runs from
-   `MainMenuController.Awake()`; `上丂丁丙丛万丐万丗()` has 9 UI call sites and keeps
-   the inventory topped up after a profile reload. Both receive the controller
-   as `this`, so no singleton lookup is needed.
-3. **Raise levels at their source.** Current level is
-   `countToLevel(ownedDuplicates)` - the level getter itself calls the duplicate
-   counter (`BL` at `0x024B13D4`). The counter has 24 live call sites, so
-   reporting `与丏一丗七丝一七丏()` (the configured ceiling, read from the balance
-   config singleton) makes level, upgrade progress and "is maxed" agree even at
-   the inlined sites. The ceiling method never calls back into the counter, so
-   the substitution cannot recurse.
-4. The old level hook is kept as a fallback for its 8 live call sites, still
-   clamped to the module's own maximum.
-
-Nothing is written to `Progress`, so there is no save round-trip and no
-cheat-detection churn.
-
-## Verifying on device
-
-```sh
-adb logcat -c && adb logcat -s OPG3D | grep 23.1.3-modules
-```
-
-Expected, in order:
+`丟丅丁不丄丟不丑丁` (TypeDefIndex 12005) — модель хранилища одного предмета:
 
 ```
-23.1.3-modules: grant armed, every module unlocked at up to level 10
-23.1.3-modules: added 42 module entries, inventory now holds 42
-23.1.3-modules: added N module set entries, inventory now holds N
+int                              <id>       @ 0x10
+ModuleData.ModuleRarity          <rarity>   @ 0x14
+ModuleData.ModuleCategory        <category> @ 0x18
+Dictionary<string, module>       slots      @ 0x20
+丅丏丏丛丕丁丟上丞 itemRecord()                 0x28DB2F8
 ```
 
-If `added 0` appears the inventory already contained the catalogue; if
-`could not walk the ... lists` appears the `List<T>` members failed to resolve
-and the raw pointers are logged. Symbolise any crash with:
+`七丌丑世丂丟丞丞丟()` — единственный во всём образе вызывающий
+`专丂丄丈一丂世丑丏.丆丌丌丆且丙七丌丞(int)` (`0x171F9D8`), то есть выборку профильных
+записей по id предмета.
 
-```sh
-python3 tools/symbolize_log.py --dump dump2313.cs --log logcat.txt
+## Карта данных
+
+| RVA | Значение | Прямых вызовов |
+|---|---|---|
+| `0x24B0BB0` | `module.七且丐东丒丆丑丈万()` — уровень | 24 |
+| `0x2EF431C` → `0x2F399B0` | `.cctor` каталога (42 + 42) | — |
+| `0x3048A5C` / `0x3048AB4` | каталог: модули / наборы | 0 / 0 |
+| `0x281473C` / `0x2814784` | геттеры инвентаря (заинлайнены) | **0 / 0** |
+| `0x2814810` | `ModulesController.OnInstanceCreated()` | 0 |
+| `0x28DCBB4` | `ModuleStorageView.上专丅丑丘丟丙东与()` | 0 |
+| `0x23B6680` | `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与()` | — |
+| `0x23BA03C` | `ModuleInsertPanel.上丘与丛丝业丆万丁()` | — |
+| `0x28DB524` | `model.七丌丑世丂丟丞丞丟()` — цель r3, снята | 34 |
+| `0x171F9D8` | `профиль.丆丌丌丆且丙七丌丞(int)` | 1 (из `0x28DB524`) |
+
+Поля `ModulesController`: `+0x18 ModulesContainer`, `+0x20` и `+0x28` словари,
+**`+0x30 List<module> 丅与世丕业丘不丂丈`**, **`+0x38 List<moduleSet> 下丘丌一丞丛丂三丗`**,
+`+0x40` / `+0x48` карты моделей предметов.
+
+## История ревизий
+
+### r1 — хук не встал
+
+Find/replace испортил два символа в имени геттера уровня: `丐` (U+4E10) и
+`丒` (U+4E12) стали `十` (U+5341). U+5341 не встречается в дампе 23.1.3 ни
+разу, длина в байтах сохранилась, обязательный хук не разрешился и модуль
+отключился целиком. Лечится пином точных байтов через `static_assert`.
+
+### r2 — запись в нечитаемые поля
+
+Каталог писался в `+0x40` / `+0x48` — это карты моделей предметов, а не
+инвентарь. No-op на экране.
+
+### r3 — мерж сработал, но не туда
+
+Каталог вливался в `0x28DB524`, то есть в список модулей, установленных на
+текущем предмете. На устройстве: панель `Module Effects` переполнилась и
+наложила эффекты друг на друга, вся сетка погасла с `Same mod type already in
+use`, счётчик инвентаря не изменился. Побочная польза: доказано, что чтение
+каталога из хука UI-потока полностью безопасно.
+
+### r4 — краш на старте
+
+`install()` заканчивался проверкой каталога. Первое чтение статического
+списка каталога запускает его `.cctor`, а тот тянет определения модулей через
+`PGCompany.AssetBundles_v3` → выборку конфига. На ~950 мс после старта
+процесса этот слой ещё не поднят:
+
+```
+E/Unity  Settings are null.
+         PGCompany.AssetBundles_v3.丏丄丛丟丏丛上专丁:上丈丛丁丕丟且上业(String, String, T&, String&)
+E/CRASH  signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x68
+         Cause: null pointer dereference
+         #00 pc 00000000004e975c  /apex/com.android.art/lib64/libart.so
 ```
 
-## Crafting: state of the port after the same measurement
+Поток `Thread-20` — это bootstrap-поток `init_thread`. Он привязан к рантайму
+IL2CPP через `il2cpp_thread_attach`, но **никогда не привязан к JVM**, поэтому
+любой managed-путь, доходящий до JNI, получает нулевой `JNIEnv` и роняет
+процесс внутри `libart`. В логе видно, что установка хуков успела пройти
+полностью (`inventory routes installed 4/4`), а строки `armed:` уже нет — это
+и локализует краш до одной инструкции.
 
-The crafting hooks were checked the same way. Unlike the module getters they are
-live, so `crafting_2313.h` is not affected by the inlining problem:
+### r5 — managed-код только с игровых потоков
 
-| hook target | RVA | direct call sites |
-| --- | --- | --- |
-| detail gate | `0x0227F8B0` | 12 |
-| owned details | `0x0227F954` | 47 |
-| FortsManager craft clock | `0x03B81348` | 19 |
-| LobbyItemsController craft clock | `0x03F7B588` | 17 |
-| FortCraftController banner | `0x03E41010` | 7 |
-| LobbyCraftController banner | `0x02730254` | 1 |
-| clan part count | `0x03C2A078` | 2 |
-| clan "has part" | `0x03C2A12C` | **0** (inlined, hook is a no-op) |
-| lobby catalogue ready / list / add | `0x03F768E4` / `0x03F7F390` / `0x03F8AC04` | 5 / 7 / 11 |
-| `LobbyItemsController.Update` | `0x03F8E354` | 0 (engine-driven, expected) |
+1. `verify_catalog()` убран из `install()`; стал ленивым одноразовым
+   `verify_catalog_once()` и вызывается из `grant_inventory()`.
+2. `install()` запоминает свой `pthread_self()`, а `managed_calls_allowed()`
+   отклоняет любой managed-вызов, пришедший с этого потока.
+3. `install()` теперь делает только резолв метаданных и патч кода.
 
-What is still missing compared with `crafting_1610.h` - these five 16.1.0
-behaviours were never ported and are the reason not every craft item is
-unlocked:
+Маршруты гранта (все — на игровых потоках):
 
-1. required details forced to `0` (`BalanceController`, 1610
-   `hook_required_details`);
-2. clan craft section availability forced to `kAvailable = 3`;
-3. clan medal price forced to `0`;
-4. dead-clan hint suppression on `ShopNGUIController`;
-5. the craft-press wrapper with the `start_craft_directly()` fallback
-   (`PressScope`, `g_press_depth`, `g_press_refused`, `craft_slot_busy()`).
+| Маршрут | Когда |
+|---|---|
+| `ModulesController.OnInstanceCreated` | захват синглтона, грант после оригинала |
+| `ModuleStorageView.上专丅丑丘丟丙东与` | перед перестроением сетки |
+| `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与` | перед обновлением экрана |
+| `ModuleInsertPanel.上丘与丛丝业丆万丁` | перед панелью вставки |
+| `MainMenuController.Update` | пульс каждые 30 кадров |
 
-Porting them needs the 23.1.3 obfuscated names, which do not carry over from
-16.1.0. Narrowing pass already done - `BalanceController` exposes these
-`int(string)` candidates:
+Объект списка никогда не подменяется — только `Contains` + `Add`, иначе
+заинлайненные читатели остались бы со старой ссылкой. Модели предметов не
+трогаются вообще.
 
-| candidate | RVA | callers |
-| --- | --- | --- |
-| `丐专丘业且丞丈下丛(string)` | `0x04717CE0` | 49 (`WeaponManager`, `ClanStockWindow`, offers) |
-| `丅丏且丘丕丌丗七上(string)` | `0x04717B64` | 3 (speed-up window) |
-| `丁丆不丆业丆且丛丕(string)` | `0x04716C50` | 1 |
-| `与七丐丟丂丝丅不业(string)` / `一丅丁万丕丅且不不(string)` / `丙丝丗东七丈东三丏(string)` | `0x047180E0` / `0x047181CC` / `0x04734850` | 0 (inlined) |
+## Защита от регресса r1
 
-`0x04717CE0` is the strongest candidate for the price/required-details lookup,
-but it is reached from the weapon shop and the offer system as well, so forcing
-it to zero without first confirming the semantics would change far more than
-crafting. That confirmation is deliberately left out of this change.
+* `static_assert` пинит точные UTF-8 байты `kCurrentLevel`, `kInventoryModules`
+  и `kInventorySets`;
+* отдельный `static_assert` проверяет, что ни в одном из девяти обфусцированных
+  имён нет байтов U+5341.
+
+Любая порча имени ломает сборку, а не устройство.
+
+## Как проверять
+
+```
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion \
+    -Werror -fsyntax-only tu.cpp
+```
+
+Плюс сверка всех обфусцированных имён с `dump2313.cs` и негативный тест:
+подмена любого символа в пиненой константе на `十` должна валить сборку
+(проверено — по два срабатывания `static_assert` на каждую из трёх констант).
+
+На устройстве:
+
+```
+adb logcat -c
+adb logcat -s OPG3D | grep 23.1.3-modules
+```
+
+Ожидаемая последовательность:
+
+```
+inventory routes installed 4/4
+armed: level X guaranteed, catalogue granted into the ModulesController
+       inventory lists from game threads only (expect 42 modules, 42 module sets)
+modules controller captured
+catalogue verified (42 modules, 42 sets)
+inventory grant (controller ready): modules 4 +38 -> 42, sets 3 +39 -> 42
+module inventory complete (42/42 modules, 42/42 sets)
+```
+
+Лог нужно снимать **после** захода в «Арсенал → Модули»: строки гранта
+появляются только на игровых потоках, а не во время загрузки.
+
+Диагностика отказов:
+
+| Строка | Что означает |
+|---|---|
+| `managed call refused` | попытка managed-вызова с bootstrap-потока (не должна появляться) |
+| `controller instance not seen yet` | `OnInstanceCreated` не перехвачен |
+| `inventory field missing` | поле `+0x30` не найдено |
+| `inventory list is null` | поле есть, список не создан |
+| `catalogue mismatch` | каталог отдал не 42 + 42 |
+
+## Если счётчик всё ещё не растёт
+
+Следующие цели по приоритету:
+
+1. `ModulesContainer.Modules_v2` `+0x18` и `Storages` `+0x20` через поле
+   `ModulesController.丟三一丄丈丒三丈丞` `+0x18`;
+2. прямой вызов `丝丈丞上一下丅丁丘(module)` `0x281667C` (0 вызывающих, но метод
+   существует);
+3. профильный writer `世丏七丟业业丑丄上(int, int)` `0x172035C`.
+
+Тупики, проверенные и закрытые: `AddAllModulesDEV` и `AddAllMaxModulesDEV` —
+заглушки из 4 байт (`D65F03C0`); `与丕专丐专丐七丗丛` `0x2817230` — 0 вызывающих;
+`0x23B8D34` и `0x2816ED8` — только из `GadgetRecipesUI`; `0x28196BC` — мутирует
+профиль, использовать нельзя.
