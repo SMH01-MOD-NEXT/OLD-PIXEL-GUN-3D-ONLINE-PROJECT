@@ -8,10 +8,12 @@
 
 #include "backend_local_2313.h"
 #include "config.h"
+#include "crafting_2313.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
 #include "il2cpp_runtime_2313.h"
 #include "loading_stall_guard_2313.h"
+#include "lobby_catalog_2313.h"
 #include "log.h"
 #include "obb_provisioner.h"
 #include "photon_2313.h"
@@ -21,6 +23,7 @@
 #include "startup_guards_2313.h"
 #include "startup_trace_2313.h"
 #include "version_2313.h"
+#include "weapon_modules_2313.h"
 
 namespace {
 
@@ -125,24 +128,32 @@ void* init_thread(void*) {
     const bool default_plugin  = photon_default_plugin_2313::install_hooks();
     const bool photon_trace    = photon_trace_2313::install_hooks();
     const bool progression     = progression_2313::install_hooks();
+    const bool crafting        = crafting_2313::install_hooks();
+    const bool lobby_catalog   = lobby_catalog_2313::install_hooks();
+    const bool weapon_modules  = weapon_modules_2313::install_hooks();
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
-        default_plugin && photon_trace && progression) {
+        default_plugin && photon_trace && progression && crafting &&
+        lobby_catalog && weapon_modules) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
              "is active, Switcher heartbeat tracing is on, offline currency "
-             "and level progression are granted from the main menu");
+             "and level progression are granted from the main menu, weapon "
+             "and clan crafting run off a local clock and local stock, the "
+             "lobby craft catalogue is granted locally, and every weapon "
+             "module is unlocked at level 10");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
              "local-backend=%d photon=%d plugin=%d photon-trace=%d "
-             "progression=%d",
+             "progression=%d crafting=%d lobby-catalog=%d modules=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
              photon_online ? 1 : 0, default_plugin ? 1 : 0,
-             photon_trace ? 1 : 0, progression ? 1 : 0);
+             photon_trace ? 1 : 0, progression ? 1 : 0,
+             crafting ? 1 : 0, lobby_catalog ? 1 : 0, weapon_modules ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
