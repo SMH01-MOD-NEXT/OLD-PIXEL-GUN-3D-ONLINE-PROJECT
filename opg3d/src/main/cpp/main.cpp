@@ -17,10 +17,12 @@
 #include "loading_stall_guard_2313.h"
 #include "lobby_catalog_2313.h"
 #include "log.h"
+#include "net_stall_guard_2313.h"
 #include "obb_provisioner.h"
 #include "photon_2313.h"
 #include "photon_default_plugin_2313.h"
 #include "photon_trace_2313.h"
+#include "post_match_trace_2313.h"
 #include "progression_2313.h"
 #include "startup_guards_2313.h"
 #include "startup_trace_2313.h"
@@ -135,10 +137,13 @@ void* init_thread(void*) {
     const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     const bool local_identity   = identity_2313::install_hooks();
     const bool assets_payload   = assets_data_2313::install_hooks(base);
+    const bool net_stall        = net_stall_guard_2313::install_hooks();
+    const bool post_match_trace = post_match_trace_2313::install_hooks();
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&
-        lobby_catalog && weapon_modules && local_identity && assets_payload) {
+        lobby_catalog && weapon_modules && local_identity &&
+        assets_payload && net_stall && post_match_trace) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
@@ -149,20 +154,24 @@ void* init_thread(void*) {
              "and armor module is unlocked at level 10, the player id is "
              "minted on device with no backend round-trip, and an in-APK "
              "assets/data payload is unpacked into the game's own resource "
-             "root");
+             "root, the repeated blocking backend name lookup no longer "
+             "stalls the game thread, and the end-of-match flow is "
+             "traced");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
              "local-backend=%d photon=%d plugin=%d photon-trace=%d "
              "progression=%d crafting=%d lobby-catalog=%d modules=%d "
-             "identity=%d assets-data=%d",
+             "identity=%d assets-data=%d net-stall=%d "
+             "post-match-trace=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
              photon_online ? 1 : 0, default_plugin ? 1 : 0,
              photon_trace ? 1 : 0, progression ? 1 : 0,
              crafting ? 1 : 0, lobby_catalog ? 1 : 0, weapon_modules ? 1 : 0,
-             local_identity ? 1 : 0, assets_payload ? 1 : 0);
+             local_identity ? 1 : 0, assets_payload ? 1 : 0,
+             net_stall ? 1 : 0, post_match_trace ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
