@@ -6,29 +6,56 @@
 // Makes the complete built-in catalogue (42 modules and 42 module-set entries)
 // available in ModulesController and reports every module at level X (10).
 //
-// The implementation deliberately patches live data and the real level source:
+// Root cause of the previous revision being dead on device
+// --------------------------------------------------------
+// The level-source constant had been corrupted by a bad search/replace: two of
+// its CJK code points (U+4E10 and U+4E12) had been rewritten to U+5341. The
+// resulting identifier does not exist anywhere in this build's metadata, so the
+// fail-closed hook wrapper refused to patch anything and the whole feature was
+// switched off at startup:
 //
-// * ModulesController's trivial list getters have zero direct BL call sites;
+//   hook: REQUIRED method not found: 丐三七世丝丗与丛上.七且十东十丆丑丈万/0
+//   23.1.3-modules: install incomplete, module disabled
+//   init: 23.1.3 port incomplete: ... lobby-catalog=1 modules=0
+//
+// U+5341 does not occur a single time in the supplied dump, which is proof that
+// the spelling was never valid. The verified name is 七且丐东丒丆丑丈万.
+// A static_assert below pins its exact UTF-8 bytes so this class of corruption
+// can never reach a build again.
+//
+// Second defect: every hook was folded into one `ok` flag, so a single miss on
+// a purely auxiliary route disabled the guaranteed level fix as well. Hooks are
+// now split into one critical route and several optional ones.
+//
+// Verified facts (measured on the supplied libil2cpp.so, RVA == file offset)
+// -------------------------------------------------------------------------
+// * module::七且丐东丒丆丑丈万() (0x024B0BB0) is the real current-level source:
+//   132-byte body with 24 direct BL call sites, so it is genuinely reachable
+//   and cannot have been inlined away. The modules UI renders its result as a
+//   Roman numeral. An earlier revision hooked 0x024B0C38, which is the total
+//   owned-parts count; that is why the UI showed XL/XX/XXV/LXXX instead of X.
+// * 0x024B13C8 (8 call sites), 0x024B140C (4) and 0x024B14EC (7) are the
+//   next-level requirement, the cumulative parts threshold and the progress
+//   inside the level. They must not be clamped or replaced.
+// * The catalogue .cctor (0x02EF431C, 284308 bytes) contains exactly 42 calls
+//   to module::.ctor (0x024B1150) and 42 calls to moduleSet::.ctor
+//   (0x024B3278). The complete catalogue is already shipped, so no managed
+//   objects are fabricated.
+// * ModulesController's trivial list getters (0x0281473C, 0x02814784) and both
+//   catalogue getters (0x03048A5C, 0x03048AB4) have zero direct BL call sites:
 //   IL2CPP/clang inlined them. Hooking those bodies installs successfully but
-//   never changes the inventory.
-// * The catalogue .cctor contains exactly 42 calls to module::.ctor(ItemRecord)
-//   and 42 calls to moduleSet::.ctor(ItemRecord). These are the complete objects
-//   already shipped by this build, so no managed objects are fabricated.
-// * ModuleStorageView's model setter (0x028DCB90) is only 0x24 bytes long, so
-//   like the trivial getters it is inlined at its call sites: installing that
-//   hook succeeds but it is never entered. Device logs confirmed this.
-// * ModuleArmoryInfoScreen is the screen the player actually opens. Its entry
-//   points are large real bodies (open 0x023B5DB8, prebuild 0x023B6554), so
-//   they cannot have been inlined away. The grant now runs there, immediately
-//   before the screen reads the controller, and additionally from the
-//   main-menu pump driven by MainMenuController.Update.
-// * module::七且十东十丆丑丈万() (0x024B0BB0) is the actual current-level source.
-//   The modules UI prints its result as a Roman numeral. An earlier revision
-//   incorrectly returned 0x024B0C38, which is the total owned-parts count; that
-//   is exactly why the UI showed XL/XX/LXXX instead of X.
-// * 0x024B13C8, 0x024B140C and 0x024B14EC are respectively the next-level
-//   requirement, cumulative parts threshold and progress inside the level.
-//   They must not be clamped or replaced.
+//   never fires, which is why the very first revision changed nothing. We call
+//   the catalogue getters ourselves through their method pointers instead.
+// * AddAllModulesDEV (0x028178E4) and AddAllMaxModulesDEV (0x028178E8) are
+//   4-byte bare RET stubs (D65F03C0). They are dead and cannot be used.
+// * The auxiliary UI routes are weak entry points, so none of them may be
+//   load-bearing: ModuleStorageView setter 0x028DCB90 is a 0x24-byte body with
+//   only 4 call sites, its refresh 0x028DCBB4 has 0, ModuleArmoryInfoScreen
+//   Awake 0x023B5C08 and open 0x023B5DB8 have 0 direct BL (runtime/delegate
+//   dispatch) and prebuild 0x023B6554 has 1.
+// * The guaranteed grant driver is therefore MainMenuController.Update, which
+//   progression_2313.h hooks as a required target and which calls
+//   pump_from_main_menu() every main-menu frame.
 //
 // All mutations are process-local. Nothing is written directly to Progress.
 // Entries already present are retained; verified full-list publication is the
@@ -78,7 +105,36 @@ constexpr const char* kInfoScreenAwake = "Awake";
 constexpr const char* kInfoScreenShow = "东不丁丁丟丂丝不丁";
 constexpr const char* kInfoScreenPrebuild = "丏丁丗东且三世丄丏";
 constexpr const char* kModuleClass = "丐三七世丝丗与丛上";
-constexpr const char* kCurrentLevel = "七且十东十丆丑丈万";
+
+// module::七且丐东丒丆丑丈万() @ RVA 0x024B0BB0 - the current-level source.
+constexpr const char* kCurrentLevel = "七且丐东丒丆丑丈万";
+
+// Regression guard for the corruption that disabled this module: the previous
+// revision shipped U+5341 in place of U+4E10 and U+4E12, an identifier that
+// does not exist in the 23.1.3 metadata. Pin the exact UTF-8 byte sequence of
+// the verified name so a mangled spelling fails the build instead of the
+// device.
+constexpr bool equal_bytes(const char* a, const char* b) {
+    while (*a != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+static_assert(
+    equal_bytes(kCurrentLevel,
+                "\xE4\xB8\x83"   // U+4E03 七
+                "\xE4\xB8\x94"   // U+4E14 且
+                "\xE4\xB8\x90"   // U+4E10 丐  (was corrupted to U+5341)
+                "\xE4\xB8\x9C"   // U+4E1C 东
+                "\xE4\xB8\x92"   // U+4E12 丒  (was corrupted to U+5341)
+                "\xE4\xB8\x86"   // U+4E06 丆
+                "\xE4\xB8\x91"   // U+4E11 丑
+                "\xE4\xB8\x88"   // U+4E08 丈
+                "\xE4\xB8\x87"), // U+4E07 万
+    "kCurrentLevel must stay byte-identical to module::0x024B0BB0 as spelled in "
+    "the 23.1.3 metadata; a corrupted identifier silently disables the module");
 
 using StaticObjFn = void* (*)(void* method);
 using InstanceObjFn = void* (*)(void* self, void* method);
@@ -185,6 +241,7 @@ inline uint64_t g_level_calls = 0;
 inline uint64_t g_main_menu_frames = 0;
 inline uint64_t g_startup_frames = 0;
 inline uint64_t g_pump_nulls = 0;
+inline bool g_installed = false;
 inline bool g_catalog_size_reported = false;
 inline bool g_modules_complete_reported = false;
 inline bool g_sets_complete_reported = false;
@@ -198,11 +255,28 @@ inline bool g_controller_null_reported = false;
 inline bool g_pump_reached_reported = false;
 inline thread_local bool g_in_catalog = false;
 inline thread_local bool g_in_grant = false;
+inline thread_local bool g_in_prepare = false;
 
 inline void* controller_instance() {
     if (!g_controller_instance) return nullptr;
     return reinterpret_cast<StaticObjFn>(g_controller_instance.ptr)(
         g_controller_instance.info);
+}
+
+// Calls the real storage getter. When our hook is installed the trampoline is
+// the only safe entry (calling the patched method pointer would re-enter the
+// hook); when the optional hook could not be installed the original method
+// pointer is still callable directly.
+inline void* call_original_selected(void* controller) {
+    if (controller == nullptr) return nullptr;
+    if (g_orig_selected != nullptr && g_selected_method.info != nullptr) {
+        return g_orig_selected(controller, g_selected_method.info);
+    }
+    if (g_selected_method) {
+        return reinterpret_cast<InstanceObjFn>(g_selected_method.ptr)(
+            controller, g_selected_method.info);
+    }
+    return nullptr;
 }
 
 inline void* fetch_catalog(const Managed& source) {
@@ -312,9 +386,11 @@ inline void report_catalog_sizes(int32_t modules, int32_t sets) {
         LOGI("23.1.3-modules: verified built-in catalogue: %d modules, %d module sets",
              modules, sets);
     } else {
+        // Diagnostic only. The grant publishes whatever the build ships, so an
+        // unexpected size must not stop the inventory from being completed.
         LOGE("23.1.3-modules: unexpected catalogue size: modules=%d (expected %d), "
-             "sets=%d (expected %d)", modules, kExpectedModules, sets,
-             kExpectedModuleSets);
+             "sets=%d (expected %d); granting the reported counts anyway",
+             modules, kExpectedModules, sets, kExpectedModuleSets);
     }
 }
 
@@ -359,9 +435,11 @@ inline GrantStatus grant(void* self, const char* reason) {
                  g_modules_error_reported);
     report_merge(reason, "module-set", sets, g_sets_complete_reported,
                  g_sets_error_reported);
-    status.complete = modules.ok && sets.ok &&
-                      modules.source == kExpectedModules &&
-                      sets.source == kExpectedModuleSets;
+    // Completion means "every entry the build ships is now owned". It is
+    // deliberately not tied to the hard-coded 42/42 expectation: if this build
+    // ever shipped a different catalogue size, the UI must still be refreshed
+    // instead of silently never rebuilding.
+    status.complete = modules.ok && sets.ok;
     status.changed = modules.added > 0 || sets.added > 0 ||
                      modules.replaced || sets.replaced;
     g_in_grant = false;
@@ -401,44 +479,48 @@ inline void reset_storage_models(void* self, const char* reason) {
 }
 
 inline void* prepare_storage_model(const char* reason) {
+    if (g_in_prepare) return nullptr;
+    g_in_prepare = true;
+    void* model = nullptr;
     void* controller = controller_instance();
     if (controller == nullptr) {
         if (!g_controller_null_reported) {
             g_controller_null_reported = true;
             LOGE("23.1.3-modules: %s: ModulesController.Instance is null", reason);
         }
+        g_in_prepare = false;
         return nullptr;
     }
     if (!g_storage_view_rebuilt) g_storage_reset_done = false;
     const GrantStatus status = grant(controller, reason);
     if (status.changed) g_storage_reset_done = false;
-    if (!status.complete) return nullptr;
-    reset_storage_models(controller, reason);
-    if (g_orig_selected == nullptr || g_selected_method.info == nullptr) {
-        LOGE("23.1.3-modules: %s: original storage getter unavailable", reason);
+    if (!status.complete) {
+        g_in_prepare = false;
         return nullptr;
     }
-    void* model = g_orig_selected(controller, g_selected_method.info);
+    reset_storage_models(controller, reason);
+    model = call_original_selected(controller);
     if (model == nullptr) {
         LOGE("23.1.3-modules: %s: rebuilt storage model is null", reason);
+        g_in_prepare = false;
         return nullptr;
     }
     if (!g_storage_view_rebuilt) {
-        LOGI("23.1.3-modules: %s: replaced ModuleStorageView model after 42/42 grant",
+        LOGI("23.1.3-modules: %s: replaced ModuleStorageView model after full grant",
              reason);
     }
     g_storage_view_rebuilt = true;
+    g_in_prepare = false;
     return model;
 }
 
 // Guaranteed grant driver.
 //
-// The device logs proved that the controller lifecycle methods and the trivial
-// ModuleStorageView setter are not reached on this route after the native
-// hooks are installed, so the grant is driven from paths the same logs show
-// executing: MainMenuController.Update and the ModuleArmoryInfoScreen entry
-// points. pump() is idempotent, self-throttling and always logs its outcome
-// once, so a failure can no longer be silent.
+// Every controller/UI route measured on this build is a weak entry point (see
+// the file header), so the grant is driven from a path the device logs prove
+// executes: MainMenuController.Update, hooked as a required target in
+// progression_2313.h. pump() is idempotent, self-throttling and always logs its
+// outcome once, so a failure can no longer be silent.
 inline void pump(const char* reason) {
     void* controller = controller_instance();
     if (controller == nullptr) {
@@ -516,10 +598,10 @@ inline void storage_view_refresh_hook(void* self, void* method) {
     }
 }
 
-// ModuleArmoryInfoScreen is the screen the player opens. Its bodies are large
-// (open 0x023B5DB8, prebuild 0x023B6554), so unlike the trivial
-// ModuleStorageView setter they cannot have been inlined away. Granting here
-// happens immediately before the screen reads the controller.
+// ModuleArmoryInfoScreen is the screen the player opens. Granting here happens
+// immediately before the screen reads the controller. Awake (0x023B5C08) and
+// open (0x023B5DB8) have no direct BL call sites and prebuild (0x023B6554) has
+// one, so these are opportunistic routes only - never the guarantee.
 inline void screen_awake_hook(void* self, void* method) {
     pump("module screen awake");
     if (g_orig_screen_awake != nullptr) g_orig_screen_awake(self, method);
@@ -549,13 +631,13 @@ inline int32_t current_level_hook(void* self, void* method) {
         g_controller = controller_instance();
     }
     if (g_controller != nullptr && !g_in_grant &&
-        (g_level_calls % kLevelRecheckEvery) == 1) {
+        (g_level_calls % kLevelRecheckEvery) == 1u) {
         (void)grant(g_controller, "level fallback");
     }
     const int32_t level = original >= kTargetModuleLevel
                               ? original
                               : kTargetModuleLevel;
-    if ((g_level_calls % kLevelLogEvery) == 1) {
+    if ((g_level_calls % kLevelLogEvery) == 1u) {
         LOGI("23.1.3-modules: displayed level %d -> %d (call %llu)",
              original, level, static_cast<unsigned long long>(g_level_calls));
     }
@@ -563,6 +645,8 @@ inline int32_t current_level_hook(void* self, void* method) {
 }
 
 inline bool install() {
+    if (g_installed) return true;
+
     bool resolved = true;
     resolved &= bind(g_catalog_modules, kNs, kCatalogClass, kCatalogModules, 0);
     resolved &= bind(g_catalog_sets, kNs, kCatalogClass, kCatalogSets, 0);
@@ -594,51 +678,79 @@ inline bool install() {
         return false;
     }
 
-    bool ok = true;
-    ok &= hook::install({kNs, kControllerClass, kOnInstanceCreated, 0},
-                        reinterpret_cast<void*>(&on_instance_created_hook),
-                        reinterpret_cast<void**>(&g_orig_on_instance_created), true);
-    ok &= hook::install({kNs, kControllerClass, kControllerReload, 0},
-                        reinterpret_cast<void*>(&reload_hook),
-                        reinterpret_cast<void**>(&g_orig_reload), true);
-    ok &= hook::install({kNs, kControllerClass, kControllerSelected, 0},
-                        reinterpret_cast<void*>(&selected_hook),
-                        reinterpret_cast<void**>(&g_orig_selected), true);
-    ok &= hook::install({kNs, kStorageViewClass, kStorageViewSet, 1},
-                        reinterpret_cast<void*>(&storage_view_set_hook),
-                        reinterpret_cast<void**>(&g_orig_storage_view_set), true);
-    ok &= hook::install({kNs, kStorageViewClass, kStorageViewRefresh, 0},
-                        reinterpret_cast<void*>(&storage_view_refresh_hook),
-                        reinterpret_cast<void**>(&g_orig_storage_view_refresh), true);
-    // The module screen hooks are diagnostics plus a just-in-time grant. A
-    // metadata miss here must never disable the level fix, so they are not
-    // folded into `ok`.
-    const bool screen_awake = hook::install(
-        {kNs, kInfoScreenClass, kInfoScreenAwake, 0},
-        reinterpret_cast<void*>(&screen_awake_hook),
-        reinterpret_cast<void**>(&g_orig_screen_awake), true);
-    const bool screen_show = hook::install(
-        {kNs, kInfoScreenClass, kInfoScreenShow, 1},
-        reinterpret_cast<void*>(&screen_show_hook),
-        reinterpret_cast<void**>(&g_orig_screen_show), true);
-    const bool screen_prebuild = hook::install(
-        {kNs, kInfoScreenClass, kInfoScreenPrebuild, 0},
-        reinterpret_cast<void*>(&screen_prebuild_hook),
-        reinterpret_cast<void**>(&g_orig_screen_prebuild), true);
-    LOGI("23.1.3-modules: module screen entry points hooked "
-         "(awake=%d open=%d prebuild=%d)",
-         screen_awake ? 1 : 0, screen_show ? 1 : 0, screen_prebuild ? 1 : 0);
-    ok &= hook::install({kNs, kModuleClass, kCurrentLevel, 0},
-                        reinterpret_cast<void*>(&current_level_hook),
-                        reinterpret_cast<void**>(&g_orig_current_level), true);
-    if (ok) {
-        LOGI("23.1.3-modules: grant pump armed on main menu + module screen "
-             "(expect %d modules at level X)",
-             kExpectedModules);
-    } else {
-        LOGE("23.1.3-modules: install incomplete, module disabled");
+    // ---- critical route -----------------------------------------------------
+    // The level source is the only hook the feature cannot work without, and
+    // it is installed first so nothing below can affect it. This is exactly the
+    // hook the previous revision lost to a corrupted identifier.
+    if (!hook::install({kNs, kModuleClass, kCurrentLevel, 0},
+                       reinterpret_cast<void*>(&current_level_hook),
+                       reinterpret_cast<void**>(&g_orig_current_level), true)) {
+        LOGE("23.1.3-modules: level source %s::%s/0 could not be hooked, "
+             "module disabled", kModuleClass, kCurrentLevel);
+        return false;
     }
-    return ok;
+
+    // ---- optional routes ----------------------------------------------------
+    // Extra grant/refresh entry points. Each one is best-effort: a metadata or
+    // patch miss here degrades refresh latency but must never disable the
+    // guaranteed level fix or the main-menu grant pump again.
+    struct Route {
+        const char* label;
+        bool ok;
+    };
+    const Route routes[] = {
+        {kOnInstanceCreated,
+         hook::install({kNs, kControllerClass, kOnInstanceCreated, 0},
+                       reinterpret_cast<void*>(&on_instance_created_hook),
+                       reinterpret_cast<void**>(&g_orig_on_instance_created))},
+        {"profile reload",
+         hook::install({kNs, kControllerClass, kControllerReload, 0},
+                       reinterpret_cast<void*>(&reload_hook),
+                       reinterpret_cast<void**>(&g_orig_reload))},
+        {"storage getter",
+         hook::install({kNs, kControllerClass, kControllerSelected, 0},
+                       reinterpret_cast<void*>(&selected_hook),
+                       reinterpret_cast<void**>(&g_orig_selected))},
+        {"storage-view setter",
+         hook::install({kNs, kStorageViewClass, kStorageViewSet, 1},
+                       reinterpret_cast<void*>(&storage_view_set_hook),
+                       reinterpret_cast<void**>(&g_orig_storage_view_set))},
+        {"storage-view refresh",
+         hook::install({kNs, kStorageViewClass, kStorageViewRefresh, 0},
+                       reinterpret_cast<void*>(&storage_view_refresh_hook),
+                       reinterpret_cast<void**>(&g_orig_storage_view_refresh))},
+        {"screen awake",
+         hook::install({kNs, kInfoScreenClass, kInfoScreenAwake, 0},
+                       reinterpret_cast<void*>(&screen_awake_hook),
+                       reinterpret_cast<void**>(&g_orig_screen_awake))},
+        {"screen open",
+         hook::install({kNs, kInfoScreenClass, kInfoScreenShow, 1},
+                       reinterpret_cast<void*>(&screen_show_hook),
+                       reinterpret_cast<void**>(&g_orig_screen_show))},
+        {"screen prebuild",
+         hook::install({kNs, kInfoScreenClass, kInfoScreenPrebuild, 0},
+                       reinterpret_cast<void*>(&screen_prebuild_hook),
+                       reinterpret_cast<void**>(&g_orig_screen_prebuild))},
+    };
+    constexpr int kRouteCount = static_cast<int>(sizeof(routes) / sizeof(routes[0]));
+    int available = 0;
+    for (int index = 0; index < kRouteCount; ++index) {
+        if (routes[index].ok) {
+            ++available;
+        } else {
+            LOGE("23.1.3-modules: optional route '%s' unavailable; continuing "
+                 "(level fix and main-menu grant are unaffected)",
+                 routes[index].label);
+        }
+    }
+    LOGI("23.1.3-modules: optional refresh routes installed %d/%d", available,
+         kRouteCount);
+
+    g_installed = true;
+    LOGI("23.1.3-modules: armed: level X guaranteed, catalogue grant pumped from "
+         "main menu + module screen (expect %d modules, %d module sets)",
+         kExpectedModules, kExpectedModuleSets);
+    return true;
 }
 
 inline void pump_from_startup() {
