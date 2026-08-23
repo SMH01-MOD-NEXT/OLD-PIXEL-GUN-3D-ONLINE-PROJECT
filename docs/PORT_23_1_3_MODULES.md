@@ -1,196 +1,207 @@
-# 23.1.3 weapon modules — verified catalogue and level-X grant
+# 23.1.3 — модули оружия: все 42 и уровень X
 
-## Root cause: why the modules "crashed and switched off"
+Цель: игроку доступны все 42 встроенных модуля, каждый — на 10 уровне (в UI
+отображается римской «X»).
 
-The supplied device log (`libopg3d build 23.1.3 ARM64 ... built Aug 23 2026 11:12:11`)
-shows all eight controller/UI hooks installing successfully, then one hard
-failure that took the whole feature down:
+Всё измерено по приложенному `libil2cpp.so` (arm64-v8a) и `dump2313.cs`.
+В этой сборке **RVA == file offset**, поэтому адреса ниже одновременно являются
+смещениями в файле. Граф вызовов получен полным декодом прямых `BL`
+(`(word >> 26) == 0x25`, `imm26` со знаковым расширением) по всему образу.
 
-```text
-hook: installed ModulesController.OnInstanceCreated/0 @ 0x6dc7c22810
-hook: installed ModulesController.丞业丝丁丆丑丑丕丟/0 @ 0x6dc7c23668
-hook: installed ModulesController.上丂丁丙丛万丐万丗/0 @ 0x6dc7c23f94
-hook: installed ModuleStorageView.丝万不丘下丄丄三丟/1 @ 0x6dc7ceab90
-hook: installed ModuleStorageView.上专丅丑丘丟丙东与/0 @ 0x6dc7ceabb4
-hook: installed ModuleArmoryInfoScreen.Awake/0 @ 0x6dc77c3c08
-hook: installed ModuleArmoryInfoScreen.东不丁丁丟丂丝不丁/1 @ 0x6dc77c3db8
-hook: installed ModuleArmoryInfoScreen.丏丁丗东且三世丄丏/0 @ 0x6dc77c4554
-23.1.3-modules: module screen entry points hooked (awake=1 open=1 prebuild=1)
+---
+
+## Хронология: что было сломано и почему
+
+### Ревизия 1 — фича не включалась вовсе
+
+Испорчен идентификатор источника уровня: два CJK-символа заменены на `U+5341`
+(`丐` U+4E10 → `十`, `丒` U+4E12 → `十`). Такого имени в метаданных 23.1.3 нет,
+`U+5341` не встречается в дампе ни разу. Обёртка с fail-closed отказалась
+патчить и выключила весь модуль:
+
+```
 hook: REQUIRED method not found: 丐三七世丝丗与丛上.七且十东十丆丑丈万/0
 23.1.3-modules: install incomplete, module disabled
-init: 23.1.3 port incomplete: ... progression=1 crafting=1 lobby-catalog=1 modules=0
+init: 23.1.3 port incomplete: ... lobby-catalog=1 modules=0
 ```
 
-There is no crash anywhere in the log: no `SIGSEGV`, no `Fatal signal`, no
-backtrace. `init: 23.1.3 bootstrap initialization finished cleanly` is printed
-right after. The modules simply never armed, which is why nothing was granted
-and every module stayed at level I.
+Второй дефект той же ревизии: все хуки сводились в один флаг `ok`, поэтому
+промах на чисто вспомогательном маршруте гасил и гарантированный фикс уровня.
 
-Two independent defects produced that outcome.
+### Ревизия 2 — уровень X появился, количество не изменилось
 
-### Defect 1 — the level-source identifier was corrupted
+Подтверждено на устройстве (сборка `Aug 23 2026 12:08:07`):
 
-A bad search/replace had rewritten two CJK code points in `kCurrentLevel`:
-
-| | identifier | code points |
-| --- | --- | --- |
-| shipped (broken) | `七且十东十丆丑丈万` | `4E03 4E14 5341 4E1C 5341 4E06 4E11 4E08 4E07` |
-| metadata (correct) | `七且丐东丒丆丑丈万` | `4E03 4E14 4E10 4E1C 4E12 4E06 4E11 4E08 4E07` |
-
-U+4E10 (`丐`) and U+4E12 (`丒`) had both become U+5341 (`十`). **U+5341 does not
-occur a single time in `dump2313.cs`**, so the spelling could never have
-resolved. `hook::install` is fail-closed by design, so it correctly refused to
-patch an address it could not verify — and the module disabled itself.
-
-The verified name is now byte-identical to the metadata and is pinned by a
-`static_assert` on its exact UTF-8 byte sequence. A mangled spelling now fails
-the build instead of failing silently on the device.
-
-### Defect 2 — all-or-nothing install
-
-Six hooks were folded into a single `ok` flag, so a miss on any one of them —
-including purely cosmetic refresh routes — disabled the level fix and the
-catalogue grant as well. `install()` is now split:
-
-- **critical:** the level source. Installed first; if it fails, the module
-  reports and disables itself (correct, since the level cannot be faked).
-- **optional (8 routes):** `OnInstanceCreated`, profile reload, storage getter,
-  storage-view setter/refresh, screen awake/open/prebuild. Each is best-effort
-  and logged individually; a miss only slows down UI refresh.
-
-## Measured evidence
-
-All figures below were measured directly on the supplied `libil2cpp.so` by
-decoding every `BL` instruction in the image (RVA == file offset in this build).
-
-| RVA | member | body | direct BL sites | role |
-| --- | --- | --- | --- | --- |
-| `0x024B0BB0` | `module::七且丐东丒丆丑丈万()` | 132 B | **24** | **current level → hooked** |
-| `0x024B0C38` | `module::与丏一丗七丝一七丏()` | — | 5 | total owned parts — untouched |
-| `0x024B13C8` | `module::丌丏业丁丅丑与丆丕()` | — | 8 | parts for next level — untouched |
-| `0x024B140C` | `module::上丟七丝丒七丝不丈(level)` | — | 4 | cumulative threshold — untouched |
-| `0x024B14EC` | `module::丗丂丙上丏丏专上专()` | — | 7 | progress in level — untouched |
-| `0x02815F94` | controller storage getter | — | 9 | optional route |
-| `0x028DCB90` | `ModuleStorageView` model setter | 36 B | 4 | optional route |
-| `0x028DCBB4` | `ModuleStorageView` refresh | — | 0 | optional route |
-| `0x023B6554` | `ModuleArmoryInfoScreen` prebuild | — | 1 | optional route |
-| `0x023B5DB8` | `ModuleArmoryInfoScreen` open | — | 0 | optional route |
-| `0x0281473C` | owned-modules getter | — | 0 | inlined — unusable |
-| `0x02814784` | owned-sets getter | — | 0 | inlined — unusable |
-| `0x03048A5C` | catalogue modules getter | — | 0 | inlined — called directly instead |
-| `0x03048AB4` | catalogue sets getter | — | 0 | inlined — called directly instead |
-| `0x028178E4` | `AddAllModulesDEV()` | 4 B | 0 | bare `RET` (`D65F03C0`) — dead |
-| `0x028178E8` | `AddAllMaxModulesDEV()` | 4 B | 0 | bare `RET` (`D65F03C0`) — dead |
-
-The level source is the one target with a real body **and** plenty of live call
-sites, which is why the hook actually fires. This also confirms the two earlier
-failed approaches: hooking the zero-call-site getters changed nothing, and
-hooking `0x024B0C38` printed part totals as Roman numerals (`XL`, `XX`, `XXV`,
-`LXXX`) instead of `X`.
-
-## Complete built-in catalogue
-
-Decoding the catalogue `.cctor` `PGCompany.丐丞丒专且丁丈丌业::.cctor`
-(`0x02EF431C`, 284 308 bytes, 10 193 `BL` sites) finds exactly:
-
-- **42** calls to module `.ctor` (`0x024B1150`)
-- **42** calls to module-set `.ctor` (`0x024B3278`)
-
-The build already ships the complete catalogue, so no managed objects are
-fabricated and no backend response is needed. Every obfuscated name used by the
-native module — all 16 constants plus 5 field names — was re-verified
-byte-for-byte against `dump2313.cs`, and all fields match their expected
-offsets (`+0x30`, `+0x38`, `+0x40`, `+0x48` on `ModulesController`, `+0x30` on
-`ModuleStorageView`).
-
-## Correct level semantics
-
-| method | RVA | actual meaning |
-| --- | --- | --- |
-| `七且丐东丒丆丑丈万()` | `0x024B0BB0` | **current level**, rendered as a Roman numeral |
-| `与丏一丗七丝一七丏()` | `0x024B0C38` | total owned parts |
-| `上丟七丝丒七丝不丈(level)` | `0x024B140C` | cumulative parts threshold |
-| `丌丏业丁丅丑与丆丕()` | `0x024B13C8` | parts required for the next level |
-| `丗丂丙上丏丏专上专()` | `0x024B14EC` | progress inside the current level |
-
-The current-level hook returns `max(original, 10)`, so a module that is already
-above X is never downgraded. Part totals, thresholds and progress remain
-untouched.
-
-## Grant path
-
-Every controller and UI entry point on this build is a weak route (see the table
-above), so none of them may be load-bearing. The guarantee comes from
-`MainMenuController.Update`, which `progression_2313.h` hooks as a *required*
-target and which calls `weapon_modules_2313::pump_from_main_menu()` every
-main-menu frame.
-
-On each pump the order is:
-
-```text
-grant/verify the full catalogue into +0x30 / +0x38
--> invalidate controller storage caches (+0x40 and +0x48)
--> let the original storage getter rebuild the UI model
 ```
-
-Safeguards:
-
-- `List<T>.Contains`/`Add` preserves existing profile objects and prevents
-  duplicate references; direct publication of the built-in list is the fallback
-  when the destination list API is unusable.
-- Grant completion is no longer gated on the hard-coded 42/42 expectation. A
-  size mismatch is reported as a diagnostic and the reported counts are still
-  granted, so an unexpected catalogue size can no longer leave the UI
-  permanently un-refreshed.
-- Catalogue mutation, storage-model preparation and the level hook are all
-  re-entrancy guarded (`thread_local` flags).
-- The storage getter has a non-recursive fallback: if its optional hook is
-  absent, the original method pointer is called directly instead.
-- `install()` is idempotent.
-- Modules and module sets have independent fail-visible diagnostics; one
-  failure cannot hide the other.
-
-## Device verification
-
-Full process restart, then open the modules screen:
-
-```sh
-adb logcat -c
-adb logcat -s OPG3D | grep 23.1.3-modules
-```
-
-Expected lines:
-
-```text
+hook: installed 丐三七世丝丗与丛上.七且丐东丒丆丑丈万/0 @ 0x6dc9bf3bb0
 23.1.3-modules: optional refresh routes installed 8/8
-23.1.3-modules: armed: level X guaranteed, catalogue grant pumped from main menu + module screen (expect 42 modules, 42 module sets)
-23.1.3-modules: main-menu pump: reached live ModulesController 0x...
+23.1.3-modules: armed: level X guaranteed, ...
+```
+
+Уровень стал правильным, количество модулей — нет. Причина: грант писал
+каталог в `ModulesController` → `List<丐三七世丝丗与丛上> 丅与世丕业丘不丂丈` (+0x30) и затем
+сбрасывал кэши моделей склада (+0x40 `Dictionary<string, 丟丅丁不丄丟不丑丁>`,
++0x48 `丙业丅丑丒丘丕丂丘<丟丅丁不丄丟不丑丁>`), рассчитывая на пересборку. **Экран модулей не
+читает ни одно из этих полей.**
+
+---
+
+## Реальный путь чтения инвентаря
+
+```
+ModuleStorageView.上专丅丑丘丟丙东与()          0x028DCBB4
+  └─ 丟丅丁不丄丟不丑丁.丟丄丅丆丐不下丟且()            0x028DBF68   (BL на +0x220)
+       └─ 丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟()        0x028DB524   (BL на +0x154)
+            ├─ 与丅丟丈丕上东丟丁.丟且丗下丁上一专下()   0x026FDD74 → 专丂丄丈一丂世丑丏
+            └─ 专丂丄丈一丂世丑丏.丆丌丌丆且丙七丌丞(int) 0x0171F9D8 → List<string>
+```
+
+Инвентарь модулей материализуется **по запросу из объекта профиля**
+`专丂丄丈一丂世丑丏` (TypeDefIndex 6598): он хранит принадлежащие записи как
+`丙业丅丑丒丘丕丂丘<List<丅丏丏丛丕丁丟上丞>>` (+0x10) и отдаёт их списком имён модулей.
+
+`ModulesController` +0x30 в этой цепочке не участвует нигде — поэтому запись
+туда в принципе не могла изменить количество.
+
+`ModuleStorageView` держит **одну** модель `丟丅丁不丄丟不丑丁` (+0x30) и список
+`List<ModuleSlotView>` (+0x38); сетка пересобирается из модели, а не из
+контроллера.
+
+---
+
+## Ревизия 3 — исправление
+
+Хук ставится на единственную точку сужения `丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟()`, и в
+возвращаемый список доливается встроенный каталог.
+
+Почему именно эта цель:
+
+* тело 880 байт (`0x028DB524..0x028DB894`), **34 прямых call site** — маршрут
+  реально достижим и заведомо не заинлайнен;
+* через него проходят **все** потребители инвентаря: сетка склада,
+  `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与` (0x023B6680),
+  `ModuleStoragePropertiesView`, `ModuleInsertPanel`,
+  `ModuleInsertPropertiesView`, хелперы `ModuleContextClues*`, собственные
+  `ModulesController.下且与丏丛业丈业与 / 与丕专丐专丐七丗丛 / 丛七丂丙丛世丁不业 / 专丟不且丁丅丏上丏`, а также
+  методы самой модели `丐丐丆丈丒丒丙丆东 / 与丅与业丐上且不丝 / 丟万世与丌且丒且丒 / 丟丄丅丆丐不下丟且 / 业丝一一丂万丒不丝`;
+* наборы модулей отдельного гранта не требуют: `ModulesController.丐上丙业与且丛丂丆`
+  выводит набор из списка модулей, то есть следует за слитым списком сам.
+
+Свойства решения:
+
+* **ничего не пишется в сохранение.** Объект прогресса игрока не
+  перезаписывается, поэтому неудачное слияние не может испортить профиль;
+* **идемпотентность.** Объекты каталога — синглтоны, созданные один раз в
+  `.cctor` каталога, поэтому `List<T>.Contains` сравнивает по ссылке и повторный
+  проход ничего не дублирует;
+* **защёлка от реентерабельности.** `丟丄丅丆丐不下丟且` и `业丝一一丂万丒不丝` сами вызывают
+  хукнутый геттер, а `Contains`/`Add` исполняют managed-код, поэтому слияние
+  закрыто `thread_local`-защёлкой;
+* **границы безопасности.** Каталог принимается только при `0 < count <= 1024`,
+  исходный список — при `count <= 4096`.
+
+Структура маршрутов: **2 критичных + 2 опциональных**.
+
+| Маршрут | RVA | Роль |
+|---|---|---|
+| `丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟/0` | `0x028DB524` | критичный: источник инвентаря |
+| `丐三七世丝丗与丛上.七且丐东丒丆丑丈万/0` | `0x024B0BB0` | критичный: уровень → X |
+| `ModuleStorageView.上专丅丑丘丟丙东与/0` | `0x028DCBB4` | опциональный: диагностика |
+| `ModuleArmoryInfoScreen.上专丅丑丘丟丙东与/0` | `0x023B6680` | опциональный: диагностика |
+
+Промах опционального маршрута больше не может выключить критичные.
+
+---
+
+## Удалено как заведомо неработающее
+
+* запись в `ModulesController` +0x30 / +0x38 и публикация полного списка;
+* сброс кэшей моделей склада +0x40 / +0x48 (`reset_storage_models`);
+* хуки `OnInstanceCreated` / `丞业丝丁丆丑丑丕丟` / `上丂丁丙丛万丐万丗`, сеттер
+  `ModuleStorageView.丝万不丘下丄丄三丟`, `ModuleArmoryInfoScreen.Awake / 东不丁丁丟丂丝不丁 /
+  丏丁丗东且三世丄丏` — они гоняли грант, которого больше нет;
+* грант из главного меню. `pump_from_main_menu()` сохранён (его вызывает
+  `progression_2313.h` из `MainMenuController.Update`), но теперь это только
+  однократная сверка размера каталога.
+
+---
+
+## Тупики: проверено, использовать нельзя
+
+| Символ | RVA | Почему нельзя |
+|---|---|---|
+| owned-геттеры контроллера | `0x0281473C`, `0x02814784` | 0 прямых call site — заинлайнены |
+| геттеры каталога | `0x03048A5C`, `0x03048AB4` | 0 call site; вызываются через method pointer |
+| `AddAllModulesDEV` | `0x028178E4` | 4 байта, голый `RET` (`D65F03C0`) |
+| `AddAllMaxModulesDEV` | `0x028178E8` | 4 байта, голый `RET` |
+| `与丏一丗七丝一七丏()` | `0x024B0C38` | общее число деталей, не уровень (давало XL/XX/XXV/LXXX) |
+| `ModulesController.下且与丏丛业丈业与(string)` | `0x0281702C` | единственный вызов — из UI-кнопки |
+| `丑丅丟丟丞与东丙丑.不下与丗丄下且上丛(model, module)` | `0x028196BC` | единственный вызов `model.东丅与业专七与丌丆`, но дёргает уведомление через `东丝丂丄业丕且丙丑` → запись в профиль |
+
+Не трогаются: `0x024B13C8` (деталей до следующего уровня), `0x024B140C`
+(накопительный порог), `0x024B14EC` (прогресс внутри уровня).
+
+Каталог `.cctor` (`0x02EF431C`, 284 308 байт) содержит ровно 42 вызова
+`module::.ctor` (`0x024B1150`) и 42 вызова `moduleSet::.ctor` (`0x024B3278`) —
+ничего не синтезируется.
+
+---
+
+## Защита от регресса
+
+UTF-8 байты `kCurrentLevel`, `kStorageModelClass` и `kStorageModelList`
+зафиксированы через `static_assert`. Порча идентификатора теперь валит сборку,
+а не устройство.
+
+Проверки текущей ревизии:
+
+```
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion \
+    -Werror -fsyntax-only tu.cpp        → без предупреждений
+45 обфусцированных идентификаторов файла → все найдены в dump2313.cs
+U+5341 в файле                           → 0
+негативный тест (порча имени геттера)    → сборка падает на нужном static_assert
+```
+
+---
+
+## Как проверять на устройстве
+
+```
+adb logcat -c && adb logcat -s OPG3D | grep 23.1.3-modules
+```
+
+При старте:
+
+```
+hook: installed 丟丅丁不丄丟不丑丁.七丌丑世丂丟丞丞丟/0 @ 0x...
+hook: installed 丐三七世丝丗与丛上.七且丐东丒丆丑丈万/0 @ 0x...
+23.1.3-modules: optional diagnostic routes installed 2/2
+23.1.3-modules: armed: level X guaranteed, full catalogue merged into the storage inventory the UI reads (expect 42 modules, 42 module sets)
+```
+
+В главном меню:
+
+```
 23.1.3-modules: verified built-in catalogue: 42 modules, 42 module sets
-23.1.3-modules: main-menu pump: module source=42 owned=N +M -> 42
+23.1.3-modules: catalogue verified from main menu
+```
+
+При открытии экрана модулей:
+
+```
+23.1.3-modules: module armory screen refreshing
+23.1.3-modules: module storage grid rebuilding
+23.1.3-modules: inventory merge live: source=42 owned=N +M -> 42
 23.1.3-modules: module inventory complete (42/42)
-23.1.3-modules: module-set inventory complete (42/42)
-23.1.3-modules: main-menu pump: invalidated cached storage models before UI build
 23.1.3-modules: displayed level 1 -> 10 (call 1)
 ```
 
-The startup summary must now end with `modules=1`. If any stage cannot complete,
-the log names the exact failing stage (null catalogue, unavailable list API,
-unsafe count, publication failure, storage-cache invalidation failure, or a
-named unavailable optional route).
+Строка `inventory merge live` — главный индикатор: `owned=N` показывает, сколько
+модулей было у игрока, `-> 42` — сколько стало.
 
-## Build check
+Признак неудачи (диагностируется явно, с причиной):
 
-```sh
-g++ -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion \
-    -Werror -fsyntax-only weapon_modules_2313.h
 ```
-
-Clean. A negative test that reintroduces the corrupted `十` spelling now fails
-at compile time on the `kCurrentLevel` `static_assert`, which is the regression
-this PR exists to prevent.
-
-## Scope
-
-Weapon crafting is intentionally untouched because it works on the device.
-Lobby customization remains a separate, lower-priority follow-up in
-`lobby_catalog_2313.h`.
+23.1.3-modules: inventory merge failed: <причина> (source=.. before=.. after=..)
+```
