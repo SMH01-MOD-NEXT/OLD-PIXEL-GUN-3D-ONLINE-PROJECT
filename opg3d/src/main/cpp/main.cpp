@@ -17,6 +17,7 @@
 #include "photon_2313.h"
 #include "photon_default_plugin_2313.h"
 #include "photon_trace_2313.h"
+#include "progression_2313.h"
 #include "startup_guards_2313.h"
 #include "startup_trace_2313.h"
 #include "version_2313.h"
@@ -123,22 +124,25 @@ void* init_thread(void*) {
     const bool photon_online   = photon_2313::install_hooks();
     const bool default_plugin  = photon_default_plugin_2313::install_hooks();
     const bool photon_trace    = photon_trace_2313::install_hooks();
+    const bool progression     = progression_2313::install_hooks();
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
-        default_plugin && photon_trace) {
+        default_plugin && photon_trace && progression) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
-             "is active, Switcher heartbeat tracing is on");
+             "is active, Switcher heartbeat tracing is on, offline currency "
+             "and level progression are granted from the main menu");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
-             "local-backend=%d photon=%d plugin=%d photon-trace=%d",
+             "local-backend=%d photon=%d plugin=%d photon-trace=%d "
+             "progression=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
              photon_online ? 1 : 0, default_plugin ? 1 : 0,
-             photon_trace ? 1 : 0);
+             photon_trace ? 1 : 0, progression ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
