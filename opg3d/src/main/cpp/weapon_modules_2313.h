@@ -49,6 +49,8 @@ constexpr int32_t kExpectedModuleSets = 42;
 constexpr int32_t kMaxCatalogEntries = 1024;
 constexpr uint64_t kLevelRecheckEvery = 240;
 constexpr uint64_t kLevelLogEvery = 240;
+constexpr uint64_t kMainMenuRecheckEvery = 60;
+constexpr uint64_t kMainMenuNullLogEvery = 600;
 
 constexpr const char* kNs = "PGCompany";
 constexpr const char* kCatalogClass = "丐丞丒专且丁丈丌业";
@@ -62,6 +64,11 @@ constexpr const char* kStorageByIndexField = "丙丕一东丛万丕丄丘";
 constexpr const char* kOnInstanceCreated = "OnInstanceCreated";
 constexpr const char* kControllerReload = "丞业丝丁丆丑丑丕丟";
 constexpr const char* kControllerSelected = "上丂丁丙丛万丐万丗";
+constexpr const char* kControllerInstance = "get_Instance";
+constexpr const char* kStorageViewClass = "ModuleStorageView";
+constexpr const char* kStorageViewSet = "丝万不丘下丄丄三丟";
+constexpr const char* kStorageViewRefresh = "上专丅丑丘丟丙东与";
+constexpr const char* kStorageViewModelField = "丁业丈东丝丆丅丞与";
 constexpr const char* kModuleClass = "丐三七世丝丗与丛上";
 constexpr const char* kCurrentLevel = "七且丐东丒丆丑丈万";
 
@@ -69,6 +76,7 @@ using StaticObjFn = void* (*)(void* method);
 using InstanceObjFn = void* (*)(void* self, void* method);
 using InstanceVoidFn = void (*)(void* self, void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
+using InstanceObjArgVoidFn = void (*)(void* self, void* value, void* method);
 using ListCountFn = int32_t (*)(void* list, void* method);
 using ListItemFn = void* (*)(void* list, int32_t index, void* method);
 using ListContainsFn = bool (*)(void* list, void* item, void* method);
@@ -146,18 +154,25 @@ inline int32_t list_count(void* list) {
 
 inline Managed g_catalog_modules{};
 inline Managed g_catalog_sets{};
+inline Managed g_controller_instance{};
+inline Managed g_selected_method{};
 inline void* g_field_owned_modules = nullptr;
 inline void* g_field_owned_sets = nullptr;
 inline void* g_field_storage_by_name = nullptr;
 inline void* g_field_storage_by_index = nullptr;
+inline void* g_field_storage_view_model = nullptr;
 inline InstanceVoidFn g_orig_on_instance_created = nullptr;
 inline InstanceVoidFn g_orig_reload = nullptr;
 inline InstanceObjFn g_orig_selected = nullptr;
 inline InstanceIntFn g_orig_current_level = nullptr;
+inline InstanceObjArgVoidFn g_orig_storage_view_set = nullptr;
+inline InstanceVoidFn g_orig_storage_view_refresh = nullptr;
 inline void* g_controller = nullptr;
 inline uint64_t g_grant_attempts = 0;
 inline uint64_t g_selected_calls = 0;
 inline uint64_t g_level_calls = 0;
+inline uint64_t g_main_menu_frames = 0;
+inline uint64_t g_main_menu_nulls = 0;
 inline bool g_catalog_size_reported = false;
 inline bool g_modules_complete_reported = false;
 inline bool g_sets_complete_reported = false;
@@ -165,8 +180,17 @@ inline bool g_modules_error_reported = false;
 inline bool g_sets_error_reported = false;
 inline bool g_storage_reset_reported = false;
 inline bool g_storage_reset_done = false;
+inline bool g_storage_view_rebuilt = false;
+inline bool g_storage_view_entry_reported = false;
+inline bool g_controller_null_reported = false;
 inline thread_local bool g_in_catalog = false;
 inline thread_local bool g_in_grant = false;
+
+inline void* controller_instance() {
+    if (!g_controller_instance) return nullptr;
+    return reinterpret_cast<StaticObjFn>(g_controller_instance.ptr)(
+        g_controller_instance.info);
+}
 
 inline void* fetch_catalog(const Managed& source) {
     if (!source || g_in_catalog) return nullptr;
@@ -246,7 +270,6 @@ inline MergeResult merge_catalog(void* self, void* field, const Managed& source)
         if (!result.ok) result.failure = "published catalogue count changed";
         return result;
     }
-
     ListApi owned_api;
     if (!resolve_list_api(owned, owned_api) || !owned_api.writable()) {
         publish_full_list(self, field, full, result);
@@ -364,6 +387,37 @@ inline void reset_storage_models(void* self, const char* reason) {
     }
 }
 
+inline void* prepare_storage_model(const char* reason) {
+    void* controller = controller_instance();
+    if (controller == nullptr) {
+        if (!g_controller_null_reported) {
+            g_controller_null_reported = true;
+            LOGE("23.1.3-modules: %s: ModulesController.Instance is null", reason);
+        }
+        return nullptr;
+    }
+    if (!g_storage_view_rebuilt) g_storage_reset_done = false;
+    const GrantStatus status = grant(controller, reason);
+    if (status.changed) g_storage_reset_done = false;
+    if (!status.complete) return nullptr;
+    reset_storage_models(controller, reason);
+    if (g_orig_selected == nullptr || g_selected_method.info == nullptr) {
+        LOGE("23.1.3-modules: %s: original storage getter unavailable", reason);
+        return nullptr;
+    }
+    void* model = g_orig_selected(controller, g_selected_method.info);
+    if (model == nullptr) {
+        LOGE("23.1.3-modules: %s: rebuilt storage model is null", reason);
+        return nullptr;
+    }
+    if (!g_storage_view_rebuilt) {
+        LOGI("23.1.3-modules: %s: replaced ModuleStorageView model after 42/42 grant",
+             reason);
+    }
+    g_storage_view_rebuilt = true;
+    return model;
+}
+
 inline void on_instance_created_hook(void* self, void* method) {
     if (g_orig_on_instance_created != nullptr) {
         g_orig_on_instance_created(self, method);
@@ -373,22 +427,49 @@ inline void on_instance_created_hook(void* self, void* method) {
     g_modules_error_reported = false;
     g_sets_error_reported = false;
     g_storage_reset_done = false;
+    g_storage_view_rebuilt = false;
     const GrantStatus status = grant(self, "OnInstanceCreated");
+    if (status.changed) g_storage_reset_done = false;
     if (status.complete) reset_storage_models(self, "OnInstanceCreated");
 }
 
 inline void reload_hook(void* self, void* method) {
     if (g_orig_reload != nullptr) g_orig_reload(self, method);
     g_storage_reset_done = false;
+    g_storage_view_rebuilt = false;
     const GrantStatus status = grant(self, "profile reload");
+    if (status.changed) g_storage_reset_done = false;
     if (status.complete) reset_storage_models(self, "profile reload");
 }
 
 inline void* selected_hook(void* self, void* method) {
     ++g_selected_calls;
     const GrantStatus status = grant(self, "module UI prebuild");
+    if (status.changed) g_storage_reset_done = false;
     if (status.complete) reset_storage_models(self, "module UI prebuild");
     return g_orig_selected != nullptr ? g_orig_selected(self, method) : nullptr;
+}
+
+inline void storage_view_set_hook(void* self, void* model, void* method) {
+    if (!g_storage_view_entry_reported) {
+        g_storage_view_entry_reported = true;
+        LOGI("23.1.3-modules: ModuleStorageView setter reached");
+    }
+    void* rebuilt = prepare_storage_model("storage-view setter");
+    if (rebuilt != nullptr) model = rebuilt;
+    if (g_orig_storage_view_set != nullptr) {
+        g_orig_storage_view_set(self, model, method);
+    }
+}
+
+inline void storage_view_refresh_hook(void* self, void* method) {
+    void* rebuilt = prepare_storage_model("storage-view refresh");
+    if (rebuilt != nullptr) {
+        write_object_field(self, g_field_storage_view_model, rebuilt);
+    }
+    if (g_orig_storage_view_refresh != nullptr) {
+        g_orig_storage_view_refresh(self, method);
+    }
 }
 
 inline int32_t current_level_hook(void* self, void* method) {
@@ -397,6 +478,9 @@ inline int32_t current_level_hook(void* self, void* method) {
         original = g_orig_current_level(self, method);
     }
     ++g_level_calls;
+    if (g_controller == nullptr && !g_in_grant) {
+        g_controller = controller_instance();
+    }
     if (g_controller != nullptr && !g_in_grant &&
         (g_level_calls % kLevelRecheckEvery) == 1) {
         (void)grant(g_controller, "level fallback");
@@ -415,6 +499,10 @@ inline bool install() {
     bool resolved = true;
     resolved &= bind(g_catalog_modules, kNs, kCatalogClass, kCatalogModules, 0);
     resolved &= bind(g_catalog_sets, kNs, kCatalogClass, kCatalogSets, 0);
+    resolved &= bind(g_controller_instance, kNs, kControllerClass,
+                     kControllerInstance, 0);
+    resolved &= bind(g_selected_method, kNs, kControllerClass,
+                     kControllerSelected, 0);
     if (!resolved) {
         LOGE("23.1.3-modules: built-in catalogue unavailable, module disabled");
         return false;
@@ -427,12 +515,15 @@ inline bool install() {
         kNs, kControllerClass, kStorageByNameField);
     g_field_storage_by_index = il2cpp::find_field(
         kNs, kControllerClass, kStorageByIndexField);
+    g_field_storage_view_model = il2cpp::find_field(
+        kNs, kStorageViewClass, kStorageViewModelField);
     if (g_field_owned_modules == nullptr || g_field_owned_sets == nullptr ||
-        g_field_storage_by_name == nullptr || g_field_storage_by_index == nullptr) {
+        g_field_storage_by_name == nullptr || g_field_storage_by_index == nullptr ||
+        g_field_storage_view_model == nullptr) {
         LOGE("23.1.3-modules: controller fields unavailable "
-             "(modules=%p sets=%p by-name=%p by-index=%p), module disabled",
+             "(modules=%p sets=%p by-name=%p by-index=%p view-model=%p), module disabled",
              g_field_owned_modules, g_field_owned_sets, g_field_storage_by_name,
-             g_field_storage_by_index);
+             g_field_storage_by_index, g_field_storage_view_model);
         return false;
     }
 
@@ -446,11 +537,17 @@ inline bool install() {
     ok &= hook::install({kNs, kControllerClass, kControllerSelected, 0},
                         reinterpret_cast<void*>(&selected_hook),
                         reinterpret_cast<void**>(&g_orig_selected), true);
+    ok &= hook::install({kNs, kStorageViewClass, kStorageViewSet, 1},
+                        reinterpret_cast<void*>(&storage_view_set_hook),
+                        reinterpret_cast<void**>(&g_orig_storage_view_set), true);
+    ok &= hook::install({kNs, kStorageViewClass, kStorageViewRefresh, 0},
+                        reinterpret_cast<void*>(&storage_view_refresh_hook),
+                        reinterpret_cast<void**>(&g_orig_storage_view_refresh), true);
     ok &= hook::install({kNs, kModuleClass, kCurrentLevel, 0},
                         reinterpret_cast<void*>(&current_level_hook),
                         reinterpret_cast<void**>(&g_orig_current_level), true);
     if (ok) {
-        LOGI("23.1.3-modules: corrected prebuild grant armed (expect %d modules at level X)",
+        LOGI("23.1.3-modules: visible storage rebuild armed (expect %d modules at level X)",
              kExpectedModules);
     } else {
         LOGE("23.1.3-modules: install incomplete, module disabled");
@@ -458,8 +555,30 @@ inline bool install() {
     return ok;
 }
 
+inline void pump_from_main_menu() {
+    ++detail::g_main_menu_frames;
+    if ((detail::g_main_menu_frames % detail::kMainMenuRecheckEvery) != 1u) {
+        return;
+    }
+    void* controller = detail::controller_instance();
+    if (controller == nullptr) {
+        ++detail::g_main_menu_nulls;
+        if (detail::g_main_menu_nulls == 1u ||
+            (detail::g_main_menu_nulls % detail::kMainMenuNullLogEvery) == 0u) {
+            LOGE("23.1.3-modules: main-menu pump: ModulesController.Instance is null");
+        }
+        return;
+    }
+    const detail::GrantStatus status = detail::grant(controller, "main-menu pump");
+    if (status.changed) detail::g_storage_reset_done = false;
+    if (status.complete) {
+        detail::reset_storage_models(controller, "main-menu pump");
+    }
+}
+
 }  // namespace detail
 
 inline bool install_hooks() { return detail::install(); }
+inline void pump_from_main_menu() { detail::pump_from_main_menu(); }
 
 }  // namespace weapon_modules_2313
