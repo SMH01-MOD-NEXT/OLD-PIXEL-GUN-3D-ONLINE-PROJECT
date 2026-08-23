@@ -14,13 +14,16 @@
 // * The catalogue .cctor contains exactly 42 calls to module::.ctor(ItemRecord)
 //   and 42 calls to moduleSet::.ctor(ItemRecord). These are the complete objects
 //   already shipped by this build, so no managed objects are fabricated.
-// * ModulesController::OnInstanceCreated builds the profile-backed lists. It is
-//   invoked indirectly by Singleton<T>, so a direct-BL-only scan cannot see it.
-//   A post-initialization merge covers newly created controllers. For a singleton
-//   created before hook installation, the live UI storage getter is intercepted
-//   before it builds its filtered cache, so all 42 entries are present in time.
-// * module::七且丐东丒丆丑丈万() (0x024B0BB0) is the actual current-level source.
-//   The modules UI prints its result as a Roman numeral. The earlier revision
+// * ModuleStorageView's model setter (0x028DCB90) is only 0x24 bytes long, so
+//   like the trivial getters it is inlined at its call sites: installing that
+//   hook succeeds but it is never entered. Device logs confirmed this.
+// * ModuleArmoryInfoScreen is the screen the player actually opens. Its entry
+//   points are large real bodies (open 0x023B5DB8, prebuild 0x023B6554), so
+//   they cannot have been inlined away. The grant now runs there, immediately
+//   before the screen reads the controller, and additionally from the
+//   main-menu pump driven by MainMenuController.Update.
+// * module::七且十东十丆丑丈万() (0x024B0BB0) is the actual current-level source.
+//   The modules UI prints its result as a Roman numeral. An earlier revision
 //   incorrectly returned 0x024B0C38, which is the total owned-parts count; that
 //   is exactly why the UI showed XL/XX/LXXX instead of X.
 // * 0x024B13C8, 0x024B140C and 0x024B14EC are respectively the next-level
@@ -28,7 +31,8 @@
 //   They must not be clamped or replaced.
 //
 // All mutations are process-local. Nothing is written directly to Progress.
-// Entries already present are retained; verified full-list publication is the fallback.
+// Entries already present are retained; verified full-list publication is the
+// fallback.
 // -----------------------------------------------------------------------------
 
 #include <cstddef>
@@ -50,7 +54,7 @@ constexpr int32_t kMaxCatalogEntries = 1024;
 constexpr uint64_t kLevelRecheckEvery = 240;
 constexpr uint64_t kLevelLogEvery = 240;
 constexpr uint64_t kMainMenuRecheckEvery = 60;
-constexpr uint64_t kMainMenuNullLogEvery = 600;
+constexpr uint64_t kPumpNullLogEvery = 300;
 
 constexpr const char* kNs = "PGCompany";
 constexpr const char* kCatalogClass = "丐丞丒专且丁丈丌业";
@@ -69,8 +73,12 @@ constexpr const char* kStorageViewClass = "ModuleStorageView";
 constexpr const char* kStorageViewSet = "丝万不丘下丄丄三丟";
 constexpr const char* kStorageViewRefresh = "上专丅丑丘丟丙东与";
 constexpr const char* kStorageViewModelField = "丁业丈东丝丆丅丞与";
+constexpr const char* kInfoScreenClass = "ModuleArmoryInfoScreen";
+constexpr const char* kInfoScreenAwake = "Awake";
+constexpr const char* kInfoScreenShow = "东不丁丁丟丂丝不丁";
+constexpr const char* kInfoScreenPrebuild = "丏丁丗东且三世丄丏";
 constexpr const char* kModuleClass = "丐三七世丝丗与丛上";
-constexpr const char* kCurrentLevel = "七且丐东丒丆丑丈万";
+constexpr const char* kCurrentLevel = "七且十东十丆丑丈万";
 
 using StaticObjFn = void* (*)(void* method);
 using InstanceObjFn = void* (*)(void* self, void* method);
@@ -167,12 +175,16 @@ inline InstanceObjFn g_orig_selected = nullptr;
 inline InstanceIntFn g_orig_current_level = nullptr;
 inline InstanceObjArgVoidFn g_orig_storage_view_set = nullptr;
 inline InstanceVoidFn g_orig_storage_view_refresh = nullptr;
+inline InstanceVoidFn g_orig_screen_awake = nullptr;
+inline InstanceObjArgVoidFn g_orig_screen_show = nullptr;
+inline InstanceVoidFn g_orig_screen_prebuild = nullptr;
 inline void* g_controller = nullptr;
 inline uint64_t g_grant_attempts = 0;
 inline uint64_t g_selected_calls = 0;
 inline uint64_t g_level_calls = 0;
 inline uint64_t g_main_menu_frames = 0;
-inline uint64_t g_main_menu_nulls = 0;
+inline uint64_t g_startup_frames = 0;
+inline uint64_t g_pump_nulls = 0;
 inline bool g_catalog_size_reported = false;
 inline bool g_modules_complete_reported = false;
 inline bool g_sets_complete_reported = false;
@@ -183,6 +195,7 @@ inline bool g_storage_reset_done = false;
 inline bool g_storage_view_rebuilt = false;
 inline bool g_storage_view_entry_reported = false;
 inline bool g_controller_null_reported = false;
+inline bool g_pump_reached_reported = false;
 inline thread_local bool g_in_catalog = false;
 inline thread_local bool g_in_grant = false;
 
@@ -418,6 +431,37 @@ inline void* prepare_storage_model(const char* reason) {
     return model;
 }
 
+// Guaranteed grant driver.
+//
+// The device logs proved that the controller lifecycle methods and the trivial
+// ModuleStorageView setter are not reached on this route after the native
+// hooks are installed, so the grant is driven from paths the same logs show
+// executing: MainMenuController.Update and the ModuleArmoryInfoScreen entry
+// points. pump() is idempotent, self-throttling and always logs its outcome
+// once, so a failure can no longer be silent.
+inline void pump(const char* reason) {
+    void* controller = controller_instance();
+    if (controller == nullptr) {
+        ++g_pump_nulls;
+        if (g_pump_nulls == 1u || (g_pump_nulls % kPumpNullLogEvery) == 0u) {
+            LOGE("23.1.3-modules: %s: ModulesController.Instance is not available yet "
+                 "(attempt %llu)", reason,
+                 static_cast<unsigned long long>(g_pump_nulls));
+        }
+        return;
+    }
+
+    if (!g_pump_reached_reported) {
+        g_pump_reached_reported = true;
+        LOGI("23.1.3-modules: %s: reached live ModulesController %p", reason,
+             controller);
+    }
+
+    const GrantStatus status = grant(controller, reason);
+    if (status.changed) g_storage_reset_done = false;
+    if (status.complete) reset_storage_models(controller, reason);
+}
+
 inline void on_instance_created_hook(void* self, void* method) {
     if (g_orig_on_instance_created != nullptr) {
         g_orig_on_instance_created(self, method);
@@ -469,6 +513,29 @@ inline void storage_view_refresh_hook(void* self, void* method) {
     }
     if (g_orig_storage_view_refresh != nullptr) {
         g_orig_storage_view_refresh(self, method);
+    }
+}
+
+// ModuleArmoryInfoScreen is the screen the player opens. Its bodies are large
+// (open 0x023B5DB8, prebuild 0x023B6554), so unlike the trivial
+// ModuleStorageView setter they cannot have been inlined away. Granting here
+// happens immediately before the screen reads the controller.
+inline void screen_awake_hook(void* self, void* method) {
+    pump("module screen awake");
+    if (g_orig_screen_awake != nullptr) g_orig_screen_awake(self, method);
+}
+
+inline void screen_show_hook(void* self, void* argument, void* method) {
+    pump("module screen open");
+    if (g_orig_screen_show != nullptr) {
+        g_orig_screen_show(self, argument, method);
+    }
+}
+
+inline void screen_prebuild_hook(void* self, void* method) {
+    pump("module screen prebuild");
+    if (g_orig_screen_prebuild != nullptr) {
+        g_orig_screen_prebuild(self, method);
     }
 }
 
@@ -543,11 +610,30 @@ inline bool install() {
     ok &= hook::install({kNs, kStorageViewClass, kStorageViewRefresh, 0},
                         reinterpret_cast<void*>(&storage_view_refresh_hook),
                         reinterpret_cast<void**>(&g_orig_storage_view_refresh), true);
+    // The module screen hooks are diagnostics plus a just-in-time grant. A
+    // metadata miss here must never disable the level fix, so they are not
+    // folded into `ok`.
+    const bool screen_awake = hook::install(
+        {kNs, kInfoScreenClass, kInfoScreenAwake, 0},
+        reinterpret_cast<void*>(&screen_awake_hook),
+        reinterpret_cast<void**>(&g_orig_screen_awake), true);
+    const bool screen_show = hook::install(
+        {kNs, kInfoScreenClass, kInfoScreenShow, 1},
+        reinterpret_cast<void*>(&screen_show_hook),
+        reinterpret_cast<void**>(&g_orig_screen_show), true);
+    const bool screen_prebuild = hook::install(
+        {kNs, kInfoScreenClass, kInfoScreenPrebuild, 0},
+        reinterpret_cast<void*>(&screen_prebuild_hook),
+        reinterpret_cast<void**>(&g_orig_screen_prebuild), true);
+    LOGI("23.1.3-modules: module screen entry points hooked "
+         "(awake=%d open=%d prebuild=%d)",
+         screen_awake ? 1 : 0, screen_show ? 1 : 0, screen_prebuild ? 1 : 0);
     ok &= hook::install({kNs, kModuleClass, kCurrentLevel, 0},
                         reinterpret_cast<void*>(&current_level_hook),
                         reinterpret_cast<void**>(&g_orig_current_level), true);
     if (ok) {
-        LOGI("23.1.3-modules: visible storage rebuild armed (expect %d modules at level X)",
+        LOGI("23.1.3-modules: grant pump armed on main menu + module screen "
+             "(expect %d modules at level X)",
              kExpectedModules);
     } else {
         LOGE("23.1.3-modules: install incomplete, module disabled");
@@ -555,30 +641,25 @@ inline bool install() {
     return ok;
 }
 
+inline void pump_from_startup() {
+    ++g_startup_frames;
+    if (g_modules_complete_reported && g_sets_complete_reported &&
+        g_storage_reset_done) {
+        return;
+    }
+    pump("startup pump");
+}
+
 inline void pump_from_main_menu() {
-    ++detail::g_main_menu_frames;
-    if ((detail::g_main_menu_frames % detail::kMainMenuRecheckEvery) != 1u) {
-        return;
-    }
-    void* controller = detail::controller_instance();
-    if (controller == nullptr) {
-        ++detail::g_main_menu_nulls;
-        if (detail::g_main_menu_nulls == 1u ||
-            (detail::g_main_menu_nulls % detail::kMainMenuNullLogEvery) == 0u) {
-            LOGE("23.1.3-modules: main-menu pump: ModulesController.Instance is null");
-        }
-        return;
-    }
-    const detail::GrantStatus status = detail::grant(controller, "main-menu pump");
-    if (status.changed) detail::g_storage_reset_done = false;
-    if (status.complete) {
-        detail::reset_storage_models(controller, "main-menu pump");
-    }
+    ++g_main_menu_frames;
+    if ((g_main_menu_frames % kMainMenuRecheckEvery) != 1u) return;
+    pump("main-menu pump");
 }
 
 }  // namespace detail
 
 inline bool install_hooks() { return detail::install(); }
 inline void pump_from_main_menu() { detail::pump_from_main_menu(); }
+inline void pump_from_startup() { detail::pump_from_startup(); }
 
 }  // namespace weapon_modules_2313
