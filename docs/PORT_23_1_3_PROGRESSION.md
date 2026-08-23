@@ -153,6 +153,96 @@ level-up events, the port never has to reproduce the per-level experience
 table: it grants a large fixed amount per tick and the game stops itself at
 `maxLevel`.
 
+## Experience at max level (why level 65 showed xp 0)
+
+The first revision of this module only pumped experience until `maxLevel` and
+then stopped. On device that produced level 65 with the experience counter
+reading **0**. That is not a failed hook: it is exactly what the stock routine
+persists.
+
+`ExperienceController::东丙丑万且专丞世丂` at `0x01C7AC28` treats the stored experience as a
+**per-level remainder**. Its loop reads the level threshold table, subtracts
+the threshold on every level-up, and just before persisting it executes:
+
+```
+0x01C7AFF0  bl   0x01C79A50        ; 世丐丙丆业一丄丙丒()  -> level
+0x01C7AFF4  cmp  w0, #0x41         ; maxLevel (65)
+0x01C7AFF8  csel w26, w26, wzr, lt ; level < 65 ? remainder : 0
+```
+
+`w26` is the remainder that is about to be handed to the Progress service at
+`0x01C7B0CC`. So the very level-up that reaches 65 stores experience as zero
+by design, and a pump that stops at the cap can never leave a non-zero value
+behind.
+
+### The max-level overload accumulates instead
+
+The same entry point has a second path. At `0x01C7AD2C` it compares the level
+against `0x41` and, when the player is already at 65, tail-branches to the
+overload `丏三万丕丂业专丌丏` at **`0x01C7B374`**:
+
+```
+0x01C7AD28  bl   0x01C79A50        ; level()
+0x01C7AD2C  cmp  w0, #0x41
+0x01C7AD30  b.ne 0x01C7AD64        ; normal per-level path
+...
+0x01C7AD60  b    0x01C7B374        ; max-level path
+```
+
+That overload is materially different:
+
+| Offset | Call | Meaning |
+| --- | --- | --- |
+| `+0x0E4` | `bl 0x01C79AB0` | read stored experience |
+| `+0x108` | `add w25, w25, w29` | experience **+** amount (no threshold subtraction) |
+| `+0x11C` | `bl 0x01B4FD5C` | persist the sum through the Progress service |
+| `+0x1E4` | `bl 0x028D4C28` | analytics record |
+| `+0x2A0` | `bl 0x01B44230` | save |
+
+There is no level-up bookkeeping and, critically, **no `csel ..., wzr`** — the
+value is stored verbatim.
+
+### What the module does now
+
+`pump_experience()` replaces `raise_level()` and keeps driving the same stock
+entry point past the cap:
+
+- `level < 65` — grant `kExpGrantPerTick` as before (level ramp).
+- `level == 65` — read the stored experience and grant exactly
+  `kExperienceTarget - experience`, so the routine lands on the target
+  exactly.
+
+The grant is therefore **self-limiting**: after one successful top-up the
+deficit is zero and no further managed call is made, which keeps the XP-gain
+notification from firing on a loop. `kExperienceTarget` is `900000000` rather
+than `999999999` because `0x01C7B374` computes `experience + amount` as a
+signed 32-bit int and normal post-grant gains keep accruing on top of the
+synthetic value.
+
+Two alternatives were rejected:
+
+- **Writing the backing field directly.** Experience lives behind the Progress
+  save model (`0x026FCD84` → accessor `0x04D89694`), the same encrypted-holder
+  pattern the wallet uses. Poking it would bypass the persist/notify path and
+  desync the save, exactly the mistake the currency module avoids by going
+  through `0x01B44CC0`.
+- **`万丝丆万丆专且专丌(int,int,int,int)` at `0x01C79F40`.** Disassembly shows it
+  writes the per-level *threshold tables* (`str w19, [x8, #0x20]` indexed by
+  `w20 <= 0x40`), not the player's experience. It is a table initializer, not
+  a setter.
+
+### Expected log
+
+```
+23.1.3-progression: installed (currency target 999999999, level cap 65, experience target 900000000)
+23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=…
+23.1.3-progression: max level reached; experience topped up 0 -> 900000000
+```
+
+The top-up line must appear exactly **once** per session. If it repeats every
+few frames, the Progress service is rejecting the write and the analysis above
+needs revisiting.
+
 ## Save shield
 
 `CheaterConfigMemento` does not exist in 23.1.3. The punishment path is now
@@ -206,6 +296,8 @@ adb logcat -s OPG3D
    — confirm the two captured keys differ and look like real wallet keys.
 4. Coins and gems climb to `999999999` without a `CoinsMessage` toast storm.
 5. Level climbs to 65 and then stops; the level-up UI fires normally.
+5a. Once level 65 is reached, the XP counter reads `900000000` instead of
+   `0`, and `experience topped up 0 -> 900000000` appears once in logcat.
 6. No `CheatDetectedBanner` wipe: `PlayerPrefs` survives an app restart and
    progress is still present.
 7. Online still works — the Photon path is untouched; confirm

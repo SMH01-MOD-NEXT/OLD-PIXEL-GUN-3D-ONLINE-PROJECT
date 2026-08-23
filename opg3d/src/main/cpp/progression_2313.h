@@ -30,6 +30,7 @@ static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 constexpr int32_t kCurrencyTarget = 999999999;
 constexpr int32_t kLevelCap = 65;
 constexpr int32_t kExpGrantPerTick = 9999999;
+constexpr int32_t kExperienceTarget = 900000000;
 constexpr uint64_t kLevelIntervalFrames = 5;
 constexpr uint64_t kCurrencyIntervalFrames = 120;
 constexpr uint64_t kWarmupFrames = 60;
@@ -205,15 +206,63 @@ inline void* shared_controller() {
     return value;
 }
 
-inline void raise_level() {
-    const int32_t level =
-        reinterpret_cast<StaticIntFn>(g_level.ptr)(g_level.info);
-    if (level < 0 || level >= kLevelCap) return;
+inline int32_t current_level() {
+    return reinterpret_cast<StaticIntFn>(g_level.ptr)(g_level.info);
+}
 
+inline int32_t current_experience() {
+    return reinterpret_cast<StaticIntFn>(g_experience.ptr)(g_experience.info);
+}
+
+inline void add_experience(int32_t amount) {
+    if (amount <= 0) return;
     void* controller = shared_controller();
     if (controller == nullptr) return;
     reinterpret_cast<AddExperienceFn>(g_add_experience.ptr)(
-        controller, kExpGrantPerTick, 0, nullptr, g_add_experience.info);
+        controller, amount, 0, nullptr, g_add_experience.info);
+}
+
+// Level ramp *and* the experience counter itself.
+//
+// Below maxLevel the stock add-experience routine (0x01C7AC28) treats the
+// stored experience as a per-level remainder: it subtracts the level
+// threshold on every level-up and then, at 0x01C7AFF4, executes
+//
+//     bl   0x01C79A50        ; 世丐丙丆业一丄丙丒()  -> level
+//     cmp  w0, #0x41         ; maxLevel (65)
+//     csel w26, w26, wzr, lt ; level < 65 ? remainder : 0
+//
+// so the very level-up that reaches 65 deliberately persists experience as
+// **zero**. That is why a level-only pump left the profile at level 65 with
+// xp 0.
+//
+// At maxLevel the same entry point instead tail-branches to the max-level
+// overload 丏三万丕丂业专丌丏 (0x01C7B374), which reads the stored experience,
+// adds the requested amount and persists the sum through the Progress
+// service (0x01B4FD5C) with no level-up bookkeeping and no zeroing. So the
+// counter is filled by continuing to drive the *same* stock routine once the
+// cap is reached, rather than by writing the backing field directly.
+//
+// The top-up is self-limiting: it requests exactly the deficit, so after one
+// successful grant the experience equals kExperienceTarget and no further
+// managed call is made. kExperienceTarget stays well below INT32_MAX because
+// the max-level overload computes `experience + amount` as a signed int and
+// legitimate post-grant gains keep accruing on top of it.
+inline void pump_experience() {
+    const int32_t level = current_level();
+    if (level < 0) return;
+
+    if (level < kLevelCap) {
+        add_experience(kExpGrantPerTick);
+        return;
+    }
+
+    const int32_t experience = current_experience();
+    if (experience < 0 || experience >= kExperienceTarget) return;
+
+    add_experience(kExperienceTarget - experience);
+    LOGI("23.1.3-progression: max level reached; experience topped up "
+         "%" PRId32 " -> %" PRId32, experience, kExperienceTarget);
 }
 
 inline void maybe_grant() {
@@ -238,7 +287,7 @@ inline void maybe_grant() {
     }
 
     if ((g_frames % kCurrencyIntervalFrames) == 0u) top_up_currency();
-    if ((g_frames % kLevelIntervalFrames) == 0u) raise_level();
+    if ((g_frames % kLevelIntervalFrames) == 0u) pump_experience();
 }
 
 inline void menu_update_hook(void* self, void* method) {
@@ -306,7 +355,8 @@ inline bool install() {
 
     g_installed = true;
     LOGI("23.1.3-progression: installed (currency target %" PRId32
-         ", level cap %" PRId32 ")", kCurrencyTarget, kLevelCap);
+         ", level cap %" PRId32 ", experience target %" PRId32 ")",
+         kCurrencyTarget, kLevelCap, kExperienceTarget);
     return true;
 }
 
