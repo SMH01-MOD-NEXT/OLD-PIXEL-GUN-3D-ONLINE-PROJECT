@@ -37,8 +37,8 @@
 //       every module in the storage grid greyed out with "Same mod type
 //       already in use", while the inventory count never moved.
 //
-//   r4  (this file) Inventory-side grant. The catalogue is appended to the two
-//       lists the storage readers actually enumerate:
+//   r4  Inventory-side grant. The catalogue is appended to the two lists the
+//       storage readers actually enumerate:
 //
 //           ModulesController.丅与世丕业丘不丂丈  @ 0x30  List<module>
 //           ModulesController.下丘丌一丞丛丂三丗  @ 0x38  List<moduleSet>
@@ -48,9 +48,28 @@
 //       only stable interception point - hence a field-level grant that is
 //       re-asserted from the main menu and from each storage refresh instead
 //       of a single hook. Per-item models are never written again.
+//
+//   r5  (this file) r4 killed the game on the splash screen. install() ended
+//       with a verify step that read the catalogue's static list, and that
+//       first read forces the catalogue class's static constructor, which
+//       pulls module definitions through PGCompany.AssetBundles_v3 -> config
+//       lookup. At install time (~950 ms after process start) that layer is
+//       not up yet: it logged "Settings are null." and then walked into a JNI
+//       path on the bootstrap thread, which is attached to the IL2CPP runtime
+//       but never to the JVM. Null JNIEnv -> SIGSEGV at 0x68 inside libart.so.
+//
+//       Rule enforced from here on: install() only resolves metadata and
+//       patches code. Every managed call - reading the catalogue, counting a
+//       list, appending to it - runs on a game thread from one of the hooks or
+//       from the main-menu pump, and is refused outright if it is ever reached
+//       from the bootstrap thread. r3 already proved that reading the
+//       catalogue from a UI-thread hook is safe: its merge succeeded on device
+//       (very visibly, on the armour screen).
 
 #include <cstddef>
 #include <cstdint>
+
+#include <pthread.h>
 
 #include "hook.h"
 #include "il2cpp.h"
@@ -146,7 +165,7 @@ constexpr bool contains_bytes(const char* haystack, const char* needle) {
 }
 
 // U+5341 十, the character revision 1 substituted for 丐 and 丒.
-constexpr const char* kMojibake = "\xE5\x8D\x81";
+constexpr const char* kMojibake = "\\xE5\\x8D\\x81";
 
 static_assert(!contains_bytes(kCurrentLevel, kMojibake) &&
                   !contains_bytes(kModuleClass, kMojibake) &&
@@ -162,43 +181,43 @@ static_assert(!contains_bytes(kCurrentLevel, kMojibake) &&
 
 static_assert(
     equal_bytes(kCurrentLevel,
-                "\xE4\xB8\x83"   // U+4E03 七
-                "\xE4\xB8\x94"   // U+4E14 且
-                "\xE4\xB8\x90"   // U+4E10 丐  (revision 1 corrupted this)
-                "\xE4\xB8\x9C"   // U+4E1C 东
-                "\xE4\xB8\x92"   // U+4E12 丒  (revision 1 corrupted this)
-                "\xE4\xB8\x86"   // U+4E06 丆
-                "\xE4\xB8\x91"   // U+4E11 丑
-                "\xE4\xB8\x88"   // U+4E08 丈
-                "\xE4\xB8\x87"), // U+4E07 万
+                "\\xE4\\xB8\\x83"   // U+4E03 七
+                "\\xE4\\xB8\\x94"   // U+4E14 且
+                "\\xE4\\xB8\\x90"   // U+4E10 丐  (revision 1 corrupted this)
+                "\\xE4\\xB8\\x9C"   // U+4E1C 东
+                "\\xE4\\xB8\\x92"   // U+4E12 丒  (revision 1 corrupted this)
+                "\\xE4\\xB8\\x86"   // U+4E06 丆
+                "\\xE4\\xB8\\x91"   // U+4E11 丑
+                "\\xE4\\xB8\\x88"   // U+4E08 丈
+                "\\xE4\\xB8\\x87"), // U+4E07 万
     "kCurrentLevel must stay byte-identical to 0x024B0BB0 as spelled in the "
     "23.1.3 metadata; a corrupted identifier silently disables the module");
 
 static_assert(
     equal_bytes(kInventoryModules,
-                "\xE4\xB8\x85"   // U+4E05 丅
-                "\xE4\xB8\x8E"   // U+4E0E 与
-                "\xE4\xB8\x96"   // U+4E16 世
-                "\xE4\xB8\x95"   // U+4E15 丕
-                "\xE4\xB8\x9A"   // U+4E1A 业
-                "\xE4\xB8\x98"   // U+4E18 丘
-                "\xE4\xB8\x8D"   // U+4E0D 不
-                "\xE4\xB8\x82"   // U+4E02 丂
-                "\xE4\xB8\x88"), // U+4E08 丈
+                "\\xE4\\xB8\\x85"   // U+4E05 丅
+                "\\xE4\\xB8\\x8E"   // U+4E0E 与
+                "\\xE4\\xB8\\x96"   // U+4E16 世
+                "\\xE4\\xB8\\x95"   // U+4E15 丕
+                "\\xE4\\xB8\\x9A"   // U+4E1A 业
+                "\\xE4\\xB8\\x98"   // U+4E18 丘
+                "\\xE4\\xB8\\x8D"   // U+4E0D 不
+                "\\xE4\\xB8\\x82"   // U+4E02 丂
+                "\\xE4\\xB8\\x88"), // U+4E08 丈
     "kInventoryModules must stay byte-identical to ModulesController +0x30, "
     "the List<module> every storage reader enumerates");
 
 static_assert(
     equal_bytes(kInventorySets,
-                "\xE4\xB8\x8B"   // U+4E0B 下
-                "\xE4\xB8\x98"   // U+4E18 丘
-                "\xE4\xB8\x8C"   // U+4E0C 丌
-                "\xE4\xB8\x80"   // U+4E00 一
-                "\xE4\xB8\x9E"   // U+4E1E 丞
-                "\xE4\xB8\x9B"   // U+4E1B 丛
-                "\xE4\xB8\x82"   // U+4E02 丂
-                "\xE4\xB8\x89"   // U+4E09 三
-                "\xE4\xB8\x97"), // U+4E17 丗
+                "\\xE4\\xB8\\x8B"   // U+4E0B 下
+                "\\xE4\\xB8\\x98"   // U+4E18 丘
+                "\\xE4\\xB8\\x8C"   // U+4E0C 丌
+                "\\xE4\\xB8\\x80"   // U+4E00 一
+                "\\xE4\\xB8\\x9E"   // U+4E1E 丞
+                "\\xE4\\xB8\\x9B"   // U+4E1B 丛
+                "\\xE4\\xB8\\x82"   // U+4E02 丂
+                "\\xE4\\xB8\\x89"   // U+4E09 三
+                "\\xE4\\xB8\\x97"), // U+4E17 丗
     "kInventorySets must stay byte-identical to ModulesController +0x38");
 
 // ---------------------------------------------------------------------------
@@ -293,8 +312,13 @@ inline uint64_t g_level_calls = 0;
 inline uint64_t g_grant_calls = 0;
 inline uint64_t g_pump_calls = 0;
 inline uint64_t g_failure_reports = 0;
+inline uint64_t g_refusals = 0;
 
 inline thread_local bool g_in_grant = false;
+
+inline pthread_t g_install_thread{};
+inline bool g_install_thread_valid = false;
+inline bool g_catalog_verified = false;
 
 class Latch {
 public:
@@ -319,6 +343,65 @@ private:
     bool& flag_;
     bool entered_;
 };
+
+// ---------------------------------------------------------------------------
+// Thread safety and lazy catalogue verification
+// ---------------------------------------------------------------------------
+
+// The bootstrap thread that runs install() is attached to the IL2CPP runtime
+// but not to the JVM, and it runs long before the config/AssetBundles layer is
+// alive. A managed call from it can reach JNI with a null JNIEnv and take the
+// process down inside libart, which is exactly how r4 died. Only the game's own
+// threads may call into managed code.
+inline bool managed_calls_allowed(const char* label) {
+    if (!g_install_thread_valid ||
+        pthread_equal(pthread_self(), g_install_thread) == 0) {
+        return true;
+    }
+    if (g_refusals < 3) {
+        ++g_refusals;
+        LOGE("23.1.3-modules: managed call refused (%s): the bootstrap thread "
+             "is not a safe caller", label);
+    }
+    return false;
+}
+
+// Diagnostics only, and deliberately lazy: the first read of the catalogue is
+// what triggers its static constructor, so it has to happen on a game thread.
+inline void verify_catalog_once() {
+    if (g_catalog_verified || !g_catalog_modules.ok()) {
+        return;
+    }
+    g_catalog_verified = true;
+
+    void* modules = reinterpret_cast<StaticObjFn>(g_catalog_modules.ptr)(
+        g_catalog_modules.info);
+    ListApi api{};
+    if (!resolve_list_api(modules, api)) {
+        LOGE("23.1.3-modules: catalogue unreadable");
+        return;
+    }
+    const int32_t count = list_count(api, modules);
+
+    int32_t sets = -1;
+    if (g_catalog_sets.ok()) {
+        void* set_list = reinterpret_cast<StaticObjFn>(g_catalog_sets.ptr)(
+            g_catalog_sets.info);
+        ListApi set_api{};
+        if (resolve_list_api(set_list, set_api)) {
+            sets = list_count(set_api, set_list);
+        }
+    }
+
+    if (count == kExpectedModules && sets == kExpectedModuleSets) {
+        LOGI("23.1.3-modules: catalogue verified (%d modules, %d sets)", count,
+             sets);
+    } else {
+        LOGE("23.1.3-modules: catalogue mismatch (%d modules, %d sets; "
+             "expected %d and %d)",
+             count, sets, kExpectedModules, kExpectedModuleSets);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Inventory grant
@@ -414,7 +497,7 @@ inline GrantResult grant_into(void* target, const Managed& source) {
 }
 
 inline void grant_inventory(const char* label) {
-    if (!g_installed) {
+    if (!g_installed || !managed_calls_allowed(label)) {
         return;
     }
 
@@ -422,6 +505,8 @@ inline void grant_inventory(const char* label) {
     if (!latch.entered()) {
         return;
     }
+
+    verify_catalog_once();
 
     ++g_grant_calls;
     const bool verbose = g_grant_calls <= 3 || (g_grant_calls % kGrantLogEvery) == 0;
@@ -536,43 +621,15 @@ inline void insert_panel_refresh_hook(void* self, void* method) {
 // Install
 // ---------------------------------------------------------------------------
 
-inline void verify_catalog() {
-    if (!g_catalog_modules.ok()) {
-        return;
-    }
-    void* modules = reinterpret_cast<StaticObjFn>(g_catalog_modules.ptr)(
-        g_catalog_modules.info);
-    ListApi api{};
-    if (!resolve_list_api(modules, api)) {
-        LOGE("23.1.3-modules: catalogue unreadable at install time");
-        return;
-    }
-    const int32_t count = list_count(api, modules);
-
-    int32_t sets = -1;
-    if (g_catalog_sets.ok()) {
-        void* set_list = reinterpret_cast<StaticObjFn>(g_catalog_sets.ptr)(
-            g_catalog_sets.info);
-        ListApi set_api{};
-        if (resolve_list_api(set_list, set_api)) {
-            sets = list_count(set_api, set_list);
-        }
-    }
-
-    if (count == kExpectedModules && sets == kExpectedModuleSets) {
-        LOGI("23.1.3-modules: catalogue verified (%d modules, %d sets)", count,
-             sets);
-    } else {
-        LOGE("23.1.3-modules: catalogue mismatch (%d modules, %d sets; "
-             "expected %d and %d)",
-             count, sets, kExpectedModules, kExpectedModuleSets);
-    }
-}
-
 inline bool install() {
     if (g_installed) {
         return true;
     }
+
+    // Remember who we are: nothing managed may ever run on this thread.
+    g_install_thread = pthread_self();
+    g_install_thread_valid = true;
+
     if (!il2cpp::resolve()) {
         LOGE("23.1.3-modules: il2cpp api unavailable, module disabled");
         return false;
@@ -640,11 +697,13 @@ inline bool install() {
          kRouteCount);
 
     g_installed = true;
-    verify_catalog();
 
+    // Nothing managed runs here. The catalogue is read, verified and merged the
+    // first time a game thread reaches one of the routes above.
     LOGI("23.1.3-modules: armed: level X guaranteed, catalogue granted into "
-         "the ModulesController inventory lists (expect %d modules, %d module "
-         "sets); per-item module storage is left untouched",
+         "the ModulesController inventory lists from game threads only "
+         "(expect %d modules, %d module sets); per-item module storage is left "
+         "untouched",
          kExpectedModules, kExpectedModuleSets);
     return true;
 }
