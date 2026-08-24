@@ -38,6 +38,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -496,8 +497,21 @@ inline void broadcast_probe(int fd, const char* payload) {
     sendto(fd, payload, length, 0, reinterpret_cast<sockaddr*>(&target),
            sizeof(target));
 
+    // bionic only declares getifaddrs and freeifaddrs from API 24 onwards and
+    // this library targets API 21, so they are resolved at runtime instead. On
+    // Android 7 and newer the per-interface pass below runs as written; on
+    // anything older the limited broadcast above is the whole probe, which is
+    // all a single-subnet network needs anyway.
+    using GetIfAddrs = int (*)(ifaddrs**);
+    using FreeIfAddrs = void (*)(ifaddrs*);
+    static const auto get_addrs =
+        reinterpret_cast<GetIfAddrs>(dlsym(RTLD_DEFAULT, "getifaddrs"));
+    static const auto free_addrs =
+        reinterpret_cast<FreeIfAddrs>(dlsym(RTLD_DEFAULT, "freeifaddrs"));
+    if (get_addrs == nullptr || free_addrs == nullptr) return;
+
     ifaddrs* interfaces = nullptr;
-    if (getifaddrs(&interfaces) != 0 || interfaces == nullptr) return;
+    if (get_addrs(&interfaces) != 0 || interfaces == nullptr) return;
     for (ifaddrs* item = interfaces; item != nullptr; item = item->ifa_next) {
         if (item->ifa_broadaddr == nullptr) continue;
         if (item->ifa_broadaddr->sa_family != AF_INET) continue;
@@ -509,7 +523,7 @@ inline void broadcast_probe(int fd, const char* payload) {
         sendto(fd, payload, length, 0, reinterpret_cast<sockaddr*>(&peer),
                sizeof(peer));
     }
-    freeifaddrs(interfaces);
+    free_addrs(interfaces);
 }
 
 inline bool probe_for_host(std::string* endpoint) {
