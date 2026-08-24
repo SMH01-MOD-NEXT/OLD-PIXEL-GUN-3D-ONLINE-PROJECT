@@ -31,9 +31,17 @@ namespace detail {
 using MethodInfo = void;
 using InstanceVoidFn = void (*)(void*, const MethodInfo*);
 using InstanceBoolFn = void (*)(void*, bool, const MethodInfo*);
+// UIButtonColor.SetState(State, bool): the managed enum is a plain int32 in
+// this ABI, and this is the single surface every NGUI button uses to apply the
+// gray "Disabled" presentation (disabledColor plus disabledSprite).
+using InstanceStateFn = void (*)(void*, int32_t, bool, const MethodInfo*);
 using GetGameObjectFn = void* (*)(void*, const MethodInfo*);
 using GetNameFn = void* (*)(void*, const MethodInfo*);
 using GetComponentByNameFn = void* (*)(void*, void*, const MethodInfo*);
+
+// UIButtonColor.State values (dump2313.cs, TypeDefIndex 1202).
+inline constexpr int32_t kStateNormal = 0;
+inline constexpr int32_t kStateDisabled = 3;
 
 inline constexpr const char* kUiNs = "PGCompany.UI";
 inline constexpr const char* kUIGotoArmory = "UIGotoArmory";
@@ -57,15 +65,21 @@ inline const MethodInfo* g_mi_ui_button_set_enabled = nullptr;
 inline const MethodInfo* g_mi_button_handler_set_enabled = nullptr;
 
 inline InstanceBoolFn g_ui_button_set_enabled = nullptr;
+inline InstanceBoolFn g_button_color_set_enabled = nullptr;
 inline InstanceBoolFn g_button_handler_set_enabled = nullptr;
+inline InstanceStateFn g_ui_button_set_state = nullptr;
+inline InstanceStateFn g_button_color_set_state = nullptr;
 inline InstanceVoidFn g_armory_capture = nullptr;
 inline InstanceVoidFn g_armory_click = nullptr;
+inline uintptr_t g_il2cpp_base = 0u;
 
 inline std::array<std::atomic<void*>, kRememberedArmoryObjects>
     g_armory_game_objects{};
 inline std::atomic<uint32_t> g_capture_cursor{0u};
 inline std::atomic<uint32_t> g_disabled_calls{0u};
 inline std::atomic<uint32_t> g_restored_calls{0u};
+inline std::atomic<uint32_t> g_state_calls{0u};
+inline std::atomic<uint32_t> g_state_restored{0u};
 inline std::atomic<uint32_t> g_clicks{0u};
 inline std::atomic<uint32_t> g_eager_repairs{0u};
 
@@ -186,8 +200,19 @@ void eagerly_enable_attached_controls(void* armory_component) {
          count, repaired ? "enabled" : "not-found (name filter remains armed)");
 }
 
+// Managed callers reach the NGUI setters through the virtual slot, so the
+// image contains no direct BL site and the driving controller can only be
+// identified from the live return address. This converts it into the RVA that
+// tools/resolve_rva.py understands.
+uintptr_t caller_rva(const void* caller) {
+    const uintptr_t pc = reinterpret_cast<uintptr_t>(caller) &
+                         ~static_cast<uintptr_t>(1u);
+    if (pc == 0u || g_il2cpp_base == 0u || pc < g_il2cpp_base) return 0u;
+    return pc - g_il2cpp_base;
+}
+
 bool repaired_enabled_value(void* component, bool requested,
-                            const char* surface) {
+                            const char* surface, const void* caller) {
     if (requested) return true;
 
     const std::string name = game_object_name(component);
@@ -195,35 +220,110 @@ bool repaired_enabled_value(void* component, bool requested,
     const uint32_t disabled = g_disabled_calls.fetch_add(1u) + 1u;
     if (disabled <= kDisabledDiagnosticLimit) {
         LOGI("23.1.3-battle-ui: disabled %s candidate #%u object='%s' "
-             "target=%d", surface, disabled, name.c_str(), target ? 1 : 0);
+             "target=%d caller-rva=0x%08" PRIxPTR,
+             surface, disabled, name.c_str(), target ? 1 : 0,
+             caller_rva(caller));
     }
 
     if (!target) return false;
 
     const uint32_t restored = g_restored_calls.fetch_add(1u) + 1u;
-    LOGW("23.1.3-battle-ui: restored %s Armory control #%u object='%s'",
-         surface, restored, name.c_str());
+    if (restored <= kDisabledDiagnosticLimit) {
+        LOGW("23.1.3-battle-ui: restored %s Armory control #%u object='%s'",
+             surface, restored, name.c_str());
+    }
     return true;
+}
+
+// The gray look itself is applied here: NGUI paints disabledColor and swaps in
+// disabledSprite from SetState(Disabled), and a controller can drive that
+// without ever touching isEnabled. Only the narrow Armory filter is forced
+// back to Normal; every other button keeps the stock state.
+int32_t repaired_state_value(void* component, int32_t state,
+                            const char* surface, const void* caller) {
+    if (state != kStateDisabled) return state;
+
+    const std::string name = game_object_name(component);
+    const bool target = is_armory_control(component, name);
+    const uint32_t seen = g_state_calls.fetch_add(1u) + 1u;
+    if (seen <= kDisabledDiagnosticLimit) {
+        LOGI("23.1.3-battle-ui: %s grayed candidate #%u object='%s' target=%d "
+             "caller-rva=0x%08" PRIxPTR,
+             surface, seen, name.c_str(), target ? 1 : 0, caller_rva(caller));
+    }
+
+    if (!target) return state;
+
+    const uint32_t restored = g_state_restored.fetch_add(1u) + 1u;
+    if (restored <= kDisabledDiagnosticLimit) {
+        LOGW("23.1.3-battle-ui: repainted %s Armory control #%u object='%s' "
+             "(Disabled -> Normal)",
+             surface, restored, name.c_str());
+    }
+    return kStateNormal;
 }
 
 void ui_button_set_enabled_hook(void* self, bool enabled,
                                 const MethodInfo* method) {
+    const void* caller = OPG3D_RETURN_ADDRESS();
     if (g_ui_button_set_enabled == nullptr) {
         LOGE("23.1.3-battle-ui: UIButton setter has no saved original");
         return;
     }
     g_ui_button_set_enabled(
-        self, repaired_enabled_value(self, enabled, "UIButton"), method);
+        self, repaired_enabled_value(self, enabled, "UIButton", caller),
+        method);
+}
+
+// UIButton derives from UIButtonColor, so a control that carries only the base
+// component (or a caller that assigns through the base slot) never reaches the
+// UIButton override above.
+void button_color_set_enabled_hook(void* self, bool enabled,
+                                   const MethodInfo* method) {
+    const void* caller = OPG3D_RETURN_ADDRESS();
+    if (g_button_color_set_enabled == nullptr) {
+        LOGE("23.1.3-battle-ui: UIButtonColor setter has no saved original");
+        return;
+    }
+    g_button_color_set_enabled(
+        self, repaired_enabled_value(self, enabled, "UIButtonColor", caller),
+        method);
+}
+
+void ui_button_set_state_hook(void* self, int32_t state, bool immediate,
+                              const MethodInfo* method) {
+    const void* caller = OPG3D_RETURN_ADDRESS();
+    if (g_ui_button_set_state == nullptr) {
+        LOGE("23.1.3-battle-ui: UIButton.SetState has no saved original");
+        return;
+    }
+    g_ui_button_set_state(
+        self, repaired_state_value(self, state, "UIButton", caller), immediate,
+        method);
+}
+
+void button_color_set_state_hook(void* self, int32_t state, bool immediate,
+                                 const MethodInfo* method) {
+    const void* caller = OPG3D_RETURN_ADDRESS();
+    if (g_button_color_set_state == nullptr) {
+        LOGE("23.1.3-battle-ui: UIButtonColor.SetState has no saved original");
+        return;
+    }
+    g_button_color_set_state(
+        self, repaired_state_value(self, state, "UIButtonColor", caller),
+        immediate, method);
 }
 
 void button_handler_set_enabled_hook(void* self, bool enabled,
                                      const MethodInfo* method) {
+    const void* caller = OPG3D_RETURN_ADDRESS();
     if (g_button_handler_set_enabled == nullptr) {
         LOGE("23.1.3-battle-ui: ButtonHandler setter has no saved original");
         return;
     }
     g_button_handler_set_enabled(
-        self, repaired_enabled_value(self, enabled, "ButtonHandler"), method);
+        self, repaired_enabled_value(self, enabled, "ButtonHandler", caller),
+        method);
 }
 
 void armory_capture_hook(void* self, const MethodInfo* method) {
@@ -262,6 +362,7 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
 #endif
     using namespace detail;
 
+    g_il2cpp_base = libil2cpp_base;
     g_get_component_by_name = libil2cpp_base != 0u
         ? reinterpret_cast<GetComponentByNameFn>(
               libil2cpp_base + kComponentGetComponentStringRva)
@@ -285,6 +386,20 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
         {"", "UIButton", "set_isEnabled", 1},
         replacement(&ui_button_set_enabled_hook),
         original_slot(&g_ui_button_set_enabled), true, &installed);
+    const bool button_color = add(
+        {"", "UIButtonColor", "set_isEnabled", 1},
+        replacement(&button_color_set_enabled_hook),
+        original_slot(&g_button_color_set_enabled), false, &installed);
+    // SetState is the only surface that paints disabledColor and swaps in
+    // disabledSprite, so a control can be grayed with isEnabled untouched.
+    const bool ui_button_state = add(
+        {"", "UIButton", "SetState", 2},
+        replacement(&ui_button_set_state_hook),
+        original_slot(&g_ui_button_set_state), false, &installed);
+    const bool button_color_state = add(
+        {"", "UIButtonColor", "SetState", 2},
+        replacement(&button_color_set_state_hook),
+        original_slot(&g_button_color_set_state), false, &installed);
     const bool button_handler = add(
         {"Rilisoft", "ButtonHandler", kButtonHandlerEnable, 1},
         replacement(&button_handler_set_enabled_hook),
@@ -300,12 +415,14 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
 
     const bool ready = unity_api && g_get_component_by_name != nullptr &&
                        ui_button && capture;
-    LOGI("23.1.3-battle-ui: installed %d/4 Armory hooks "
-         "(unity-api=%d eager-helper=%d ui-button=%d button-handler=%d "
-         "capture=%d click=%d)",
+    LOGI("23.1.3-battle-ui: installed %d/7 Armory hooks "
+         "(unity-api=%d eager-helper=%d ui-button=%d button-color=%d "
+         "state=%d/%d button-handler=%d capture=%d click=%d)",
          installed, unity_api ? 1 : 0,
          g_get_component_by_name != nullptr ? 1 : 0, ui_button ? 1 : 0,
-         button_handler ? 1 : 0, capture ? 1 : 0, click ? 1 : 0);
+         button_color ? 1 : 0, ui_button_state ? 1 : 0,
+         button_color_state ? 1 : 0, button_handler ? 1 : 0, capture ? 1 : 0,
+         click ? 1 : 0);
     if (!ready) {
         LOGE("23.1.3-battle-ui: Armory restoration is incomplete");
     }

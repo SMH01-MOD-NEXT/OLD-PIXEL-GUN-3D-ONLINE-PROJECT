@@ -110,3 +110,51 @@ and every other disabled button stay stock. The expected marker is now:
 ```text
 23.1.3-battle-ui: kept UIButton Armory control enabled #1 object='ChangeTeamButton'
 ```
+
+## Revision 3: the gray look is a state, not the enabled flag
+
+The 2026-08-24 07:23 build proved revision 2 wrong. The alias worked exactly
+as designed — `disabled UIButton candidate #N object='ChangeTeamButton'
+target=1` followed by `restored UIButton Armory control #N` on every frame —
+and the Armory button was still gray. Two conclusions follow:
+
+1. `UIButton.set_isEnabled` is not the surface that grays this control. NGUI
+   paints `UIButtonColor.disabledColor` and swaps in `UIButton.disabledSprite`
+   from `SetState(Disabled)`, which a controller can call directly.
+2. `ChangeTeamButton` was the only object on the `isEnabled` path, so the real
+   Armory prefab is grayed elsewhere and its runtime name is still unknown.
+   `tools/find_callers.py` cannot help: `UIButton.set_isEnabled` (`0x4E6EC5C`),
+   `UIButton.SetState` (`0x4E6FD3C`) and `UIButtonColor.set_isEnabled`
+   (`0x4E70254`) each report `0 call site(s)` because every caller dispatches
+   through the virtual slot instead of a direct `BL`.
+
+This revision therefore widens the *surfaces* while keeping the same narrow
+name filter, and it makes the next log self-identifying:
+
+- `UIButtonColor.set_isEnabled` (slot 5) is hooked in addition to the
+  `UIButton` override, so a control that carries only the base component is
+  covered too.
+- `UIButton.SetState` and `UIButtonColor.SetState` (slot 13) are hooked. A
+  `Disabled` request is rewritten to `Normal` only for the Armory filter, which
+  restores the color *and* the sprite; every other button keeps its stock
+  state.
+- Because the caller is only knowable at runtime, each bounded diagnostic line
+  now carries `caller-rva=0x...`, taken from the live return address relative
+  to `libil2cpp.so`. Feed it to `python3 tools/resolve_rva.py
+  analys2313/dump2313.cs 0x<rva>` to name the managed method that grays the
+  button.
+- Both diagnostic streams are capped at 48 lines so the log is not flooded the
+  way the per-frame revision 2 markers were.
+
+### Expected runtime markers
+
+```text
+23.1.3-battle-ui: installed 7/7 Armory hooks (... button-color=1 state=1/1 ...)
+23.1.3-battle-ui: UIButtonColor grayed candidate #1 object='<real name>' target=0 caller-rva=0x04xxxxxx
+23.1.3-battle-ui: repainted UIButton Armory control #1 object='...' (Disabled -> Normal)
+```
+
+The `grayed candidate` lines are the payload of this revision: the object name
+printed with `target=0` is the prefab that has to be added to the filter, and
+its `caller-rva` identifies the controller that decides the button is
+unavailable.
