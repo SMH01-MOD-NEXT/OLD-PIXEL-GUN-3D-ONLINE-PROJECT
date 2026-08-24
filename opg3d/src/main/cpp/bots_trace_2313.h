@@ -9,8 +9,10 @@
 #include "il2cpp.h"
 #include "log.h"
 
-// Passive diagnostics for 23.1.3 bots: whether the bot subsystem runs at all,
-// how strong the bots are allowed to be, and what they are actually given.
+// Runtime diagnostics and high-rank loadout repair for 23.1.3 multiplayer
+// bots. The trace proves which creation path runs; the repair assigns the
+// highest AI tier shipped by this exact client so regular bots select the
+// weapon table associated with a high-level player profile.
 //
 // Revision 2, driven by a real device log. The first revision proved two
 // things, both of which are corrected here:
@@ -36,8 +38,10 @@
 //        AIBotController.<setAiLevel>(int)       -> which level is handed out?
 //        AIBotController.<setBehavior>(enum)     -> does the AI actually tick?
 //
-// Why this is still a trace and not yet a buff. The numbers that decide bot
-// strength are DATA, not code, and the data source is the retired backend:
+// The complete bot tuning model is still data-driven. This matters for future
+// work on health, aim and movement, but the latest device trace proves that
+// standard bots already spawn and run; only their local AI tier assignment is
+// skipped. The retired backend model is:
 //
 //   PGCompany.DataObjects.<loadout>            [MessagePackObject/JsonProperty]
 //     .IntBotsLoadout : Dictionary<int, <botConfig>>
@@ -52,9 +56,10 @@
 //     ChangeWeaponToMeleeInCloseRange, MinTurnRate, MaxTurnRate,
 //     RotateWhenStand, AggroRadius, ChaisingTime
 //
-// Note BotIsEnable and MinBotsNumber/MaxBotsNumber in particular: with the
-// backend retired that dictionary is empty, so "bots are weak" and "bots never
-// appeared in this match" may well share one root cause.
+// BotIsEnable and MinBotsNumber/MaxBotsNumber can still affect other modes,
+// but they are not the cause in the reported deathmatch: six bot prefabs and
+// AIBotController.Awake calls were observed while the AI-level setter remained
+// completely silent.
 //
 // The client-side mirror is <aiConfig>.AILevelSettings, keyed by an integer AI
 // level, and it carries the weapon list itself:
@@ -67,10 +72,12 @@
 //     rotateWhenStand, choosePlayerAsTarget, doDamageOnShoot,
 //     changeWeaponOnReload, pauseOnShoot, throwGrenade
 //
-// What cannot be known statically is how many AI levels this build actually
-// ships and which one is handed out - the dictionary is filled at runtime from
-// a JSON payload. Raising the level blindly would either do nothing or index a
-// level that does not exist. This module changes nothing.
+// Revision 3 resolves the remaining ambiguity from the device trace and the
+// A64 caller graph. PlayerBotsManager clamps the stock value to 3 before it
+// calls AIBotController.<setAiLevel>, and the weapon-list selector indexes its
+// local AILevelSettings dictionary with that field. The reported match never
+// called the setter, leaving every bot at default tier 0. Tier 3 is therefore
+// the verified high-rank client tier; 65 would be an invalid index here.
 //
 // RVAs for review only; everything resolves by metadata name at runtime:
 //   PlayerBotsManager.Awake                                    0x239D6E4
@@ -126,6 +133,8 @@ inline constexpr const char* kAiLevelSettings = u8"万东上不丑且七与丑";
 inline constexpr size_t kMaxStringChars = 128u;
 // Behavior changes are frequent; keep the log readable.
 inline constexpr uint32_t kBehaviorLogInterval = 25u;
+// Bot AI tiers are 0..3 in 23.1.3. This is not the player rank scale.
+inline constexpr int32_t kHighRankAiLevel = 3;
 
 inline InstanceVoidFn g_manager_awake = nullptr;
 inline InstanceVoidFn g_manager_start = nullptr;
@@ -136,6 +145,7 @@ inline RegisterFn g_register_bot = nullptr;
 inline InstantiateFn g_instantiate_bot = nullptr;
 inline StaticFactoryFn g_bot_factory = nullptr;
 inline InstanceIntFn g_set_ai_level = nullptr;
+inline const MethodInfo* g_set_ai_level_info = nullptr;
 inline InstanceIntFn g_set_behavior = nullptr;
 inline InstanceObjFn g_ai_level_settings = nullptr;
 
@@ -228,6 +238,20 @@ void ai_awake_hook(void* self, const MethodInfo* method) {
         return;
     }
     g_ai_awake(self, method);
+
+    // The retired loadout transaction never reaches the stock manager call
+    // that assigns this field. Apply the verified maximum tier immediately
+    // after Awake, before the bot begins Walking/Searching/Skirmish updates.
+    if (self != nullptr && g_set_ai_level != nullptr &&
+        g_set_ai_level_info != nullptr) {
+        g_set_ai_level(self, kHighRankAiLevel, g_set_ai_level_info);
+        LOGW("23.1.3-bots: bot %p forced to high-rank AI tier %" PRId32
+             " after Awake #%" PRIu32,
+             self, kHighRankAiLevel, index);
+    } else {
+        LOGE("23.1.3-bots: cannot assign high-rank AI tier after Awake #%"
+             PRIu32, index);
+    }
 }
 
 void spawn_with_equip_hook(void* self, ManagedString* first,
@@ -266,12 +290,19 @@ void apply_ai_levels_hook(void* self, void* teammates, void* enemies,
 }
 
 void set_ai_level_hook(void* self, int32_t level, const MethodInfo* method) {
-    LOGI("23.1.3-bots: bot %p assigned AI level %" PRId32, self, level);
     if (g_set_ai_level == nullptr) {
         LOGE("23.1.3-bots: AI level setter has no saved original");
         return;
     }
-    g_set_ai_level(self, level, method);
+    if (level != kHighRankAiLevel) {
+        LOGW("23.1.3-bots: bot %p AI tier %" PRId32 " -> %" PRId32
+             " (high-rank weapon table)",
+             self, level, kHighRankAiLevel);
+    } else {
+        LOGI("23.1.3-bots: bot %p retained high-rank AI tier %" PRId32,
+             self, kHighRankAiLevel);
+    }
+    g_set_ai_level(self, kHighRankAiLevel, method);
 }
 
 void set_behavior_hook(void* self, int32_t behavior,
@@ -316,9 +347,8 @@ inline bool add(const hook::ManagedMethod& method, void* replacement_pointer,
 
 } // namespace detail
 
-// Installs the passive bot trace. Returns true when the hooks that answer the
-// two open questions are in place: is a bot object created at all, and which AI
-// level does its controller receive.
+// Installs the bot trace and high-rank AI-tier repair. Readiness requires the
+// factory trace and the setter whose saved original is used after every Awake.
 inline bool install_hooks() {
 #if defined(__ANDROID__)
     static_assert(sizeof(void*) == 8,
@@ -354,13 +384,19 @@ inline bool install_hooks() {
         reinterpret_cast<void**>(&g_apply_ai_levels), &installed);
 
     // Tuning surface. Namespace "PlayerBot", not global.
-    add({kBotNs, kAiBotController, "Awake", 0},
-        reinterpret_cast<void*>(&ai_awake_hook),
-        reinterpret_cast<void**>(&g_ai_awake), &installed);
+    const bool ai_awake = add({kBotNs, kAiBotController, "Awake", 0},
+                              reinterpret_cast<void*>(&ai_awake_hook),
+                              reinterpret_cast<void**>(&g_ai_awake),
+                              &installed);
+    g_set_ai_level_info = reinterpret_cast<const MethodInfo*>(
+        il2cpp::find_method_info(kBotNs, kAiBotController, kSetAiLevel, 1));
     const bool level = add({kBotNs, kAiBotController, kSetAiLevel, 1},
                            reinterpret_cast<void*>(&set_ai_level_hook),
                            reinterpret_cast<void**>(&g_set_ai_level),
                            &installed);
+    if (level && g_set_ai_level_info == nullptr) {
+        LOGE("23.1.3-bots: AI level MethodInfo was not retained");
+    }
     add({kBotNs, kAiBotController, kSetBehavior, 1},
         reinterpret_cast<void*>(&set_behavior_hook),
         reinterpret_cast<void**>(&g_set_behavior), &installed);
@@ -368,10 +404,12 @@ inline bool install_hooks() {
         reinterpret_cast<void*>(&ai_level_settings_hook),
         reinterpret_cast<void**>(&g_ai_level_settings), &installed);
 
-    LOGI("23.1.3-bots-trace: installed %d/11 hooks (bot-factory=%s "
-         "ai-level=%s)",
-         installed, factory ? "OK" : "FAILED", level ? "OK" : "FAILED");
-    return factory && level;
+    LOGI("23.1.3-bots: installed %d/11 hooks (bot-factory=%s "
+         "ai-awake=%s ai-level=%s forced-tier=%" PRId32 ")",
+         installed, factory ? "OK" : "FAILED",
+         ai_awake ? "OK" : "FAILED", level ? "OK" : "FAILED",
+         kHighRankAiLevel);
+    return factory && ai_awake && level && g_set_ai_level_info != nullptr;
 }
 
 } // namespace bots_trace_2313

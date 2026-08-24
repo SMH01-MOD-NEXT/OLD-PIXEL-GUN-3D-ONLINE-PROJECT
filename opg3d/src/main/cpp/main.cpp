@@ -8,6 +8,7 @@
 
 #include "assets_data_2313.h"
 #include "backend_local_2313.h"
+#include "battle_ui_2313.h"
 #include "bots_trace_2313.h"
 #include "config.h"
 #include "crafting_2313.h"
@@ -26,6 +27,7 @@
 #include "photon_trace_2313.h"
 #include "post_match_2313.h"
 #include "progression_2313.h"
+#include "rank_ui_2313.h"
 #include "startup_guards_2313.h"
 #include "startup_trace_2313.h"
 #include "version_2313.h"
@@ -141,6 +143,8 @@ void* init_thread(void*) {
     const bool assets_payload   = assets_data_2313::install_hooks(base);
     const bool net_stall        = net_stall_guard_2313::install_hooks();
     const bool online_state     = online_state_2313::install_hooks();
+    const bool battle_ui        = battle_ui_2313::install_hooks(base);
+    const bool rank_ui          = rank_ui_2313::install_hooks();
     const bool post_match       = post_match_2313::install_hooks();
     const bool bots_trace       = bots_trace_2313::install_hooks();
     if (signature_compat && version_traces && startup_guards &&
@@ -148,7 +152,7 @@ void* init_thread(void*) {
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && weapon_modules && local_identity &&
         assets_payload && net_stall && post_match && online_state &&
-        bots_trace) {
+        battle_ui && rank_ui && bots_trace) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
@@ -161,15 +165,18 @@ void* init_thread(void*) {
              "assets/data payload is unpacked into the game's own resource "
              "root, the repeated blocking backend name lookup no longer "
              "stalls the game thread, and the frozen end-of-match "
-             "victory screen is revived with a guaranteed exit, and every "
-             "retired offline verdict now reports a live connection");
+             "victory screen is revived with a guaranteed exit, every "
+             "retired offline verdict now reports a live connection, the "
+             "in-battle Armory and rank label are restored, and multiplayer "
+             "bots use the high-rank weapon tier");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
              "local-backend=%d photon=%d plugin=%d photon-trace=%d "
              "progression=%d crafting=%d lobby-catalog=%d modules=%d "
              "identity=%d assets-data=%d net-stall=%d "
-             "post-match=%d online-state=%d bots-trace=%d",
+             "post-match=%d online-state=%d battle-ui=%d rank-ui=%d "
+             "bots=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
@@ -178,7 +185,8 @@ void* init_thread(void*) {
              crafting ? 1 : 0, lobby_catalog ? 1 : 0, weapon_modules ? 1 : 0,
              local_identity ? 1 : 0, assets_payload ? 1 : 0,
              net_stall ? 1 : 0, post_match ? 1 : 0,
-             online_state ? 1 : 0, bots_trace ? 1 : 0);
+             online_state ? 1 : 0, battle_ui ? 1 : 0, rank_ui ? 1 : 0,
+             bots_trace ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);

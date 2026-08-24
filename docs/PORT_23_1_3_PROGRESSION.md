@@ -313,3 +313,21 @@ Symbolize any crash with:
 ```
 python3 tools/symbolize_log.py --dump <dump>.cs --log logcat.txt
 ```
+
+## Rank presentation follow-up
+
+The August 24 device log proves that progression itself is synchronized:
+`ExperienceController` returned level 65 and experience 999,995 before the
+existing max-level top-up ran. The mode-selection UI's absent number is not a
+second save problem.
+
+`RankIndicatorGuiElement.<refresh>(bool)` reads
+`ExpController.<normalizedLevel>()`; that helper calls the same canonical
+level getter and clamps it to `1..65`. The refresh then calls
+`UILabel.set_text("65")` on `_rankLable`. The new `rank_ui_2313.h` hook leaves
+all progression values stock and repairs only that label's active/enabled/alpha
+state after the refresh. `PlayerPanel.UpdateExp()` receives the same fallback
+for the older header widget.
+
+The 900,000,000 experience target remains unchanged. No display-only XP clamp
+was needed to restore the rank label.

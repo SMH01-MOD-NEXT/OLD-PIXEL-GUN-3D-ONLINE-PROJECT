@@ -268,3 +268,55 @@ either.
 - The post-match chain fired only `ShowStartInterface` (the pre-match panel),
   and the captured log ends mid-match, so the end-of-match segment is still
   missing. The 13-node trace has not yet been observed at match end.
+
+## Revision 3: assign the verified high-rank AI tier
+
+The next device log resolved the creation chain completely:
+
+- `PlayerBotsManager.Awake` and `Start` ran;
+- six regular bot prefabs were instantiated;
+- six `PlayerBot.AIBotController.Awake` calls ran;
+- the bots entered Walking, Searching and Skirmish states;
+- no `AIBotController.<setAiLevel>(int)` call occurred;
+- no stock spawn-with-equip or AI-level-table application event occurred.
+
+Thus standard bots exist and tick, but their AI-level field remains its default
+zero. The missing player rank label is unrelated: the player getter already
+returns 65.
+
+### Why the assigned value is 3, not 65
+
+`AIBotController + 0x7C` is an AI-tier index, not a player rank. In
+`PlayerBotsManager.<assign>` (`0x023A034C`) the stock client computes a value
+and explicitly clamps it to 3 before calling the setter at `0x02143514`:
+
+```asm
+cmp  w27, #0x3
+csel w1, w27, w26, lt   // w26 = 3
+bl   0x02143514
+```
+
+The normal weapon-list selector near `0x02147E40` reads that field and indexes
+the local `AILevelSettings.weapons` dictionary. Passing 65 would be an invalid
+index; tier 3 is the client's own maximum/high-rank configuration.
+
+### Runtime repair
+
+Revision 3 keeps all diagnostics and adds two bounded interventions:
+
+1. after every stock `AIBotController.Awake`, call the saved original setter
+   with tier 3, before behavior updates start;
+2. if any delayed stock assignment arrives later, preserve the call but clamp
+   its argument to tier 3.
+
+Expected markers:
+
+```text
+23.1.3-bots: installed 11/11 hooks (bot-factory=OK ai-awake=OK ai-level=OK forced-tier=3)
+23.1.3-bots: AIBotController.Awake #1 self=...
+23.1.3-bots: bot ... forced to high-rank AI tier 3 after Awake #1
+```
+
+Validation must confirm that bots no longer keep the default starter weapons.
+If tier 3 is assigned but a particular mode still uses defaults, capture the
+weapon selector/spawn path for that mode instead of increasing the index.

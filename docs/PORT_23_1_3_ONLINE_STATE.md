@@ -112,3 +112,15 @@ Prefix `23.1.3-online`:
 2. Confirm `23.1.3-online: installed 10/10 forced-online hooks` at startup.
 3. Enter a battle and open the arsenal; no offline banner should appear.
 4. Confirm craft screens no longer show a connection-error banner.
+
+## Device follow-up: the gray Armory is not an online verdict
+
+The next full log installed all 10 hooks but showed none of the online-state
+runtime callbacks on the gray Armory path, while Photon reached Joined and
+operations succeeded. This falsifies the earlier working assumption that
+`DisableIfOfflineMode` removes that particular control.
+
+The remaining state is repaired separately in `battle_ui_2313.h` at the NGUI
+`UIButton`/`ButtonHandler` enable surfaces. Keeping the modules separate avoids
+turning more connection state into synthetic data and keeps every unrelated
+button's disabled state intact.
