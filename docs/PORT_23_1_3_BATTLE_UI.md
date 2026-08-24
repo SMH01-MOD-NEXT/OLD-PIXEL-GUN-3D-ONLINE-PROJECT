@@ -95,3 +95,18 @@ not modified or cosmetically replaced.
 
 Only the applicable Armory restoration path needs to appear: an eager repair
 may make a later `restored UIButton` line unnecessary.
+
+## Revision 2: the real 23.1.3 battle prefab
+
+The 2026-08-24 device log showed `UIButton.set_isEnabled(false)` every frame
+for exactly one object: `ChangeTeamButton`. It also contained no
+`UIGotoArmory` lifecycle/capture marker, so this scene variant cannot be
+identified through that component.
+
+`ChangeTeamButton` is now an exact, case-insensitive alias in the same narrow
+name filter. A false write to that button is changed to true; unrelated names
+and every other disabled button stay stock. The expected marker is now:
+
+```text
+23.1.3-battle-ui: kept UIButton Armory control enabled #1 object='ChangeTeamButton'
+```

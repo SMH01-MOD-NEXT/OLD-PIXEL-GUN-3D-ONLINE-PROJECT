@@ -452,3 +452,27 @@ is released with `controller is gone; the screen was closed elsewhere`.
 `post_match_trace_2313.h` is kept in the tree for future mapping work but is no
 longer installed from `main.cpp`: it hooks the same iterators, and shadowhook
 allows one hook per target.
+
+## Revision 4: clickable but invisible result HUD
+
+The 2026-08-24 device report refined the remaining failure: the OK control can
+still be clicked at its normal coordinates, but the HUD, rewards, and button
+art are not drawn. Static A64 analysis also shows that the stock panel switch
+already activates `finishedInterface`. The defect is therefore the NGUI
+presentation state, not a missing GameObject or collider.
+
+The repair keeps the stock transition and adds a 30-second visibility watchdog,
+armed by the results iterator and refreshed after `OnTablesShown`,
+`OnRewardShow`, and `OnRewardAnimationEnds`. It walks only currently active
+result roots through the exact 23.1.3
+`GameObject.GetComponentsInChildren(Type, bool)` RVA and:
+
+- re-enables disabled active `UIPanel`/`UIWidget` components;
+- changes only effectively invisible alpha values (`<= 0.01`) back to `1`;
+- leaves inactive win/defeat/draw, ad, and other mutually exclusive branches
+  under stock control;
+- stops when the stock Continue/OK handler runs, or after 30 seconds.
+
+Bounded `presentation watchdog` markers report active roots and the number of
+panels/widgets actually restored. No reward, match payload, or label value is
+fabricated.

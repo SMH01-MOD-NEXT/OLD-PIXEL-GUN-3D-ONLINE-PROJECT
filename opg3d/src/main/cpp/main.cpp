@@ -145,7 +145,7 @@ void* init_thread(void*) {
     const bool online_state     = online_state_2313::install_hooks();
     const bool battle_ui        = battle_ui_2313::install_hooks(base);
     const bool rank_ui          = rank_ui_2313::install_hooks();
-    const bool post_match       = post_match_2313::install_hooks();
+    const bool post_match       = post_match_2313::install_hooks(base);
     const bool bots_trace       = bots_trace_2313::install_hooks();
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
@@ -165,9 +165,10 @@ void* init_thread(void*) {
              "assets/data payload is unpacked into the game's own resource "
              "root, the repeated blocking backend name lookup no longer "
              "stalls the game thread, and the frozen end-of-match "
-             "victory screen is revived with a guaranteed exit, every "
-             "retired offline verdict now reports a live connection, the "
-             "in-battle Armory and rank label are restored, and multiplayer "
+             "victory screen is revived with visible NGUI presentation and a "
+             "guaranteed exit, every retired offline verdict now reports a "
+             "live connection, the in-battle Armory and rank label are "
+             "restored, and multiplayer "
              "bots use the high-rank weapon tier");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "

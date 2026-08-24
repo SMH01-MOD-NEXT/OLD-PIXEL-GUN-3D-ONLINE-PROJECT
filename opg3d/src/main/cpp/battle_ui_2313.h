@@ -124,7 +124,10 @@ bool target_name(const std::string& name) {
     const std::string lower = ascii_lower(name);
     return lower.find("armory") != std::string::npos ||
            lower.find("arsenal") != std::string::npos ||
-           lower.find("loadout") != std::string::npos;
+           lower.find("loadout") != std::string::npos ||
+           // The latest 23.1.3 device log shows that this legacy prefab is the
+           // only UIButton continuously driven disabled during the battle.
+           lower == "changeteambutton";
 }
 
 void remember_armory_object(void* game_object) {

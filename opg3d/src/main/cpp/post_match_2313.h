@@ -97,6 +97,16 @@ constexpr uint64_t kGiveUpMs = 12000;
 constexpr int kMaxRepairs = 3;
 constexpr int kMaxParents = 8;
 
+// The latest device run proves that the post-match controls remain clickable
+// while every visual disappears. That is an NGUI presentation failure (zero
+// UIPanel/UIWidget alpha or a disabled renderer), not a missing button. Keep a
+// short watchdog after the result flow starts and restore only active,
+// effectively invisible NGUI components. Inactive branches remain stock.
+constexpr uint64_t kPresentationHoldMs = 30000;
+constexpr uint64_t kPresentationRefreshMs = 250;
+constexpr size_t kMaxUiComponentsPerRoot = 512u;
+constexpr uintptr_t kGameObjectGetComponentsInChildrenRva = 0x442152Cu;
+
 constexpr int kSlotResults = 0;
 constexpr int kSlotCount = 5;
 
@@ -125,6 +135,13 @@ constexpr IteratorTarget kIterators[kSlotCount] = {
 
 using MoveNextFn = bool (*)(void*, void*);
 using UpdateFn = void (*)(void*, void*);
+using GetComponentsInChildrenFn = void* (*)(void*, void*, bool, void*);
+using ClassGetTypeFn = void* (*)(void*);
+using TypeGetObjectFn = void* (*)(void*);
+using GetAlphaFn = float (*)(void*, void*);
+using SetAlphaFn = void (*)(void*, float, void*);
+using GetEnabledFn = bool (*)(void*, void*);
+using SetEnabledFn = void (*)(void*, bool, void*);
 
 struct Slot {
     void* iterator;
@@ -147,8 +164,18 @@ Slot g_slots[kSlotCount] = {};
 MoveNextFn g_orig_move_next[kSlotCount] = {};
 UpdateFn g_orig_table_update = nullptr;
 UpdateFn g_orig_controller_update = nullptr;
+UpdateFn g_orig_tables_shown = nullptr;
+UpdateFn g_orig_reward_show = nullptr;
+UpdateFn g_orig_reward_animation_ends = nullptr;
+UpdateFn g_orig_continue = nullptr;
+GetComponentsInChildrenFn g_get_components_in_children = nullptr;
+ClassGetTypeFn g_class_get_type = nullptr;
+TypeGetObjectFn g_type_get_object = nullptr;
 bool g_any_live = false;
 uint64_t g_last_service_ms = 0;
+uint64_t g_presentation_until_ms = 0;
+uint64_t g_last_presentation_ms = 0;
+uint32_t g_presentation_passes = 0;
 
 // ---------------------------------------------------------------------------
 // GC handles. Once Unity drops a routine, the only remaining reference to the
@@ -168,6 +195,17 @@ void resolve_gc_api() {
         elfsym::find_symbol("libil2cpp.so", "il2cpp_gchandle_get_target"));
     g_gchandle_free = reinterpret_cast<void (*)(uint32_t)>(
         elfsym::find_symbol("libil2cpp.so", "il2cpp_gchandle_free"));
+}
+
+void resolve_presentation_bridge(uintptr_t libil2cpp_base) {
+    g_get_components_in_children = libil2cpp_base != 0u
+        ? reinterpret_cast<GetComponentsInChildrenFn>(
+              libil2cpp_base + kGameObjectGetComponentsInChildrenRva)
+        : nullptr;
+    g_class_get_type = reinterpret_cast<ClassGetTypeFn>(
+        elfsym::find_symbol("libil2cpp.so", "il2cpp_class_get_type"));
+    g_type_get_object = reinterpret_cast<TypeGetObjectFn>(
+        elfsym::find_symbol("libil2cpp.so", "il2cpp_type_get_object"));
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +255,16 @@ void call_void_bool(const ManagedCall& call, void* self, bool value) {
     reinterpret_cast<Fn>(call.code)(self, value, call.info);
 }
 
+float call_float(const ManagedCall& call, void* self, float fallback) {
+    if (!call.ok() || self == nullptr) return fallback;
+    return reinterpret_cast<GetAlphaFn>(call.code)(self, call.info);
+}
+
+void call_void_float(const ManagedCall& call, void* self, float value) {
+    if (!call.ok() || self == nullptr) return;
+    reinterpret_cast<SetAlphaFn>(call.code)(self, value, call.info);
+}
+
 void* call_object_object(const ManagedCall& call, void* self, void* argument) {
     if (!call.ok() || self == nullptr) return nullptr;
     using Fn = void* (*)(void*, void*, void*);
@@ -234,6 +282,14 @@ struct UnityApi {
     ManagedCall alive;            // UnityEngine.Object.op_Implicit(Object)
     ManagedCall start_coroutine;  // UnityEngine.MonoBehaviour
     ManagedCall press_continue;   // controller.HandleContinue_GoToLobbyButton()
+    ManagedCall get_enabled;      // UnityEngine.Behaviour.get_enabled()
+    ManagedCall set_enabled;      // UnityEngine.Behaviour.set_enabled(bool)
+    ManagedCall panel_get_alpha;  // UIPanel.get_alpha()
+    ManagedCall panel_set_alpha;  // UIPanel.set_alpha(float)
+    ManagedCall widget_get_alpha; // UIWidget.get_alpha()
+    ManagedCall widget_set_alpha; // UIWidget.set_alpha(float)
+    void* panel_type = nullptr;
+    void* widget_type = nullptr;
     bool resolved = false;
 };
 
@@ -266,14 +322,38 @@ void resolve_api() {
     }
     g_api.press_continue =
         resolve_call(kGlobalNs, kController, "HandleContinue_GoToLobbyButton", 0);
+    g_api.get_enabled =
+        resolve_call("UnityEngine", "Behaviour", "get_enabled", 0);
+    g_api.set_enabled =
+        resolve_call("UnityEngine", "Behaviour", "set_enabled", 1);
+    g_api.panel_get_alpha = resolve_call("", "UIPanel", "get_alpha", 0);
+    g_api.panel_set_alpha = resolve_call("", "UIPanel", "set_alpha", 1);
+    g_api.widget_get_alpha = resolve_call("", "UIWidget", "get_alpha", 0);
+    g_api.widget_set_alpha = resolve_call("", "UIWidget", "set_alpha", 1);
+    if (g_class_get_type != nullptr && g_type_get_object != nullptr) {
+        void* panel_class = il2cpp::find_class("", "UIPanel");
+        void* widget_class = il2cpp::find_class("", "UIWidget");
+        if (panel_class != nullptr) {
+            g_api.panel_type = g_type_get_object(g_class_get_type(panel_class));
+        }
+        if (widget_class != nullptr) {
+            g_api.widget_type = g_type_get_object(g_class_get_type(widget_class));
+        }
+    }
     LOGI("%s: managed api gameObject=%d transform=%d parent=%d activeSelf=%d "
          "activeInHierarchy=%d setActive=%d name=%d alive=%d startCoroutine=%d "
-         "continue=%d",
+         "continue=%d ngui=%d",
          kTag, g_api.game_object.ok() ? 1 : 0, g_api.transform.ok() ? 1 : 0,
          g_api.parent.ok() ? 1 : 0, g_api.active_self.ok() ? 1 : 0,
          g_api.active_in_tree.ok() ? 1 : 0, g_api.set_active.ok() ? 1 : 0,
          g_api.name.ok() ? 1 : 0, g_api.alive.ok() ? 1 : 0,
-         g_api.start_coroutine.ok() ? 1 : 0, g_api.press_continue.ok() ? 1 : 0);
+         g_api.start_coroutine.ok() ? 1 : 0, g_api.press_continue.ok() ? 1 : 0,
+         g_get_components_in_children != nullptr &&
+                 g_api.panel_type != nullptr && g_api.widget_type != nullptr &&
+                 g_api.panel_get_alpha.ok() && g_api.panel_set_alpha.ok() &&
+                 g_api.widget_get_alpha.ok() && g_api.widget_set_alpha.ok()
+             ? 1
+             : 0);
 }
 
 bool unity_alive(void* unity_object) {
@@ -315,6 +395,136 @@ void* read_reference(void* object, const char* name) {
     return value;
 }
 
+struct ManagedArrayView {
+    void* klass;
+    void* monitor;
+    void* bounds;
+    uintptr_t max_length;
+    void* items[1];
+};
+
+constexpr const char* kPresentationRootFields[] = {
+    "allInterfaceContainer",
+    "ranksInterface",
+    "finishedInterface",
+    "endInterfacePanel",
+    "allInterfacePanel",
+    "ProgressInterfaceGo",
+    "Continue_GoToLobbyButton",
+    "rewardFullScreenButton",
+    "trophyPanel",
+    "rewardLabelObject",
+};
+constexpr size_t kPresentationRootCount =
+    sizeof(kPresentationRootFields) / sizeof(kPresentationRootFields[0]);
+void* g_presentation_root_fields[kPresentationRootCount] = {};
+bool g_presentation_fields_resolved = false;
+
+bool presentation_api_ready() {
+    return g_get_components_in_children != nullptr &&
+           g_api.panel_type != nullptr && g_api.widget_type != nullptr &&
+           g_api.panel_get_alpha.ok() && g_api.panel_set_alpha.ok() &&
+           g_api.widget_get_alpha.ok() && g_api.widget_set_alpha.ok();
+}
+
+void resolve_presentation_fields() {
+    if (g_presentation_fields_resolved) return;
+    g_presentation_fields_resolved = true;
+    for (size_t index = 0; index < kPresentationRootCount; ++index) {
+        g_presentation_root_fields[index] = il2cpp::find_field(
+            kGlobalNs, kController, kPresentationRootFields[index]);
+    }
+}
+
+void* read_reference_field(void* object, void* field) {
+    if (object == nullptr || field == nullptr ||
+        il2cpp::field_get_value == nullptr) {
+        return nullptr;
+    }
+    void* value = nullptr;
+    il2cpp::field_get_value(object, field, &value);
+    return value;
+}
+
+size_t restore_ngui_components(void* root, void* component_type,
+                               const ManagedCall& get_alpha,
+                               const ManagedCall& set_alpha) {
+    if (root == nullptr || component_type == nullptr ||
+        g_get_components_in_children == nullptr) {
+        return 0u;
+    }
+    void* raw_array =
+        g_get_components_in_children(root, component_type, false, nullptr);
+    if (raw_array == nullptr) return 0u;
+
+    auto* array = reinterpret_cast<ManagedArrayView*>(raw_array);
+    size_t length = static_cast<size_t>(array->max_length);
+    if (length > kMaxUiComponentsPerRoot) {
+        length = kMaxUiComponentsPerRoot;
+    }
+
+    size_t repaired = 0u;
+    for (size_t index = 0; index < length; ++index) {
+        void* component = array->items[index];
+        if (component == nullptr || !unity_alive(component)) continue;
+
+        bool changed = false;
+        if (g_api.get_enabled.ok() && g_api.set_enabled.ok() &&
+            !call_bool(g_api.get_enabled, component, true)) {
+            call_void_bool(g_api.set_enabled, component, true);
+            changed = true;
+        }
+        const float alpha = call_float(get_alpha, component, 1.0f);
+        if (alpha <= 0.01f) {
+            call_void_float(set_alpha, component, 1.0f);
+            changed = true;
+        }
+        if (changed) ++repaired;
+    }
+    return repaired;
+}
+
+void repair_presentation(void* controller, const char* reason) {
+    if (controller == nullptr || !unity_alive(controller)) return;
+    resolve_presentation_fields();
+    if (!presentation_api_ready()) return;
+
+    size_t active_roots = 0u;
+    size_t repaired_panels = 0u;
+    size_t repaired_widgets = 0u;
+    for (size_t index = 0; index < kPresentationRootCount; ++index) {
+        void* root = read_reference_field(
+            controller, g_presentation_root_fields[index]);
+        if (root == nullptr || !unity_alive(root) ||
+            !call_bool(g_api.active_in_tree, root, false)) {
+            continue;
+        }
+        ++active_roots;
+        repaired_panels += restore_ngui_components(
+            root, g_api.panel_type, g_api.panel_get_alpha,
+            g_api.panel_set_alpha);
+        repaired_widgets += restore_ngui_components(
+            root, g_api.widget_type, g_api.widget_get_alpha,
+            g_api.widget_set_alpha);
+    }
+
+    const uint32_t pass = ++g_presentation_passes;
+    if (repaired_panels != 0u || repaired_widgets != 0u || pass <= 2u ||
+        pass % 40u == 0u) {
+        LOGI("%s: presentation watchdog #%u reason=%s active-roots=%zu "
+             "restored-panels=%zu restored-widgets=%zu",
+             kTag, pass, reason, active_roots, repaired_panels,
+             repaired_widgets);
+    }
+}
+
+void arm_presentation(void* controller, const char* reason) {
+    const uint64_t now = ::opg3d_log::monotonic_ms();
+    g_presentation_until_ms = now + kPresentationHoldMs;
+    g_last_presentation_ms = 0u;
+    repair_presentation(controller, reason);
+}
+
 // ---------------------------------------------------------------------------
 // Slot bookkeeping.
 
@@ -342,6 +552,11 @@ void adopt(Slot& slot, int index, void* iterator) {
     g_any_live = true;
     LOGI("%s: %s coroutine started (pinned=%d)", kTag, kIterators[index].label,
          slot.handle != 0u ? 1 : 0);
+    if (index == kSlotResults) {
+        const uint64_t now = ::opg3d_log::monotonic_ms();
+        g_presentation_until_ms = now + kPresentationHoldMs;
+        g_last_presentation_ms = 0u;
+    }
 }
 
 // Switches the inactive GameObject chain that hosts `component` back on.
@@ -410,8 +625,10 @@ void force_exit(Slot& slot, void* live_controller) {
 // heartbeat came from the controller's own Update(), which proves that this
 // controller is alive and its object active.
 void service(void* live_controller) {
-    if (!g_any_live) return;
     const uint64_t now = ::opg3d_log::monotonic_ms();
+    const bool presentation_armed =
+        g_presentation_until_ms != 0u && now <= g_presentation_until_ms;
+    if (!g_any_live && !presentation_armed) return;
     if (now == g_last_service_ms) return;
     g_last_service_ms = now;
     resolve_api();
@@ -457,6 +674,22 @@ void service(void* live_controller) {
         if (index != kSlotResults || slot.exit_pressed) continue;
         if (now - slot.orphan_since_ms < kGiveUpMs) continue;
         force_exit(slot, live_controller);
+    }
+    if (g_presentation_until_ms != 0u) {
+        if (now > g_presentation_until_ms) {
+            g_presentation_until_ms = 0u;
+        } else if (g_last_presentation_ms == 0u ||
+                   now - g_last_presentation_ms >= kPresentationRefreshMs) {
+            void* controller = live_controller != nullptr
+                ? live_controller
+                : g_slots[kSlotResults].controller;
+            if (controller != nullptr && unity_alive(controller)) {
+                g_last_presentation_ms = now;
+                repair_presentation(controller, "watchdog");
+            } else if (controller != nullptr) {
+                g_presentation_until_ms = 0u;
+            }
+        }
     }
     g_any_live = any_live;
 }
@@ -507,10 +740,34 @@ void controller_update(void* self, void* method) {
     service(self);
 }
 
+void tables_shown(void* self, void* method) {
+    if (g_orig_tables_shown != nullptr) g_orig_tables_shown(self, method);
+    arm_presentation(self, "OnTablesShown");
+}
+
+void reward_show(void* self, void* method) {
+    if (g_orig_reward_show != nullptr) g_orig_reward_show(self, method);
+    arm_presentation(self, "OnRewardShow");
+}
+
+void reward_animation_ends(void* self, void* method) {
+    if (g_orig_reward_animation_ends != nullptr) {
+        g_orig_reward_animation_ends(self, method);
+    }
+    arm_presentation(self, "OnRewardAnimationEnds");
+}
+
+void continue_to_lobby(void* self, void* method) {
+    g_presentation_until_ms = 0u;
+    g_last_presentation_ms = 0u;
+    if (g_orig_continue != nullptr) g_orig_continue(self, method);
+}
+
 } // namespace
 
-inline bool install_hooks() {
+inline bool install_hooks(uintptr_t libil2cpp_base) {
     resolve_gc_api();
+    resolve_presentation_bridge(libil2cpp_base);
 
     void* const proxies[kSlotCount] = {
         reinterpret_cast<void*>(&results_move_next),
@@ -541,19 +798,48 @@ inline bool install_hooks() {
         hook::install({kGlobalNs, kController, "Update", 0},
                       reinterpret_cast<void*>(&controller_update),
                       reinterpret_cast<void**>(&g_orig_controller_update));
+    const bool tables_shown_hook =
+        hook::install({kGlobalNs, kController, "OnTablesShown", 0},
+                      reinterpret_cast<void*>(&tables_shown),
+                      reinterpret_cast<void**>(&g_orig_tables_shown));
+    const bool reward_show_hook =
+        hook::install({kGlobalNs, kController, "OnRewardShow", 0},
+                      reinterpret_cast<void*>(&reward_show),
+                      reinterpret_cast<void**>(&g_orig_reward_show));
+    const bool reward_end_hook =
+        hook::install({kGlobalNs, kController, "OnRewardAnimationEnds", 0},
+                      reinterpret_cast<void*>(&reward_animation_ends),
+                      reinterpret_cast<void**>(&g_orig_reward_animation_ends));
+    const bool continue_hook =
+        hook::install({kGlobalNs, kController,
+                       "HandleContinue_GoToLobbyButton", 0},
+                      reinterpret_cast<void*>(&continue_to_lobby),
+                      reinterpret_cast<void**>(&g_orig_continue));
 
     const bool results_hooked = g_orig_move_next[kSlotResults] != nullptr;
-    const bool ok = results_hooked && table_tick && controller_tick;
+    const bool presentation_bridge =
+        g_get_components_in_children != nullptr &&
+        g_class_get_type != nullptr && g_type_get_object != nullptr;
+    const bool presentation_hooks =
+        tables_shown_hook && reward_show_hook && reward_end_hook;
+    const bool ok = results_hooked && table_tick && controller_tick &&
+                    presentation_bridge && presentation_hooks;
     if (ok) {
         LOGI("%s: repair armed (iterators=%d/%d table-tick=OK controller-tick=OK "
-             "gc-handles=%d orphan=%" PRIu64 "ms give-up=%" PRIu64 "ms)",
-             kTag, iterators, kSlotCount, g_gchandle_new != nullptr ? 1 : 0,
-             kOrphanMs, kGiveUpMs);
+             "presentation=OK events=%d/%d/%d/%d gc-handles=%d orphan=%" PRIu64
+             "ms give-up=%" PRIu64 "ms visibility-hold=%" PRIu64 "ms)",
+             kTag, iterators, kSlotCount, tables_shown_hook ? 1 : 0,
+             reward_show_hook ? 1 : 0, reward_end_hook ? 1 : 0,
+             continue_hook ? 1 : 0, g_gchandle_new != nullptr ? 1 : 0,
+             kOrphanMs, kGiveUpMs, kPresentationHoldMs);
     } else {
         LOGE("%s: repair NOT armed (iterators=%d/%d results=%d table-tick=%d "
-             "controller-tick=%d)",
+             "controller-tick=%d presentation=%d events=%d/%d/%d/%d)",
              kTag, iterators, kSlotCount, results_hooked ? 1 : 0,
-             table_tick ? 1 : 0, controller_tick ? 1 : 0);
+             table_tick ? 1 : 0, controller_tick ? 1 : 0,
+             presentation_bridge ? 1 : 0, tables_shown_hook ? 1 : 0,
+             reward_show_hook ? 1 : 0, reward_end_hook ? 1 : 0,
+             continue_hook ? 1 : 0);
     }
     return ok;
 }
