@@ -10,6 +10,9 @@ def photonAppId = providers.gradleProperty('PHOTON_APP_ID').orElse('').get()
 def photonMode = providers.gradleProperty('PHOTON_MODE').orElse('cloud').get()
 def photonAddr = providers.gradleProperty('PHOTON_SERVER_ADDRESS').orElse('').get()
 def photonPort = providers.gradleProperty('PHOTON_SERVER_PORT').orElse('5055').get()
+// GHA runners ship CMake 3.31.5 in the SDK; local machines rarely do, so the
+// version is overridable with -PCMAKE_VERSION=<installed> and CI keeps its own.
+def cmakeVersion = providers.gradleProperty('CMAKE_VERSION').orElse('3.31.5').get()
 
 android {
     namespace 'com.opg3d.redirect'
@@ -33,7 +36,7 @@ android {
     externalNativeBuild {
         cmake {
             path file('src/main/cpp/CMakeLists.txt')
-            version '3.31.5'   // preinstalled in the SDK on GHA runners
+            version cmakeVersion   // 3.31.5 is preinstalled in the SDK on GHA runners
         }
     }
 }

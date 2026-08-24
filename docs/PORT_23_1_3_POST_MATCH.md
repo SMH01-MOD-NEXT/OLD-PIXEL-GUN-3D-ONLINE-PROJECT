@@ -320,3 +320,135 @@ previous bot-trace run, so a missing driver hook must fail loudly.
 - Not `finishedInterface`: it is `false` in the broken capture and was `true` in
   an earlier pre-match-only capture, so it tracks which panel is up rather than
   gating the reward flow.
+
+## Revision 3: the freeze is located and repaired
+
+Revision 2 answered its question. The driver half **does** run; it parks.
+
+| device log (2026-08-24, +ms) | event |
+| --- | --- |
+| 262574 | `results wrapper B`, payload `exp=20 coins=4 gems=0 clan=0 winnerCommand=1 amIWinner=true firstPlace=true showAward=true` |
+| 262574 | `results coroutine state -> 0` (first step, run inline by `StartCoroutine`) |
+| 262582 | `panel switch a=true b=false` |
+| 262583 | `results coroutine state 0 -> 1` — **the last transition, ever** |
+| 265011 | `OnTablesShow` |
+| 265036 | `OnMatchEndAnimationDone` |
+| 265157 | `OnTablesShown` |
+| 265163 | `OnTrophyAnimationDone`, then `reward-delay state -> 0` and `0 -> 1` — **also the last transition of that routine** |
+| 325553 | `OnRewardShow` (60 s later, animation event) |
+| 327480 | `OnRewardAnimationEnds` |
+
+### What state 1 waits for
+
+`世丟丈丄丙丒专丘丂.MoveNext` (0x4E61894) at the panel-switch call site:
+
+```text
+4e62f3c  bl   0x484dd44            三丕丟丅丐丕丆丘万(this, true, false, null)
+4e62f44  strb w8,  [x19, #0x5b0]   controller.与东丞丙丏丝丗与业 = true
+4e62f4c  ldrb w8,  [x19, #0x5b0]   while (that flag)
+4e62f54  str  xzr, [x20, #0x18]!     <>2__current = null
+4e62f68  stur w0,  [x20, #-0x8]      <>1__state  = 1      -> yield return null
+4e62f6c  b    0x4e64300              return true
+```
+
+So state 1 is `while (flag@0x5B0) yield return null;`. A full scan of the image
+for `STRB`/`LDRB` with immediate `0x5B0` (the same BL/B decoding technique as
+`tools/find_callers.py`) gives every party interested in that flag:
+
+| site | method |
+| --- | --- |
+| `STRB 0x0484FDFC` | `OnTablesShow (+0x0)` — writes `wzr`, i.e. clears it |
+| `STRB 0x04E61DBC` | results `MoveNext (+0x528)` — an earlier wait on the same flag |
+| `STRB 0x04E62F44` | results `MoveNext (+0x16B0)` — the wait above |
+| `LDRB 0x04E61DD0` / `0x04E62F4C` | the two `while` checks |
+| `LDRB 0x04E67B98` | `丁丛不丘不世丟不丗.MoveNext (+0x328)` |
+
+`OnTablesShow` fires at +265011, i.e. the wait condition **was** satisfied 2.4 s
+after the park, and the coroutine still never advanced. A `yield return null`
+that is not resumed after its condition clears means nobody steps the routine
+any more.
+
+### Root cause
+
+Two independent iterators of the same MonoBehaviour — the results coroutine and
+the reward-delay coroutine — each ran exactly one step and then went silent.
+That is the Unity signature of a host GameObject that is not active:
+`StartCoroutine` runs the first `MoveNext` inline and only afterwards refuses to
+schedule the routine. Everything that keeps firing is an animation event, which
+Unity delivers to the component regardless of the object's state (the scene also
+has `NetworkStartTableCupAnimationEventsHandler`, which forwards events to this
+controller through a serialized reference), so the animation half looks healthy
+while the data half is frozen.
+
+The lone caption is explained by the same call: `三丕丟丅丐丕丆丘万(true, false)`
+(0x484DD44) is not a passive panel toggle. It activates `finishedInterface`
+(field 0x68), plays `winSound` (0x78, chosen because the payload has
+`firstPlace=true`), bulk-toggles three panel arrays (0x370/0x378/0x380) and
+writes the localized caption into `finishedInterfaceLabels` (0x88). Everything
+else the player expects — player table, reward window, trophy, OK button — lives
+in the coroutine states after that yield, and never runs.
+
+The retired backend is **not** involved: the payload is complete before the
+first step, and no network call sits between the park and the freeze.
+
+### The fix: `post_match_2313.h`
+
+The module is a repair, not a trace. Seven hooks, all resolved by metadata name:
+
+- the five nested iterators of the controller (results plus the four reward-queue
+  routines) — every step is observed and each live iterator is kept alive with
+  `il2cpp_gchandle_new`, so Unity dropping the routine cannot leave a dangling
+  pointer;
+- `NetworkStartTable.Update` — the heartbeat that keeps ticking even while the
+  controller's object is switched off;
+- `NetworkStartTableNGUIController.Update` — the heartbeat whose `self` is a
+  provably live controller.
+
+On every heartbeat each live routine is checked. A routine that has not been
+stepped for `kOrphanMs` (500 ms) while parked at a yield is treated as
+abandoned, and then, in order:
+
+1. **Repair.** The inactive GameObject chain that hosts the controller is
+   switched back on (own object first, then up to eight ancestors, each logged by
+   name), and the very same iterator is handed back to Unity through
+   `MonoBehaviour.StartCoroutineManaged2` — the unique internal entry that
+   `StartCoroutine(IEnumerator)` itself calls, chosen because the public overload
+   set is ambiguous by name and argument count. The stock coroutine then finishes
+   the screen with stock timing. Up to `kMaxRepairs` (3) attempts, spaced by
+   `kRestartGraceMs` (1.5 s).
+2. **Guaranteed exit.** If the results routine still has not completed
+   `kGiveUpMs` (12 s) after the freeze was first seen, the module presses the
+   screen's own `HandleContinue_GoToLobbyButton` (0x4846310) once, so the player
+   always reaches the next screen instead of a dead end.
+
+Safety rules that the module never breaks: no reward is granted, no label is
+written, no payload field is modified; every managed object is tested with
+`UnityEngine.Object.op_Implicit` before it is touched, so a destroyed controller
+is dropped instead of dereferenced; and if the screen closes by itself the slot
+is released with `controller is gone; the screen was closed elsewhere`.
+
+### Reading the next log
+
+```text
+23.1.3-post-match: repair armed (iterators=5/5 table-tick=OK controller-tick=OK ...)
+23.1.3-post-match: results coroutine started (pinned=1)
+23.1.3-post-match: results coroutine was abandoned by Unity at state 1 (host active=0, attempt 1)
+23.1.3-post-match: re-activating host object '...'
+23.1.3-post-match: results handed back to Unity (re-activated=1 accepted=1)
+23.1.3-post-match: results coroutine is being stepped again from state 1
+23.1.3-post-match: results coroutine finished normally
+```
+
+- `host active=0` confirms the root cause above, and the `re-activating ...`
+  lines name the object that the panel switch had switched off.
+- `host active=1` instead would mean the routine was cancelled rather than
+  orphaned; the hand-back covers that case too.
+- `accepted=0` means Unity refused the hand-back; the guaranteed exit then
+  closes the screen after 12 s with `pressing its own Continue button`.
+- If a future build wants the screen skipped unconditionally, drop `kGiveUpMs`
+  to zero: the repair is then bypassed and the Continue button is pressed as
+  soon as the freeze is seen.
+
+`post_match_trace_2313.h` is kept in the tree for future mapping work but is no
+longer installed from `main.cpp`: it hooks the same iterators, and shadowhook
+allows one hook per target.
