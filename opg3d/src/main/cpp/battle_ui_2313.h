@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
 #include <string>
 
@@ -9,22 +10,51 @@
 #include "il2cpp.h"
 #include "log.h"
 
-// Restores only the 23.1.3 Armory/Loadout entry points that are rendered as
-// disabled NGUI controls. The previous forced-online module intentionally
-// remains separate: the device log proved that none of its connectivity gates
-// runs on the gray in-battle Armory path.
+// Restores the 23.1.3 in-battle Armory (Shop) and Bank controls.
 //
-// The primary target is UIButton.set_isEnabled(bool). Calls are virtual in
-// this build (there are no direct BL sites), so the implementation itself is
-// hooked. A button is restored only when either:
-//   * its GameObject name contains Armory, Arsenal, or Loadout; or
-//   * the same GameObject was observed hosting PGCompany.UI.UIGotoArmory.
-// Every unrelated NGUI button keeps the stock enabled value.
+// The first three iterations of this module chased UIButton.set_isEnabled and
+// the ChangeTeamButton prefab. The device log proved both were the wrong
+// target: ChangeTeamButton is the team switcher, and its caller RVA resolves
+// to the IL2CPP runtime invoke thunk, so it never identified a real driver.
 //
-// Rilisoft.ButtonHandler has a second enable surface and receives the same
-// narrow filter. The bounded diagnostics retain the first disabled object
-// names so a future prefab rename can be mapped without globally enabling the
-// whole interface.
+// The real driver was found by resolving the caller RVAs that the SetState
+// proxy printed for the two buttons that are actually gray in battle:
+//
+//   caller-rva 0x02E74044  ShopButton
+//   caller-rva 0x02E740EC  BankButton
+//     both inside  Rilisoft.BankShopViewGuiElement.\u4E0A\u4E13\u4E05\u4E11\u4E18\u4E1F\u4E19\u4E1C\u4E0E()
+//     method start RVA 0x02E738B8
+//
+// Disassembling that method shows one deliberate "retire the shelf" block per
+// button, and it is not a paint-only change:
+//
+//   2e73fd0  tbz  w0, #0, 0x2e74044          ; skip the whole block
+//   2e73fdc  bl   BankShopView.get_ShopButtonScript
+//   2e73fe8  bl   UnityEngine.Behaviour.get_enabled
+//   2e73fec  tbz  w0, #0, 0x2e74044          ; already off, nothing to do
+//   2e74008  bl   UnityEngine.Behaviour.set_enabled   (w1 = 0  -> false)
+//   2e74024  bl   UnityEngine.Collider.set_enabled    (w1 = 0  -> false)
+//   2e74040  bl   UIButtonColor.set_state             (w1 = 3  -> Disabled)
+//   2e74044  ...  the identical sequence for BankButton
+//
+// So the button is switched off on three surfaces at once: the NGUI script,
+// its BoxCollider (which is why the control also stops receiving taps) and the
+// gray Disabled presentation. Intercepting only isEnabled or only SetState can
+// never restore it, which is exactly what the previous builds observed.
+//
+// The condition in w0 is derived from a static flag this build reads at
+// [statics + 0xB8] + 0x700 - a retired-service verdict that nothing on device
+// can satisfy any more. Rather than fight that flag (it is shared with paths
+// that must keep their stock behaviour), this module lets the stock body run
+// and then puts the two controls back exactly the way the stock enable path
+// would have: script enabled, collider enabled, presentation Normal. Every
+// step goes through the game's own property getters and Unity setters, so no
+// field layout is assumed and no unrelated button is touched.
+//
+// The narrow name filter on the isEnabled/SetState proxies is kept as a second
+// line of defence and now matches the two prefabs the log actually named.
+// ChangeTeamButton was removed: it is a different control and it only produced
+// log noise.
 namespace battle_ui_2313 {
 namespace detail {
 
@@ -35,6 +65,9 @@ using InstanceBoolFn = void (*)(void*, bool, const MethodInfo*);
 // this ABI, and this is the single surface every NGUI button uses to apply the
 // gray "Disabled" presentation (disabledColor plus disabledSprite).
 using InstanceStateFn = void (*)(void*, int32_t, bool, const MethodInfo*);
+// UIButtonColor.set_state(State): the property setter the retiring block calls.
+using SetStateFn = void (*)(void*, int32_t, const MethodInfo*);
+using GetObjectFn = void* (*)(void*, const MethodInfo*);
 using GetGameObjectFn = void* (*)(void*, const MethodInfo*);
 using GetNameFn = void* (*)(void*, const MethodInfo*);
 using GetComponentByNameFn = void* (*)(void*, void*, const MethodInfo*);
@@ -49,8 +82,26 @@ inline constexpr const char* kCaptureMethod =
     u8"\u4E1D\u4E0A\u4E09\u4E09\u4E0A\u4E08\u4E16\u4E0B\u4E1E";
 inline constexpr const char* kButtonHandlerEnable =
     u8"\u4E07\u4E1E\u4E0B\u4E02\u4E0F\u4E13\u4E12\u4E0E\u4E1A";
+
+// Rilisoft.BankShopViewGuiElement (dump2313.cs, TypeDefIndex 7931).
+inline constexpr const char* kRilisoftNs = "Rilisoft";
+inline constexpr const char* kBankShopElement = "BankShopViewGuiElement";
+inline constexpr const char* kBankShopView = "BankShopView";
+// BankShopViewGuiElement.\u4E0A\u4E13\u4E05\u4E11\u4E18\u4E1F\u4E19\u4E1C\u4E0E() - RVA 0x02E738B8, the refresh that
+// retires both shelves.
+inline constexpr const char* kBankShopRefresh =
+    u8"\u4E0A\u4E13\u4E05\u4E11\u4E18\u4E1F\u4E19\u4E1C\u4E0E";
+// BankShopViewGuiElement.\u4E11\u4E02\u4E1C\u4E08\u4E19\u4E1A\u4E1C\u4E1C\u4E04() - RVA 0x02E736BC, the compiler
+// generated getter for the <BankShopView>k__BackingField.
+inline constexpr const char* kBankShopViewGetter =
+    u8"\u4E11\u4E02\u4E1C\u4E08\u4E19\u4E1A\u4E1C\u4E1C\u4E04";
+
 inline constexpr size_t kRememberedArmoryObjects = 8u;
 inline constexpr uint32_t kDisabledDiagnosticLimit = 48u;
+// The refresh runs on every currency change, so its diagnostics are printed
+// for the first few calls and then only periodically.
+inline constexpr uint32_t kRepairDiagnosticBurst = 6u;
+inline constexpr uint32_t kRepairDiagnosticPeriod = 240u;
 // Component.GetComponent(string). Metadata lookup cannot select this overload
 // from GetComponent(Type) because both have arity 1, so the exact supplied
 // 23.1.3 RVA is used for the eager post-setup repair only.
@@ -71,6 +122,7 @@ inline InstanceStateFn g_ui_button_set_state = nullptr;
 inline InstanceStateFn g_button_color_set_state = nullptr;
 inline InstanceVoidFn g_armory_capture = nullptr;
 inline InstanceVoidFn g_armory_click = nullptr;
+inline InstanceVoidFn g_bank_shop_refresh = nullptr;
 inline uintptr_t g_il2cpp_base = 0u;
 
 inline std::array<std::atomic<void*>, kRememberedArmoryObjects>
@@ -82,6 +134,24 @@ inline std::atomic<uint32_t> g_state_calls{0u};
 inline std::atomic<uint32_t> g_state_restored{0u};
 inline std::atomic<uint32_t> g_clicks{0u};
 inline std::atomic<uint32_t> g_eager_repairs{0u};
+inline std::atomic<uint32_t> g_shelf_repairs{0u};
+
+// A resolved managed method: body pointer plus the MethodInfo* the managed ABI
+// expects as the trailing argument.
+struct ManagedCall {
+    void* fn = nullptr;
+    const MethodInfo* mi = nullptr;
+    explicit operator bool() const noexcept { return fn != nullptr; }
+};
+
+inline ManagedCall g_view_of_element{};
+inline ManagedCall g_shop_script{};
+inline ManagedCall g_shop_collider{};
+inline ManagedCall g_bank_script{};
+inline ManagedCall g_bank_collider{};
+inline ManagedCall g_behaviour_set_enabled{};
+inline ManagedCall g_collider_set_enabled{};
+inline ManagedCall g_button_color_state_setter{};
 
 template <typename Fn>
 void* replacement(Fn fn) {
@@ -106,6 +176,26 @@ bool resolve_call(const hook::ManagedMethod& target, void** out_fn,
     *out_fn = pointer;
     *out_mi = info;
     return true;
+}
+
+bool bind_call(ManagedCall& out, const char* namespaze, const char* klass,
+               const char* method, int args_count) {
+    void* info =
+        il2cpp::find_method_info(namespaze, klass, method, args_count);
+    void* pointer = info != nullptr ? il2cpp::method_pointer(info) : nullptr;
+    if (pointer == nullptr) {
+        LOGE("23.1.3-battle-ui: cannot resolve %s.%s/%d", klass, method,
+             args_count);
+        return false;
+    }
+    out.fn = pointer;
+    out.mi = reinterpret_cast<const MethodInfo*>(info);
+    return true;
+}
+
+void* invoke_getter(const ManagedCall& call, void* self) {
+    if (!call || self == nullptr) return nullptr;
+    return reinterpret_cast<GetObjectFn>(call.fn)(self, call.mi);
 }
 
 void* game_object_of(void* component) {
@@ -139,9 +229,10 @@ bool target_name(const std::string& name) {
     return lower.find("armory") != std::string::npos ||
            lower.find("arsenal") != std::string::npos ||
            lower.find("loadout") != std::string::npos ||
-           // The latest 23.1.3 device log shows that this legacy prefab is the
-           // only UIButton continuously driven disabled during the battle.
-           lower == "changeteambutton";
+           // The two prefabs the 23.1.3 device log named as grayed in battle.
+           // Rilisoft.BankShopView hosts them: ShopButton is the Armory entry
+           // point, BankButton its currency sibling.
+           lower == "shopbutton" || lower == "bankbutton";
 }
 
 void remember_armory_object(void* game_object) {
@@ -326,6 +417,60 @@ void button_handler_set_enabled_hook(void* self, bool enabled,
         method);
 }
 
+// Puts one shelf back exactly the way the stock enable path leaves it: the
+// NGUI script live, its collider live and the presentation Normal. Missing
+// members are skipped, so a prefab that legitimately has no collider is not a
+// failure.
+bool restore_shelf(void* script, void* collider) {
+    bool touched = false;
+    if (script != nullptr) {
+        if (g_behaviour_set_enabled) {
+            reinterpret_cast<InstanceBoolFn>(g_behaviour_set_enabled.fn)(
+                script, true, g_behaviour_set_enabled.mi);
+            touched = true;
+        }
+        if (g_button_color_state_setter) {
+            reinterpret_cast<SetStateFn>(g_button_color_state_setter.fn)(
+                script, kStateNormal, g_button_color_state_setter.mi);
+            touched = true;
+        }
+    }
+    if (collider != nullptr && g_collider_set_enabled) {
+        reinterpret_cast<InstanceBoolFn>(g_collider_set_enabled.fn)(
+            collider, true, g_collider_set_enabled.mi);
+        touched = true;
+    }
+    return touched;
+}
+
+// The stock refresh is allowed to run untouched - it also drives the currency
+// labels, the x3 frames and the event icons, and none of that may be skipped.
+// Only the retiring decision it makes for the two buttons is undone afterwards.
+void bank_shop_refresh_hook(void* self, const MethodInfo* method) {
+    if (g_bank_shop_refresh != nullptr) {
+        g_bank_shop_refresh(self, method);
+    } else {
+        LOGE("23.1.3-battle-ui: Bank/Shop refresh has no saved original");
+    }
+
+    void* view = invoke_getter(g_view_of_element, self);
+    if (view == nullptr) return;
+
+    const bool shop = restore_shelf(invoke_getter(g_shop_script, view),
+                                    invoke_getter(g_shop_collider, view));
+    const bool bank = restore_shelf(invoke_getter(g_bank_script, view),
+                                    invoke_getter(g_bank_collider, view));
+    if (!shop && !bank) return;
+
+    const uint32_t count = g_shelf_repairs.fetch_add(1u) + 1u;
+    if (count <= kRepairDiagnosticBurst ||
+        (count % kRepairDiagnosticPeriod) == 0u) {
+        LOGW("23.1.3-battle-ui: Bank/Shop shelf repair #%u "
+             "(shop=%d bank=%d script+collider+Normal reapplied)",
+             count, shop ? 1 : 0, bank ? 1 : 0);
+    }
+}
+
 void armory_capture_hook(void* self, const MethodInfo* method) {
     if (g_armory_capture != nullptr) g_armory_capture(self, method);
     void* game_object = game_object_of(self);
@@ -350,6 +495,29 @@ bool add(const hook::ManagedMethod& target, void* replace, void** original,
          bool required, int* installed) {
     const bool ok = hook::install(target, replace, original, required);
     if (ok) ++(*installed);
+    return ok;
+}
+
+// Resolves everything the shelf repair needs. Returns false if any member is
+// missing, in which case the repair stays disarmed instead of running with a
+// partial view.
+bool resolve_shelf_api() {
+    bool ok = bind_call(g_view_of_element, kRilisoftNs, kBankShopElement,
+                        kBankShopViewGetter, 0);
+    ok &= bind_call(g_shop_script, kRilisoftNs, kBankShopView,
+                    "get_ShopButtonScript", 0);
+    ok &= bind_call(g_shop_collider, kRilisoftNs, kBankShopView,
+                    "get_ShopButtonCollider", 0);
+    ok &= bind_call(g_bank_script, kRilisoftNs, kBankShopView,
+                    "get_BankButtonScript", 0);
+    ok &= bind_call(g_bank_collider, kRilisoftNs, kBankShopView,
+                    "get_BankButtonCollider", 0);
+    ok &= bind_call(g_behaviour_set_enabled, "UnityEngine", "Behaviour",
+                    "set_enabled", 1);
+    ok &= bind_call(g_collider_set_enabled, "UnityEngine", "Collider",
+                    "set_enabled", 1);
+    ok &= bind_call(g_button_color_state_setter, "", "UIButtonColor",
+                    "set_state", 1);
     return ok;
 }
 
@@ -381,6 +549,8 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
         il2cpp::find_method_info("Rilisoft", "ButtonHandler",
                                  kButtonHandlerEnable, 1));
 
+    const bool shelf_api = resolve_shelf_api();
+
     int installed = 0;
     const bool ui_button = add(
         {"", "UIButton", "set_isEnabled", 1},
@@ -404,6 +574,11 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
         {"Rilisoft", "ButtonHandler", kButtonHandlerEnable, 1},
         replacement(&button_handler_set_enabled_hook),
         original_slot(&g_button_handler_set_enabled), false, &installed);
+    // The in-battle gray Armory is decided here, on three surfaces at once.
+    const bool shelf = shelf_api && add(
+        {kRilisoftNs, kBankShopElement, kBankShopRefresh, 0},
+        replacement(&bank_shop_refresh_hook),
+        original_slot(&g_bank_shop_refresh), false, &installed);
     const bool capture = add(
         {kUiNs, kUIGotoArmory, kCaptureMethod, 0},
         replacement(&armory_capture_hook), original_slot(&g_armory_capture),
@@ -415,14 +590,19 @@ inline bool install_hooks(uintptr_t libil2cpp_base) {
 
     const bool ready = unity_api && g_get_component_by_name != nullptr &&
                        ui_button && capture;
-    LOGI("23.1.3-battle-ui: installed %d/7 Armory hooks "
+    LOGI("23.1.3-battle-ui: installed %d/8 Armory hooks "
          "(unity-api=%d eager-helper=%d ui-button=%d button-color=%d "
-         "state=%d/%d button-handler=%d capture=%d click=%d)",
+         "state=%d/%d button-handler=%d shelf-api=%d shelf-repair=%d "
+         "capture=%d click=%d)",
          installed, unity_api ? 1 : 0,
          g_get_component_by_name != nullptr ? 1 : 0, ui_button ? 1 : 0,
          button_color ? 1 : 0, ui_button_state ? 1 : 0,
-         button_color_state ? 1 : 0, button_handler ? 1 : 0, capture ? 1 : 0,
-         click ? 1 : 0);
+         button_color_state ? 1 : 0, button_handler ? 1 : 0,
+         shelf_api ? 1 : 0, shelf ? 1 : 0, capture ? 1 : 0, click ? 1 : 0);
+    if (!shelf) {
+        LOGE("23.1.3-battle-ui: the Bank/Shop shelf repair is NOT armed; the "
+             "in-battle Armory button will stay gray");
+    }
     if (!ready) {
         LOGE("23.1.3-battle-ui: Armory restoration is incomplete");
     }

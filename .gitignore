@@ -24,3 +24,11 @@ compile_commands.json
 # OS
 .DS_Store
 Thumbs.db
+
+# analysis artefacts and generated wrappers (never committed)
+TASK_PLAN.md
+analys2313/
+gradle/
+gradlew
+gradlew.bat
+tools/__pycache__/
