@@ -160,7 +160,7 @@ adb logcat -c; adb logcat --pid=$(adb shell pidof com.pixel.gun3d) > pg3d.log
 Expected:
 
 ```
-23.1.3-bots-trace: installed 5/5 hooks (spawn-equip=OK ai-level=OK)
+23.1.3-bots-trace: installed 11/11 hooks (bot-factory=OK ai-level=OK)
 23.1.3-bots: AI level settings table first queried: present
 23.1.3-bots: AI level tables applied (teammates=present enemies=present deathmatch=present)
 23.1.3-bots: bot 0x... assigned AI level <N>
@@ -170,9 +170,101 @@ Expected:
 ### Checklist
 
 - [ ] CI build succeeds.
-- [ ] `installed 5/5 hooks` appears.
+- [ ] `installed 11/11 hooks` appears.
 - [ ] One deathmatch played with bots; AI level and equip ids captured.
 - [ ] If the settings table logs `NULL`, the buff must supply the whole table,
       not just a higher level index.
 - [ ] Duel/Escort session captured to identify the mode controllers and the
       real minimum-player thresholds.
+
+## Revision 2: what the first device log proved
+
+A full online match was played on 23.1.3 with revision 1 of the trace armed.
+The log settles two questions and invalidates one assumption.
+
+### Defect 1 - wrong namespace for `AIBotController`
+
+Revision 1 reported:
+
+```
+hook: optional method not found: AIBotController.<setAiLevel>/1
+hook: optional method not found: AIBotController.<setBehavior>/1
+23.1.3-bots-trace: installed 3/5 hooks (spawn-equip=OK ai-level=FAILED)
+```
+
+The method names and arities were correct. The class lookup was not: the dump
+declares the type inside a namespace, not globally.
+
+```
+// Namespace: PlayerBot
+internal class AIBotController : MonoBehaviour // TypeDefIndex: 6288
+```
+
+`il2cpp_class_from_name` with an empty namespace cannot find it, so every method
+lookup on that class failed and the whole module reported `bots-trace=0`, which
+is why `init` ended with `23.1.3 port incomplete`. Everything else in that line
+was `1`; the port was otherwise healthy.
+
+Note that `PlayerBotsManager`, `PlayerBotController`, `PlayerBotEntity`,
+`PlayerBotInstance` and the AI-config class are all genuinely global despite
+their names - only `AIBotController` (and its three nested iterators) sit in
+`PlayerBot`. Do not generalise the namespace to the other bot types.
+
+### Defect 2 - the tail of the chain was instrumented, not the chain
+
+Over the entire match, with the spawn-equip hook installed and live, there was
+not one `23.1.3-bots` event: no spawn, no AI level table application, and the
+per-level settings getter was never queried even once.
+
+A silent spawn hook cannot distinguish these cases:
+
+- no bots were created at all (most likely: `BotIsEnable` / `MinBotsNumber`
+  come from `IntBotsLoadout`, which the retired backend never fills);
+- bots were created through a different entry point;
+- bots were created but never equipped through that particular helper.
+
+Revision 2 therefore instruments the whole creation chain, in execution order,
+so the next log answers this by elimination:
+
+| Hook | Namespace | Question it answers |
+| --- | --- | --- |
+| `PlayerBotsManager.Awake` | global | Does the bot subsystem exist in the match scene? |
+| `PlayerBotsManager.Start` | global | Does it start? |
+| `PlayerBotController.<factory>(PhotonView)` [static] | global | Is a bot object ever created? |
+| `PlayerBotsManager.<register>(PlayerBotController,int)` | global | Is it registered, and with what value? |
+| `PlayerBotsManager.<instantiate>(Dictionary<string,object>)` | global | Is a prefab instantiated? |
+| `PlayerBotsManager.<spawnWithEquip>(string,string,string)` | global | What weapon ids are handed out? |
+| `PlayerBotsManager/SavedAiLevels.<apply>(int[],int[],int[])` | global | Are the level tables ever applied? |
+| `AIBotController.Awake` | `PlayerBot` | Does the AI component wake? |
+| `AIBotController.<setAiLevel>(int)` | `PlayerBot` | Which level is actually assigned? |
+| `AIBotController.<setBehavior>(enum)` | `PlayerBot` | Does the AI tick (Walking/Searching/Skirmish)? |
+| `<aiConfig>.<aiLevelSettings>()` | global | Is the per-level table present or NULL? |
+
+The install gate is now `bot-factory && ai-level`: those two are the ones whose
+absence would make the rest meaningless.
+
+### Reading the next log
+
+- No `PlayerBotsManager.Awake` at all -> the manager is not in the match scene;
+  bot spawning is gated before any of this, and the gate is mode/loadout data.
+- `Awake` but no factory call -> the manager runs but decides zero bots, which
+  points straight at the empty `IntBotsLoadout` (`BotIsEnable`,
+  `MinBotsNumber`, `MaxBotsNumber`).
+- Factory calls but `AI level settings table first queried: NULL` -> bots exist
+  and the fallback AI level is used because there is no per-level data. The buff
+  then has to supply the whole table from the local backend, not just raise an
+  index. `backend_local_2313.h` currently has zero bot coverage.
+- Factory calls plus a `present` table plus a low `assigned AI level` -> the
+  cheapest possible buff: hand out a higher existing level.
+
+Only the last case is a one-line change. The other three require the local
+backend to grow a bot section, which is why no buff ships in this commit
+either.
+
+### Unrelated but confirmed by the same log
+
+- Progression works: `experience topped up 999995 -> 900000000`, exactly once.
+- The DNS memoisation holds: no repeated in-match resolver stalls appear.
+- The post-match chain fired only `ShowStartInterface` (the pre-match panel),
+  and the captured log ends mid-match, so the end-of-match segment is still
+  missing. The 13-node trace has not yet been observed at match end.
