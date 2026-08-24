@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "assets_data_2313.h"
+#include "backend_emu_2313.h"
 #include "backend_local_2313.h"
 #include "battle_ui_2313.h"
 #include "bots_trace_2313.h"
@@ -132,6 +133,7 @@ void* init_thread(void*) {
     const bool switcher_trace  = startup_trace_2313::install_hooks();
     const bool stall_watchdog  = loading_stall_guard_2313::start_watchdog();
     const bool local_backend   = backend_local_2313::install_hooks();
+    const bool backend_emu     = backend_emu_2313::install_hooks();
     const bool photon_online   = photon_2313::install_hooks();
     const bool default_plugin  = photon_default_plugin_2313::install_hooks();
     const bool photon_trace    = photon_trace_2313::install_hooks();
@@ -152,7 +154,7 @@ void* init_thread(void*) {
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && weapon_modules && local_identity &&
         assets_payload && net_stall && post_match && online_state &&
-        battle_ui && rank_ui && bots_trace) {
+        battle_ui && rank_ui && bots_trace && backend_emu) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
@@ -169,7 +171,9 @@ void* init_thread(void*) {
              "guaranteed exit, every retired offline verdict now reports a "
              "live connection, the in-battle Armory and rank label are "
              "restored, and multiplayer "
-             "bots use the high-rank weapon tier");
+             "bots use the high-rank weapon tier, and the retired backend "
+             "services run inside this library and are shared with every "
+             "device on the local network");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
@@ -177,7 +181,7 @@ void* init_thread(void*) {
              "progression=%d crafting=%d lobby-catalog=%d modules=%d "
              "identity=%d assets-data=%d net-stall=%d "
              "post-match=%d online-state=%d battle-ui=%d rank-ui=%d "
-             "bots=%d",
+             "bots=%d backend-emu=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
@@ -187,7 +191,7 @@ void* init_thread(void*) {
              local_identity ? 1 : 0, assets_payload ? 1 : 0,
              net_stall ? 1 : 0, post_match ? 1 : 0,
              online_state ? 1 : 0, battle_ui ? 1 : 0, rank_ui ? 1 : 0,
-             bots_trace ? 1 : 0);
+             bots_trace ? 1 : 0, backend_emu ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
