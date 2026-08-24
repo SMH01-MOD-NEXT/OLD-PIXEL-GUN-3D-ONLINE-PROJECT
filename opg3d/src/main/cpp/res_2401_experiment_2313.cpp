@@ -99,7 +99,7 @@ constexpr const char* kUriForMethod =
 constexpr const char* kResourcePathMethod =
     "\u4E1D\u4E07\u4E0C\u4E03\u4E0B\u4E14\u4E0F\u4E17\u4E04";
 
-// Bundle name+hash holder, TypeDefIndex 13763.
+// Bundle name+hash holder.
 constexpr const char* kNameAndHashClass =
     "\u4E13\u4E18\u4E0C\u4E08\u4E0F\u4E15\u4E05\u4E18\u4E0D";
 // name getter, 0x1D2A674.
@@ -186,9 +186,9 @@ size_t replace_all(std::string* text, const char* from, const char* to) {
 
 int32_t list_count(void* list) {
     if (list == nullptr) return -1;
-    void* klass = il2cpp::object_get_class(list);
+    auto* klass = il2cpp::object_get_class(list);
     if (klass == nullptr) return -1;
-    void* field = il2cpp::class_get_field_from_name(klass, "_size");
+    auto* field = il2cpp::class_get_field_from_name(klass, "_size");
     if (field == nullptr) return -1;
     int32_t size = -1;
     il2cpp::field_get_value(list, field, &size);
@@ -340,8 +340,7 @@ void* hook_resource_path(int32_t platform, void* argument, void* method) {
                 ++g_path_calls;
                 return rewritten;
             }
-            LOGW("%s: resource path rewrite rejected for '%s'", kTag,
-                 text.c_str());
+            LOGW("%s: resource path rewrite rejected for '%s'", kTag, text.c_str());
         }
     }
 
@@ -395,7 +394,8 @@ void* boot_thread(void*) {
 
     // 23.1.3 crashes if il2cpp_domain_get() is polled before runtime init, so
     // reuse the port's validated root-domain publication slot.
-    void* domain = il2cpp_runtime_2313::wait_for_domain(base, kBootSteps, kBootStepUs);
+    void* domain =
+        il2cpp_runtime_2313::wait_for_domain(base, kBootSteps, kBootStepUs);
     if (domain == nullptr) {
         LOGE("%s: root domain never became safe; experiment not armed", kTag);
         return nullptr;
@@ -423,9 +423,19 @@ void* boot_thread(void*) {
 
     if (!armed) {
         LOGE("%s: asset-bundle metadata never matched this build; "
-             "nothing was patched", kTag);
+             "nothing was patched",
+             kTag);
     }
     return nullptr;
+}
+
+__attribute__((constructor)) void res_2401_experiment_on_load() {
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, &boot_thread, nullptr) == 0) {
+        pthread_detach(thread);
+    } else {
+        LOGE("%s: pthread_create failed; experiment not armed", kTag);
+    }
 }
 
 } // namespace
@@ -444,22 +454,22 @@ bool install_hooks() {
         reinterpret_cast<void*>(&hook_parse_payload),
         reinterpret_cast<void**>(&g_orig_parse_payload));
 
-    const bool uri = install_once(
-        &g_hooked_uri_for,
-        hook::ManagedMethod{kNs, kUrlClass, kUriForMethod, 1},
-        reinterpret_cast<void*>(&hook_uri_for),
-        reinterpret_cast<void**>(&g_orig_uri_for));
+    const bool uri =
+        install_once(&g_hooked_uri_for,
+                     hook::ManagedMethod{kNs, kUrlClass, kUriForMethod, 1},
+                     reinterpret_cast<void*>(&hook_uri_for),
+                     reinterpret_cast<void**>(&g_orig_uri_for));
 
     install_once(&g_hooked_resource_path,
                  hook::ManagedMethod{kNs, kUrlClass, kResourcePathMethod, 2},
                  reinterpret_cast<void*>(&hook_resource_path),
                  reinterpret_cast<void**>(&g_orig_resource_path));
 
-    install_once(
-        &g_hooked_set_queue,
-        hook::ManagedMethod{kNs, kAndroidDownloaderClass, kSetLoadingQueueMethod, 1},
-        reinterpret_cast<void*>(&hook_set_loading_queue),
-        reinterpret_cast<void**>(&g_orig_set_queue));
+    install_once(&g_hooked_set_queue,
+                 hook::ManagedMethod{kNs, kAndroidDownloaderClass,
+                                     kSetLoadingQueueMethod, 1},
+                 reinterpret_cast<void*>(&hook_set_loading_queue),
+                 reinterpret_cast<void**>(&g_orig_set_queue));
 
     const bool armed = payload && uri;
     if (armed) {
@@ -475,11 +485,3 @@ bool install_hooks() {
 }
 
 } // namespace res_2401_experiment_2313
-
-__attribute__((constructor)) static void res_2401_experiment_on_load() {
-    pthread_t thread;
-    if (pthread_create(&thread, nullptr, res_2401_experiment_2313_boot_entry(),
-                       nullptr) == 0) {
-        pthread_detach(thread);
-    }
-}
