@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 
+#include "hidden_items_2313.h"
 #include "hook.h"
 #include "il2cpp.h"
 #include "log.h"
@@ -297,6 +298,10 @@ inline void menu_update_hook(void* self, void* method) {
     // needs a game thread and a live main menu: this Update slot is the
     // only such point this port already owns.
     weapon_modules_2313::pump_from_main_menu();
+    // Same slot, same reason for the hidden weapon / wear / gadget grant.
+    // It warms up later than the module sweep on purpose, so the two never
+    // drive the stock item inventory on the same frame.
+    hidden_items_2313::pump_from_main_menu();
 }
 
 inline bool install() {
