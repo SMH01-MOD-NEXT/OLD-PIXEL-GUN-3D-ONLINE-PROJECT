@@ -1,49 +1,64 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock
+// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v2, stall free
 //
-// A number of items ship inside the 23.1.3 build but can never be obtained on
-// a private server: they are not offered in the shop, they have no reachable
-// craft recipe, and the retired backend events that used to hand them out are
-// gone. Ultimatum and Locator (weapons) or the Harpoon (gadget) are the well
-// known examples, and the same is true for several wear pieces (hats, armor,
-// boots, capes, masks).
+// v1 worked (Ultimatum, Locator and the hidden wear pieces show up and stay),
+// but it granted every definition the build ships, one full stock inventory
+// transaction at a time, and that locked the main menu up for minutes on the
+// first launch. For a private server that is a real defect and not a nitpick:
+// an ordinary player reads a frozen menu as malware and uninstalls.
 //
-// This port deliberately does NOT patch an "is hidden" / "can craft" read path
-// and it does not fabricate UI rows. It grants real ownership through the very
-// same stock item-inventory transaction that weapon_modules_2313.h already
-// uses for modules, so the Armory, the loadout slots, the equipped storage,
-// the Progress profile and the save payload stay internally consistent:
-// everything the player sees is materialized by the game itself from the
-// registry.
+// Where the time actually went (BL scan of the shipped ARM64 code):
 //
-// Ownership source of truth (identical to the module unlock, see
-// docs/PORT_23_1_3_MODULES.md):
+//   丘上丄三业丏丙不且(key, Nullable<cause>, Action)             0x3062B08  <- v1 called this
+//   └─ 丘上丄三业丏丙不且(List<key>, Nullable<cause>, Action)     0x3061C20
+//      └─ 下万丗世丑万丌东东(List<key> give, List<key> take, cause)  0x3061DB0
+//         ├─ Progress.东丝丂丄业丕且丙丑::丞丏业丐丒与业丗与()               0x1B3BA40
+//         ├─ Progress.东丝丂丄业丕且丙丑::丂一丈东世业丆业丅(...)             0x1B44114
+//         └─ Progress.东丝丂丄业丕且丙丑::丈且东丝丝东且丈专(Dictionary<string,object>)
+//                                                             0x1B44230
 //
-//   registry singleton  PGCompany.上丞丅三业丙世不丙::下丌丑丁下丟丛丘上()   0x3046000
-//   owned count         丙丛业丐丐七丛不丂(key, Nullable<filter>)          0x304F634
-//   grant               丘上丄三业丏丙不且(key, Nullable<cause>, Action)   0x3062B08
+// The single-key entry point is only a thin wrapper: it allocates a one-element
+// list and runs the complete transaction, which appends a profile-update
+// command and re-serialises the whole pending command queue (PrUpCmKey) every
+// single time. The cost of item N therefore grows with N, so granting ~1500
+// definitions is quadratic work: minutes of stalling. Pacing by frame count
+// (v1 kGrantsPerTick) cannot help, because the cost lives inside one
+// transaction rather than across frames.
 //
-// "Everything the build ships" is enumerated from two independent stock
-// sources, so a definition that one of them omits is still reached by the
-// other:
+// v2 attacks the transaction count instead:
 //
-//   1. registry items of a type
-//        丈丂丆丙丂一七丞丌(OfferItemType) -> List<三丛丐丙丈丌丈专万>    0x3060030
-//      (no owned-filter argument, unlike 万下丘丗丈万业世世 at 0x305C330)
-//   2. static catalogue per category
-//        三与七丆丅丆丕丒业(OfferItemType, CategoryNames)
-//                                     -> List<丒专与三七丁丌丟丆>       0x305C074
-//        丌丄丛丈与丝丑世丆(entry)          -> 丑一丘与丁丄专专专 (item key)  0x30479D0
-//        丁丒丕丌丂丌且丙且(CategoryNames)  -> OfferItemType             0x305C50C
+//  1. Only unobtainable definitions are granted, which is what was asked for in
+//     the first place (hidden items and items with no reachable recipe). The
+//     question is answered structurally by the stock catalogue lookup
+//     与丅丟七与丌东丙丌(item) -> 丒专与三七丁丌丟丆 at 0x305C6C0: a definition with no
+//     catalogue entry is offered by no shop tab, no craft list and no event
+//     list, so the player has no way to reach it. Everything the shop already
+//     sells is left alone. That turns ~1500 transactions into a few dozen.
+//  2. Grants are budgeted in wall-clock time, not frames. Every grant is timed
+//     with CLOCK_MONOTONIC; when one costs more than kGrantBudgetUs the driver
+//     backs off exponentially (up to kBackoffMaxFrames) before it attempts the
+//     next one, and never runs two transactions in the same frame. A slow
+//     device degrades into a slower trickle instead of a freeze.
+//  3. The redundant category grant stage is gone. v1 walked 22 catalogue
+//     categories after the registry sweep and re-checked the same definitions
+//     many times, for up to three passes.
 //
-// Both stages end in the same idempotent step: read the item key, ask the
-// registry for the owned count and, only when that count is zero, run the
-// stock grant and re-read the count to verify it registered. Nothing is
-// written for an item the player already owns, and if one of the two sources
-// ever returned owned items only, that stage degrades to a no-op instead of
-// doing something unexpected.
+// Also new, for the missing harpoon: a targeted find-by-id probe
+// 与丒丅丝丕丕丒丟丆(OfferItemType, string) at 0x3060088 reaches definitions that the
+// per-type enumeration may not list at all, and the gadget definitions are
+// dumped to logcat once. 23.1.3 metadata contains no harpoon item id: Harpoon
+// only exists as member 2 of the movement-gadget kind enum 专丟且东丐三丟丕业 and as
+// weapon config fields (harpoonImpulse, harpoonMaxDistance, isHarpoonProjectile,
+// [...(Harpoon)] public bool harpoon), so the real id can only come off the
+// device. The dump makes that a one-line change once we see it.
+//
+// Unchanged safety model: fail closed. Nothing is patched, no game memory is
+// written, only stock public calls are made, RVA-taken pointers are used only
+// after the loaded libil2cpp.so is proven to be this exact build through four
+// unambiguous metadata anchors, and every grant is guarded by an owned check so
+// re-running the sweep can never duplicate an item.
 //
 // ARM64 ABI reminder: generated managed methods take their explicit arguments
 // followed by MethodInfo*; instance methods take `this` first. Enum arguments
@@ -57,6 +72,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #include "il2cpp.h"
@@ -74,19 +90,25 @@ static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 // drive the same stock transaction and must not overlap on a single frame.
 constexpr uint64_t kWarmupFrames = 300;
 
-// Definitions processed per main-menu frame. Deliberately small: a grant is a
-// full stock inventory transaction and must never land as one frame spike.
-constexpr int32_t kGrantsPerTick = 2;
+// Read-only checks per main-menu frame (list access, owned count, catalogue
+// lookup). These are cheap: no transaction, no persist, no allocation.
+constexpr int32_t kChecksPerTick = 24;
+
+// A grant is the expensive part, so at most one per frame, and only when the
+// budget below allows it.
+constexpr uint64_t kGrantBudgetUs = 6000u;  // 6 ms, about a third of a frame
+constexpr uint64_t kBackoffStartFrames = 6u;
+constexpr uint64_t kBackoffMaxFrames = 240u;  // ~4 s at 60 fps
 
 // Full sweeps attempted in total (late registry population included).
-constexpr int32_t kMaxPasses = 3;
+constexpr int32_t kMaxPasses = 2;
 
-// Frames between two sweeps (~30 s at 60 fps).
-constexpr uint64_t kRecheckFrames = 1800;
+// Frames between two sweeps (~60 s at 60 fps).
+constexpr uint64_t kRecheckFrames = 3600;
 
 // Consecutive failed grants after which the port disarms itself, so a layout
 // mismatch degrades to a no-op instead of a per-frame spin.
-constexpr int32_t kMaxConsecutiveFailures = 48;
+constexpr int32_t kMaxConsecutiveFailures = 24;
 
 // Sanity bound for a single managed list.
 constexpr int32_t kMaxListEntries = 8192;
@@ -99,6 +121,40 @@ constexpr uint64_t kLogPeriod = 16u;
 // catalogue and are not part of the "hidden and impossible to craft" set, so
 // they stay opt-in.
 constexpr bool kIncludeSkins = false;
+
+// Set to true to restore the v1 behaviour (grant everything the build ships,
+// now paced). The driver also flips this on by itself for one retry if the
+// unobtainable-only filter selects nothing at all, so a wrong assumption about
+// the catalogue degrades into "slower but complete" instead of "does nothing".
+constexpr bool kGrantEverything = false;
+constexpr int32_t kFallbackMinDefinitions = 64;
+
+// One-shot dump of every gadget definition id to logcat. This is how the
+// harpoon gets identified: 23.1.3 metadata has no harpoon item id, so the ids
+// have to be read off a running device (adb logcat -s OPG3D).
+constexpr bool kDumpGadgetIds = true;
+constexpr int32_t kDumpLimit = 96;
+
+// Ids that are always granted when they exist, whatever the catalogue says, so
+// that items which already work for players today can never regress. Matched
+// case-insensitively as a substring of the definition name.
+constexpr const char* kAlwaysGrantIds[] = {
+    "ultimatum",
+    "locator",
+    "harpoon",
+};
+constexpr int32_t kAlwaysGrantCount =
+    static_cast<int32_t>(sizeof(kAlwaysGrantIds) / sizeof(kAlwaysGrantIds[0]));
+
+// Ids probed directly through the registry find-by-id entry point, for
+// definitions the per-type enumeration may not list. Cheap: a lookup is not a
+// transaction.
+constexpr const char* kProbeIds[] = {
+    "Harpoon", "HarpoonGun", "Harpoon_1", "HarpoonGun_1", "harpoon",
+};
+constexpr int32_t kProbeIdCount =
+    static_cast<int32_t>(sizeof(kProbeIds) / sizeof(kProbeIds[0]));
+constexpr int32_t kMaxProbeGrants = 8;
 
 // --------------------------------------------------------- item type tables
 //
@@ -113,25 +169,11 @@ constexpr int32_t kTypeSkin = 65;
 constexpr int32_t kTypeGadget = 70;
 
 constexpr int32_t kSweptTypes[] = {
-    kTypeWeapon, kTypeArmor, kTypeMask,   kTypeHat,
-    kTypeBoots,  kTypeCape,  kTypeGadget, kTypeSkin,
+    kTypeGadget, kTypeWeapon, kTypeArmor, kTypeMask,
+    kTypeHat,    kTypeBoots,  kTypeCape,  kTypeSkin,
 };
 constexpr int32_t kSweptTypeCount =
     static_cast<int32_t>(sizeof(kSweptTypes) / sizeof(kSweptTypes[0]));
-
-// CategoryNames (dump2313.cs, TypeDefIndex 5416). The stock category -> type
-// mapper decides what each one resolves to and anything outside the target
-// set is skipped, so listing a category here can never widen the unlock.
-constexpr int32_t kCategories[] = {
-    0,      1,     2,     3,     4,     5,   // Primary … Premium weapons
-    6,      7,     9,     10,    12,         // Hats, Armor, Capes, Boots, Masks
-    8,                                       // Skins (filtered unless enabled)
-    11,     12500, 13000, 13500,             // Gear, Throwing, Tools, Support
-    35000,  40000, 45000,                    // Best weapons / wear / gadgets
-    110000, 135000, 140000,                  // weapon / event / set craft lists
-};
-constexpr int32_t kCategoryCount =
-    static_cast<int32_t>(sizeof(kCategories) / sizeof(kCategories[0]));
 
 inline bool is_target_type(int32_t type) {
     if (type == kTypeSkin) return kIncludeSkins;
@@ -169,7 +211,8 @@ constexpr const char* kItemBaseClass = "三丛丐丙丈丌丈专万";
 constexpr const char* kItemKeyField = "<下丕三上丂三丝丅丐>k__BackingField";
 constexpr const char* kItemNameField = "<世下丐不丞与丞七丄>k__BackingField";
 
-// Static catalogue helper (extension class).
+// Static catalogue helper (extension class). Two of its members are only bound
+// to prove the image (see verify_image) and are never called by v2.
 constexpr const char* kCatalogClass = "丄丝丘丆丈丆丝丆丄";
 constexpr const char* kCatalogByCategory = "三与七丆丅丆丕丒业";  // static, 2 args
 constexpr const char* kEntryKey = "丌丄丛丈与丝丑世丆";            // static, 1 arg
@@ -181,9 +224,9 @@ constexpr const char* kProgressInstance = "丞丏业丐丒与业丗与";  // sta
 
 // ---------------------------------------------------------- verified offsets
 //
-// The three registry entry points below are overloaded by argument type only,
-// so metadata name plus argument count cannot select the right overload. They
-// are taken by RVA from the verified 23.1.3 ARM64 libil2cpp.so (ELF build id
+// The entry points below are overloaded by argument type only, so metadata
+// name plus argument count cannot select the right overload. They are taken by
+// RVA from the verified 23.1.3 ARM64 libil2cpp.so (ELF build id
 // 57fcc18d2db06212416d480d53c0f881ee47c52a) and the base address is proven
 // first: four unambiguous metadata targets must resolve to exactly
 // base + their own RVA. If any check fails, nothing is armed.
@@ -191,9 +234,19 @@ constexpr uintptr_t kRegistryInstanceRva = 0x3046000u;
 constexpr uintptr_t kCatalogByCategoryRva = 0x305C074u;
 constexpr uintptr_t kEntryKeyRva = 0x30479D0u;
 constexpr uintptr_t kCategoryTypeRva = 0x305C50Cu;
+
+// 丈丂丆丙丂一七丞丌(OfferItemType) -> List<item>, the unfiltered definition list
+// (not 万下丘丗丈万业世世 at 0x305C330, which is owned-filtered).
 constexpr uintptr_t kRegistryItemsOfTypeRva = 0x3060030u;
+// 丙丛业丐丐七丛不丂(key, Nullable<filter>) -> owned count.
 constexpr uintptr_t kRegistryCountRva = 0x304F634u;
+// 丘上丄三业丏丙不且(key, Nullable<cause>, Action) -> item, the stock grant.
 constexpr uintptr_t kRegistryGrantRva = 0x3062B08u;
+// 与丒丅丝丕丕丒丟丆(OfferItemType, string) -> item, find a definition by id.
+constexpr uintptr_t kRegistryFindByIdRva = 0x3060088u;
+// 与丅丟七与丌东丙丌(item) -> catalogue entry, null when nothing offers the item.
+// (The 0x305C640 overload takes a key instead and is not used here.)
+constexpr uintptr_t kCatalogEntryForItemRva = 0x305C6C0u;
 
 // sizeof(Nullable<T>) for the two stock optional arguments. IL2CPP lays
 // Nullable<T> out as { bool has_value; T value; }, so an all-zero buffer is a
@@ -215,13 +268,11 @@ using RegistryCountFn = int32_t (*)(void* self, void* key, void* filter,
 // (this, key, Nullable<obtain-cause>*, Action, MethodInfo*) -> granted item
 using RegistryGrantFn = void* (*)(void* self, void* key, void* cause,
                                   void* callback, void* method);
-
-// (OfferItemType, CategoryNames, MethodInfo*) -> List<catalogue entry>
-using CategoryItemsFn = void* (*)(int32_t type, int32_t category, void* method);
-// (catalogue entry, MethodInfo*) -> item key
-using EntryKeyFn = void* (*)(void* entry, void* method);
-// (CategoryNames, MethodInfo*) -> OfferItemType
-using CategoryTypeFn = int32_t (*)(int32_t category, void* method);
+// (this, OfferItemType, string id, MethodInfo*) -> item
+using RegistryFindByIdFn = void* (*)(void* self, int32_t type, void* id,
+                                     void* method);
+// (item, MethodInfo*) -> catalogue entry
+using CatalogEntryForItemFn = void* (*)(void* item, void* method);
 
 struct Managed {
     void* info = nullptr;
@@ -251,9 +302,7 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
 }
 
 // List<T> is a generic instantiation, so its accessors are resolved off the
-// concrete object instead of by namespace and name. The two stages walk two
-// different instantiations (items and catalogue entries), so each one keeps
-// its own resolved accessors.
+// concrete object instead of by namespace and name.
 struct ListApi {
     void* count_info = nullptr;
     void* count_ptr = nullptr;
@@ -284,41 +333,61 @@ inline bool resolve_list_api(void* list, ListApi& api) {
 
 // ------------------------------------------------------------------- state
 
-enum class Stage : uint8_t { Registry, Category, Idle };
+enum class Stage : uint8_t { Probe, Sweep, Idle };
 
 inline Managed g_registry_instance{};
 inline Managed g_progress_service{};
-inline Managed g_category_items{};
-inline Managed g_entry_key{};
-inline Managed g_category_type{};
+inline Managed g_category_items{};  // image proof only
+inline Managed g_entry_key{};       // image proof only
+inline Managed g_category_type{};   // image proof only
 
 inline RegistryItemsOfTypeFn g_items_of_type = nullptr;
 inline RegistryCountFn g_registry_count = nullptr;
 inline RegistryGrantFn g_registry_grant = nullptr;
+inline RegistryFindByIdFn g_find_by_id = nullptr;
+inline CatalogEntryForItemFn g_catalog_entry = nullptr;
 
 inline void* g_key_field = nullptr;
 inline void* g_name_field = nullptr;
 
-inline ListApi g_item_list{};   // List<三丛丐丙丈丌丈专万>
-inline ListApi g_entry_list{};  // List<丒专与三七丁丌丟丆>
+inline ListApi g_item_list{};  // List<三丛丐丙丈丌丈专万>
 
 inline uint64_t g_frames = 0;
 inline uint64_t g_next_sweep = 0;
 inline uint64_t g_grant_log = 0;
-inline Stage g_stage = Stage::Registry;
-inline int32_t g_slot = 0;    // index into kSweptTypes / kCategories
+inline uint64_t g_next_grant_frame = 0;
+inline uint64_t g_backoff_frames = 0;
+inline uint64_t g_worst_grant_us = 0;
+inline Stage g_stage = Stage::Probe;
+inline int32_t g_slot = 0;    // index into kSweptTypes
 inline int32_t g_cursor = 0;  // index inside the current managed list
 inline int32_t g_pass = 0;
 inline int32_t g_seen = 0;
 inline int32_t g_granted = 0;
 inline int32_t g_already_owned = 0;
+inline int32_t g_offered_skipped = 0;
+inline int32_t g_candidates = 0;
 inline int32_t g_failed = 0;
 inline int32_t g_total_granted = 0;
 inline int32_t g_consecutive_failures = 0;
+inline int32_t g_type_seen = 0;
+inline int32_t g_type_granted = 0;
+inline int32_t g_type_owned = 0;
+inline int32_t g_type_hidden = 0;
+inline int32_t g_dumped = 0;
+inline int32_t g_probe_grants = 0;
+inline bool g_grant_everything = kGrantEverything;
 inline bool g_armed = false;
 inline bool g_installed = false;
 
 // ------------------------------------------------------------- diagnostics
+
+inline uint64_t now_us() {
+    struct timespec ts {};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000ull +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000ull;
+}
 
 inline bool should_log(uint64_t counter) {
     return counter <= kLogBurst || (counter % kLogPeriod) == 0u;
@@ -327,14 +396,42 @@ inline bool should_log(uint64_t counter) {
 inline std::string item_name(void* item) {
     if (item == nullptr || g_name_field == nullptr ||
         il2cpp::field_get_value == nullptr) {
-        return "<unknown>";
+        return std::string();
     }
     void* managed = nullptr;
     il2cpp::field_get_value(item, g_name_field, &managed);
     return il2cpp::to_utf8(managed, 48u);
 }
 
-// ------------------------------------------------------------ grant driver
+inline const char* display_name(const std::string& name) {
+    return name.empty() ? "<key>" : name.c_str();
+}
+
+inline bool contains_ci(const std::string& haystack, const char* needle) {
+    const size_t needle_len = std::strlen(needle);
+    if (needle_len == 0u || haystack.size() < needle_len) return false;
+    for (size_t start = 0; start + needle_len <= haystack.size(); ++start) {
+        size_t i = 0;
+        for (; i < needle_len; ++i) {
+            unsigned char a = static_cast<unsigned char>(haystack[start + i]);
+            unsigned char b = static_cast<unsigned char>(needle[i]);
+            if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + 32);
+            if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + 32);
+            if (a != b) break;
+        }
+        if (i == needle_len) return true;
+    }
+    return false;
+}
+
+inline bool is_always_granted(const std::string& name) {
+    for (int32_t i = 0; i < kAlwaysGrantCount; ++i) {
+        if (contains_ci(name, kAlwaysGrantIds[i])) return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------ item helpers
 
 inline void* item_key(void* item) {
     if (item == nullptr || g_key_field == nullptr ||
@@ -355,23 +452,45 @@ inline int32_t owned_count(void* registry, void* key) {
     return g_registry_count(registry, key, filter, nullptr);
 }
 
-// Grants one missing definition. Returns true when the definition is owned
-// after the call, which also covers definitions that were already owned.
-inline bool ensure_owned(void* registry, void* key, const char* source,
-                         int32_t type, const std::string& name) {
-    if (key == nullptr || g_registry_grant == nullptr) {
-        ++g_failed;
-        ++g_consecutive_failures;
-        return false;
-    }
+// Is this definition offered anywhere the player can reach (shop tab, craft
+// list, event list)? Returns 1 yes, 0 no, -1 unknown.
+inline int32_t is_offered(void* item) {
+    if (item == nullptr || g_catalog_entry == nullptr) return -1;
+    return g_catalog_entry(item, nullptr) != nullptr ? 1 : 0;
+}
 
-    const int32_t before = owned_count(registry, key);
-    if (before >= 1) {
-        ++g_already_owned;
-        g_consecutive_failures = 0;
-        return true;
+// Definitions the player can already buy or craft are left alone: granting
+// them is what made v1 take minutes, and it was never the point.
+inline bool wants_grant(int32_t offered, const std::string& name) {
+    if (g_grant_everything) return true;
+    if (is_always_granted(name)) return true;
+    return offered == 0;  // unknown (-1) is treated as offered: do nothing
+}
+
+// ------------------------------------------------------------ grant driver
+
+inline bool grant_allowed_now() { return g_frames >= g_next_grant_frame; }
+
+inline void note_grant_cost(uint64_t cost_us) {
+    if (cost_us > g_worst_grant_us) g_worst_grant_us = cost_us;
+    if (cost_us > kGrantBudgetUs) {
+        g_backoff_frames = (g_backoff_frames == 0u)
+                               ? kBackoffStartFrames
+                               : g_backoff_frames * 2u;
+        if (g_backoff_frames > kBackoffMaxFrames) {
+            g_backoff_frames = kBackoffMaxFrames;
+        }
+    } else if (g_backoff_frames > 0u) {
+        g_backoff_frames /= 2u;
     }
-    if (before < 0) {
+    g_next_grant_frame = g_frames + 1u + g_backoff_frames;
+}
+
+// Runs the stock grant for one definition that is known to be missing, then
+// re-reads the owned count to verify it registered.
+inline bool grant_missing(void* registry, void* key, int32_t type,
+                          const std::string& name) {
+    if (key == nullptr || g_registry_grant == nullptr) {
         ++g_failed;
         ++g_consecutive_failures;
         return false;
@@ -380,28 +499,30 @@ inline bool ensure_owned(void* registry, void* key, const char* source,
     // A null obtain cause makes the stock transaction use its own default,
     // and no completion callback is needed.
     alignas(8) unsigned char cause[kObtainCauseSize] = {};
+    const uint64_t started = now_us();
     g_registry_grant(registry, key, cause, nullptr, nullptr);
+    const uint64_t cost = now_us() - started;
+    note_grant_cost(cost);
 
     const int32_t after = owned_count(registry, key);
     if (after < 1) {
         ++g_failed;
         ++g_consecutive_failures;
-        LOGW("23.1.3-hidden-items: grant did not register %s '%s' (%s stage,"
-             " count %" PRId32 " -> %" PRId32 ")",
-             type_label(type), name.empty() ? "<key>" : name.c_str(), source,
-             before, after);
+        LOGW("23.1.3-hidden-items: grant did not register %s '%s' (count 0 ->"
+             " %" PRId32 ", %" PRIu64 " us)",
+             type_label(type), display_name(name), after, cost);
         return false;
     }
 
     ++g_granted;
+    ++g_type_granted;
     ++g_total_granted;
     g_consecutive_failures = 0;
     ++g_grant_log;
     if (should_log(g_grant_log)) {
-        LOGI("23.1.3-hidden-items: granted %s '%s' (%s stage, count 0 -> %"
-             PRId32 ")",
-             type_label(type), name.empty() ? "<key>" : name.c_str(), source,
-             after);
+        LOGI("23.1.3-hidden-items: granted %s '%s' (%" PRIu64 " us, next grant"
+             " in %" PRIu64 " frames)",
+             type_label(type), display_name(name), cost, g_backoff_frames + 1u);
     }
     return true;
 }
@@ -421,28 +542,52 @@ inline bool progress_ready() {
 }
 
 inline void begin_pass() {
-    g_stage = Stage::Registry;
+    g_stage = (g_pass == 0) ? Stage::Probe : Stage::Sweep;
     g_slot = 0;
     g_cursor = 0;
     g_seen = 0;
     g_granted = 0;
     g_already_owned = 0;
+    g_offered_skipped = 0;
+    g_candidates = 0;
     g_failed = 0;
+    g_type_seen = 0;
+    g_type_granted = 0;
+    g_type_owned = 0;
+    g_type_hidden = 0;
 }
 
 inline void finish_pass() {
     ++g_pass;
-    LOGI("23.1.3-hidden-items: pass %" PRId32 " complete (definitions seen=%"
-         PRId32 " granted=%" PRId32 " already owned=%" PRId32 " failed=%"
-         PRId32 ")",
-         g_pass, g_seen, g_granted, g_already_owned, g_failed);
+    LOGI("23.1.3-hidden-items: pass %" PRId32 " complete (seen=%" PRId32
+         " already owned=%" PRId32 " unobtainable=%" PRId32 " granted=%" PRId32
+         " left to the shop=%" PRId32 " failed=%" PRId32 ", worst grant %"
+         PRIu64 " us)",
+         g_pass, g_seen, g_already_owned, g_candidates, g_granted,
+         g_offered_skipped, g_failed, g_worst_grant_us);
+
+    // Safety net: if not a single definition looked unobtainable even though
+    // the build clearly ships plenty, the catalogue assumption is wrong for
+    // this profile. Retry once granting everything, which is now paced and no
+    // longer freezes the menu, instead of silently doing nothing.
+    if (!g_grant_everything && g_candidates == 0 &&
+        g_seen >= kFallbackMinDefinitions) {
+        LOGW("23.1.3-hidden-items: every one of the %" PRId32 " definitions is"
+             " offered by some catalogue, so nothing looked hidden; retrying"
+             " with the full inventory sweep",
+             g_seen);
+        g_grant_everything = true;
+        g_stage = Stage::Idle;
+        g_next_sweep = g_frames + kRecheckFrames;
+        return;
+    }
 
     const bool nothing_left = (g_granted == 0 && g_seen > 0);
     if (nothing_left || g_pass >= kMaxPasses) {
         LOGI("23.1.3-hidden-items: hidden weapon, wear and gadget inventory"
-             " complete (%" PRId32 " definitions owned this pass, %" PRId32
-             " granted in total)",
-             g_already_owned + g_granted, g_total_granted);
+             " complete (%" PRId32 " granted in total, %" PRId32
+             " already owned)",
+             g_total_granted, g_already_owned);
         g_armed = false;
         return;
     }
@@ -451,39 +596,64 @@ inline void finish_pass() {
     g_next_sweep = g_frames + kRecheckFrames;
 }
 
-inline void advance_slot(int32_t slot_count) {
+inline void advance_slot() {
+    if (g_type_seen > 0) {
+        LOGI("23.1.3-hidden-items: %s: %" PRId32 " definitions, %" PRId32
+             " already owned, %" PRId32 " unobtainable, %" PRId32 " granted",
+             type_label(kSweptTypes[g_slot]), g_type_seen, g_type_owned,
+             g_type_hidden, g_type_granted);
+    }
+    g_type_seen = 0;
+    g_type_granted = 0;
+    g_type_owned = 0;
+    g_type_hidden = 0;
+
     g_cursor = 0;
     ++g_slot;
-    if (g_slot < slot_count) return;
+    if (g_slot >= kSweptTypeCount) {
+        g_slot = 0;
+        finish_pass();
+    }
+}
 
-    g_slot = 0;
-    if (g_stage == Stage::Registry) {
-        g_stage = Stage::Category;
+// One type per frame: ask the registry directly for the ids that the per-type
+// enumeration may not list (the harpoon is the reason this exists).
+inline void run_probe() {
+    void* registry = registry_instance();
+    if (registry == nullptr || g_find_by_id == nullptr ||
+        il2cpp::string_new == nullptr) {
+        g_stage = Stage::Sweep;
+        g_slot = 0;
         return;
     }
-    finish_pass();
-}
 
-// Returns the managed list for the current registry slot, or nullptr when the
-// slot has nothing to sweep.
-inline void* registry_stage_list(void* registry, int32_t& type) {
-    type = kSweptTypes[g_slot];
-    if (!is_target_type(type) || g_items_of_type == nullptr) return nullptr;
-    return g_items_of_type(registry, type, nullptr);
-}
+    const int32_t type = kSweptTypes[g_slot];
+    if (is_target_type(type)) {
+        for (int32_t i = 0; i < kProbeIdCount; ++i) {
+            void* id = il2cpp::string_new(kProbeIds[i]);
+            if (id == nullptr) continue;
+            void* item = g_find_by_id(registry, type, id, nullptr);
+            if (item == nullptr) continue;
 
-// Returns the managed catalogue list for the current category slot, or
-// nullptr when the category does not map to a targeted item type.
-inline void* category_stage_list(int32_t& type) {
-    const int32_t category = kCategories[g_slot];
-    if (!g_category_type || !g_category_items) return nullptr;
+            const std::string name = item_name(item);
+            void* key = item_key(item);
+            const int32_t owned = owned_count(registry, key);
+            LOGI("23.1.3-hidden-items: probe found %s id '%s' (name '%s', owned"
+                 " %" PRId32 ")",
+                 type_label(type), kProbeIds[i], display_name(name), owned);
+            if (owned == 0 && g_probe_grants < kMaxProbeGrants) {
+                ++g_probe_grants;
+                ++g_candidates;
+                grant_missing(registry, key, type, name);
+            }
+        }
+    }
 
-    type = reinterpret_cast<CategoryTypeFn>(g_category_type.ptr)(
-        category, g_category_type.info);
-    if (!is_target_type(type)) return nullptr;
-
-    return reinterpret_cast<CategoryItemsFn>(g_category_items.ptr)(
-        type, category, g_category_items.info);
+    ++g_slot;
+    if (g_slot >= kSweptTypeCount) {
+        g_slot = 0;
+        g_stage = Stage::Sweep;
+    }
 }
 
 inline void run_sweep() {
@@ -499,66 +669,107 @@ inline void run_sweep() {
     // be alive before the first write.
     if (!progress_ready()) return;
 
+    if (g_stage == Stage::Probe) {
+        run_probe();
+        return;
+    }
+
     void* registry = registry_instance();
     if (registry == nullptr) return;
 
-    const bool registry_stage = (g_stage == Stage::Registry);
-    const int32_t slots = registry_stage ? kSweptTypeCount : kCategoryCount;
-
-    int32_t type = 0;
-    void* list = registry_stage ? registry_stage_list(registry, type)
-                                : category_stage_list(type);
-    if (list == nullptr) {
-        advance_slot(slots);
+    const int32_t type = kSweptTypes[g_slot];
+    if (!is_target_type(type) || g_items_of_type == nullptr) {
+        advance_slot();
         return;
     }
 
-    ListApi& api = registry_stage ? g_item_list : g_entry_list;
-    if (!api && !resolve_list_api(list, api)) return;
+    void* list = g_items_of_type(registry, type, nullptr);
+    if (list == nullptr) {
+        advance_slot();
+        return;
+    }
+    if (!g_item_list && !resolve_list_api(list, g_item_list)) return;
 
-    const int32_t total =
-        reinterpret_cast<ListCountFn>(api.count_ptr)(list, api.count_info);
+    const int32_t total = reinterpret_cast<ListCountFn>(g_item_list.count_ptr)(
+        list, g_item_list.count_info);
     if (total <= 0 || total > kMaxListEntries) {
         if (total > kMaxListEntries) {
-            LOGW("23.1.3-hidden-items: %s list for %s reports %" PRId32
+            LOGW("23.1.3-hidden-items: registry list for %s reports %" PRId32
                  " entries; skipped as implausible",
-                 registry_stage ? "registry" : "catalogue", type_label(type),
-                 total);
+                 type_label(type), total);
         }
-        advance_slot(slots);
+        advance_slot();
         return;
     }
 
-    int32_t processed = 0;
-    while (g_cursor < total && processed < kGrantsPerTick) {
-        void* entry =
-            reinterpret_cast<ListItemFn>(api.item_ptr)(list, g_cursor,
-                                                       api.item_info);
+    const bool dump_type = kDumpGadgetIds && type == kTypeGadget;
+    int32_t checks = 0;
+
+    while (g_cursor < total && checks < kChecksPerTick) {
+        void* item = reinterpret_cast<ListItemFn>(g_item_list.item_ptr)(
+            list, g_cursor, g_item_list.item_info);
+        void* key = item_key(item);
+        const int32_t owned = owned_count(registry, key);
+
+        const bool need_name = dump_type || owned == 0;
+        const std::string name = need_name ? item_name(item) : std::string();
+        const int32_t offered = need_name ? is_offered(item) : -1;
+        const bool grant_it = (owned == 0) && wants_grant(offered, name);
+
+        // A grant is the only expensive step, so it waits for its budget. The
+        // cursor stays put, and this definition is retried on a later frame.
+        if (grant_it && !grant_allowed_now()) return;
+
         ++g_seen;
+        ++g_type_seen;
         ++g_cursor;
-        ++processed;
+        ++checks;
 
-        if (registry_stage) {
-            ensure_owned(registry, item_key(entry), "registry", type,
-                         item_name(entry));
-        } else {
-            void* key = entry == nullptr
-                            ? nullptr
-                            : reinterpret_cast<EntryKeyFn>(g_entry_key.ptr)(
-                                  entry, g_entry_key.info);
-            ensure_owned(registry, key, "catalogue", type, std::string());
+        if (dump_type && g_dumped < kDumpLimit) {
+            ++g_dumped;
+            LOGI("23.1.3-hidden-items: gadget definition '%s' (%s, owned %"
+                 PRId32 ")",
+                 display_name(name),
+                 offered == 1 ? "offered" : (offered == 0 ? "not offered"
+                                                          : "catalogue unknown"),
+                 owned);
         }
 
-        if (g_consecutive_failures >= kMaxConsecutiveFailures) {
-            LOGW("23.1.3-hidden-items: %" PRId32 " consecutive grants failed;"
-                 " disarming (granted=%" PRId32 " total)",
-                 g_consecutive_failures, g_total_granted);
-            g_armed = false;
-            return;
+        if (owned >= 1) {
+            ++g_already_owned;
+            ++g_type_owned;
+            g_consecutive_failures = 0;
+            continue;
         }
+        if (owned < 0) {
+            ++g_failed;
+            ++g_consecutive_failures;
+            if (g_consecutive_failures >= kMaxConsecutiveFailures) break;
+            continue;
+        }
+        if (!grant_it) {
+            ++g_offered_skipped;
+            continue;
+        }
+
+        ++g_candidates;
+        ++g_type_hidden;
+        grant_missing(registry, key, type, name);
+
+        // One transaction per frame, whatever it cost.
+        if (g_consecutive_failures >= kMaxConsecutiveFailures) break;
+        return;
     }
 
-    if (g_cursor >= total) advance_slot(slots);
+    if (g_consecutive_failures >= kMaxConsecutiveFailures) {
+        LOGW("23.1.3-hidden-items: %" PRId32 " consecutive failures; disarming"
+             " (granted=%" PRId32 " total)",
+             g_consecutive_failures, g_total_granted);
+        g_armed = false;
+        return;
+    }
+
+    if (g_cursor >= total) advance_slot();
 }
 
 // ------------------------------------------------------------- installation
@@ -626,14 +837,20 @@ inline bool install(uintptr_t il2cpp_base) {
         reinterpret_cast<void*>(il2cpp_base + kRegistryCountRva));
     g_registry_grant = reinterpret_cast<RegistryGrantFn>(
         reinterpret_cast<void*>(il2cpp_base + kRegistryGrantRva));
+    g_find_by_id = reinterpret_cast<RegistryFindByIdFn>(
+        reinterpret_cast<void*>(il2cpp_base + kRegistryFindByIdRva));
+    g_catalog_entry = reinterpret_cast<CatalogEntryForItemFn>(
+        reinterpret_cast<void*>(il2cpp_base + kCatalogEntryForItemRva));
 
     begin_pass();
     g_armed = true;
     g_installed = true;
-    LOGI("23.1.3-hidden-items: armed: every hidden weapon, wear item and gadget"
-         " the build ships is granted through the stock item inventory (%"
-         PRId32 " per menu frame, %" PRId32 " sweeps max, skins %s)",
-         kGrantsPerTick, kMaxPasses, kIncludeSkins ? "included" : "excluded");
+    LOGI("23.1.3-hidden-items: armed: %s are granted through the stock item"
+         " inventory (max 1 transaction per menu frame, %" PRIu64 " us budget,"
+         " skins %s)",
+         g_grant_everything ? "every definition the build ships"
+                            : "definitions no shop or craft list offers",
+         kGrantBudgetUs, kIncludeSkins ? "included" : "excluded");
     return true;
 }
 
