@@ -1,17 +1,50 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v3, stall free
+// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v4, fast bulk sweep
 //
-// v1 worked (Ultimatum, Locator and the hidden wear pieces show up and stay),
-// but it granted every definition the build ships, one full stock inventory
-// transaction at a time, and that locked the main menu up for minutes on the
-// first launch. For a private server that is a real defect and not a nitpick:
-// an ordinary player reads a frozen menu as malware and uninstalls.
+// v1 granted every definition the build ships, one full stock inventory
+// transaction at a time, and locked the main menu up for minutes on the first
+// launch. v2 fixed the freeze by granting only definitions that no shop tab,
+// craft list or event list offers, which quietly dropped every weapon the shop
+// happens to sell. v3 restored the full weapon sweep behind a per-frame
+// wall-clock budget.
 //
-// Where the time actually went (BL scan of the shipped ARM64 code):
+// v3 did not freeze, but it was unusably slow, and the reason was its own
+// pacing rather than the amount of work:
 //
-//   丘上丄三业丏丙不且(key, Nullable<cause>, Action)             0x3062B08  <- v1 called this
+//   kGrantBudgetUs was 10 ms per frame, and note_grant_cost() treated *any*
+//   grant costing more than that as a stall, doubling an exponential backoff
+//   up to kBackoffMaxFrames = 90. A full inventory transaction always costs
+//   more than 10 ms on real hardware, so the backoff saturated on the first
+//   few grants and never came back down: the sweep settled at roughly one
+//   weapon per 90 frames, i.e. 1.5 s each, i.e. about twenty minutes for ~800
+//   weapons. The menu stayed perfectly responsive the whole time, which is
+//   exactly how the defect was reported: not laggy, just insanely slow.
+//
+// So the budget was protecting a frame rate that was never in danger. v4 keeps
+// the same mechanism and re-aims it:
+//
+//  1. The first pass is a bulk pass and is budgeted for throughput
+//     (kBurstBudgetUs, kBurstGrantsPerFrame). Dropping the menu to ~8 fps for
+//     a few seconds while the arsenal lands is the trade that was asked for.
+//  2. The backoff is no longer armed by "this grant cost more than one frame".
+//     It is armed only by kGrantStallUs, a genuinely pathological transaction
+//     (a quarter of a second), and it is capped at kBackoffMaxFrames = 8 so it
+//     can slow the sweep down without stopping it.
+//  3. Later passes are re-checks over an inventory that is already full, so
+//     they keep the gentle steady-state budget.
+//  4. The sweep starts earlier (kWarmupFrames), so it overlaps the time the
+//     player spends reading the main menu instead of starting after it.
+//
+// Expected shape on device: ~800 weapon transactions at 15-40 ms each, 3-8 per
+// frame, so the arsenal completes in single-digit seconds rather than tens of
+// minutes. The progress log prints a running rate so this can be checked
+// instead of assumed.
+//
+// Where the time goes (BL scan of the shipped ARM64 code):
+//
+//   丘上丄三业丏丙不且(key, Nullable<cause>, Action)             0x3062B08  <- called here
 //   └─ 丘上丄三业丏丙不且(List<key>, Nullable<cause>, Action)     0x3061C20
 //      └─ 下万丗世丑万丌东东(List<key> give, List<key> take, cause)  0x3061DB0
 //         ├─ Progress.东丝丂丄业丕且丙丑::丞丏业丐丒与业丗与()               0x1B3BA40
@@ -19,48 +52,31 @@
 //         └─ Progress.东丝丂丄业丕且丙丑::丈且东丝丝东且丈专(Dictionary<string,object>)
 //                                                             0x1B44230
 //
-// The single-key entry point is only a thin wrapper: it allocates a one-element
-// list and runs the complete transaction, which appends a profile-update
-// command and re-serialises the whole pending command queue (PrUpCmKey) every
-// single time. The cost of item N therefore grows with N, so granting ~1500
-// definitions is quadratic work: minutes of stalling. Pacing by frame count
-// (v1 kGrantsPerTick) cannot help, because the cost lives inside one
-// transaction rather than across frames.
+// The single-key entry point is a thin wrapper: it allocates a one-element list
+// and runs the complete transaction, which appends a profile-update command and
+// re-serialises the whole pending command queue (PrUpCmKey) every time. The
+// cost of item N therefore grows with N.
 //
-// v2 attacked the transaction count instead: only definitions that no shop
-// tab, craft list or event list offers were granted, which cut ~1500
-// transactions down to a few dozen.
+// The real end state is the batch entry point at 0x3061C20, which takes a
+// List<key> and collapses the whole sweep into one transaction and one
+// serialisation. It is still not called here, and the blocker is narrow and
+// worth recording: il2cpp.h exposes no object_new and no generic-instantiation
+// helper, so a managed List<丑一丘与丁丄专专专> cannot be constructed from native
+// code. It can, however, be *borrowed*: several shipped methods return
+// List<丑一丘与丁丄专专专> (for instance Progress.东丝丂丄业丕且丙丑::专与丁丞丂丁丐与丝(enum) at
+// 0x1B4B0E0), and List<T>.GetRange(0, 0) on any of them yields a fresh, empty,
+// correctly typed list that we own outright. That is the next step; it needs a
+// device to validate the borrow source, so v4 deliberately ships the pacing fix
+// first, on code paths that are already known to work on the target hardware.
 //
-// v3 restores the full weapon sweep, because v2 solved the freeze by also
-// dropping something that was wanted: every weapon the build ships should be
-// in the player's hands on a private server, whether or not the shop happens
-// to sell it. The freeze does not come back, because the cost is now bounded
-// from two sides at once:
-//
-//  1. kGrantEveryWeapon grants every weapon definition, catalogue or not.
-//     Wear, gadgets and skins keep the cheap v2 filter, so the extra work is
-//     paid only where it was asked for.
-//  2. Grants are budgeted in wall-clock time per frame (kGrantBudgetUs), not
-//     per transaction. Several cheap grants may share one frame while the
-//     budget lasts; the moment it is spent the sweep suspends with its cursor
-//     in place and resumes on the next frame. A grant that blows the budget on
-//     its own still triggers the exponential backoff, so the late (expensive)
-//     part of the sweep degrades into a slow trickle rather than a freeze.
-//
-// That combination matters: v2's "at most one transaction per frame, whatever
-// it cost" rule was safe for a few dozen grants, but across ~800 weapons the
-// mandatory one-frame gap plus a saturating backoff would have stretched the
-// sweep over an hour. Letting cheap grants share a frame keeps the early bulk
-// fast, and the budget keeps the late, expensive grants from stuttering.
-//
-// Also kept from v2, for the missing harpoon: a targeted find-by-id probe
-// 与丒丅丝丕丕丒丟丆(OfferItemType, string) at 0x3060088 reaches definitions that the
-// per-type enumeration may not list at all, and the gadget definitions are
-// dumped to logcat once. 23.1.3 metadata contains no harpoon item id: Harpoon
-// only exists as member 2 of the movement-gadget kind enum 专丟且东丐三丟丕业 and as
-// weapon config fields (harpoonImpulse, harpoonMaxDistance, isHarpoonProjectile,
-// [...(Harpoon)] public bool harpoon), so the real id can only come off the
-// device. The dump makes that a one-line change once we see it.
+// Also kept: a targeted find-by-id probe 与丒丅丝丕丕丒丟丆(OfferItemType, string) at
+// 0x3060088 reaches definitions the per-type enumeration may not list, and the
+// gadget definitions are dumped to logcat once. 23.1.3 metadata contains no
+// harpoon item id: Harpoon only exists as member 2 of the movement-gadget kind
+// enum 专丟且东丐三丟丕业 and as weapon config fields (harpoonImpulse,
+// harpoonMaxDistance, isHarpoonProjectile, [...(Harpoon)] public bool harpoon),
+// so the real id can only come off the device. The dump makes that a one-line
+// change once we see it.
 //
 // Unchanged safety model: fail closed. Nothing is patched, no game memory is
 // written, only stock public calls are made, RVA-taken pointers are used only
@@ -94,25 +110,36 @@ static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 // ------------------------------------------------------------------ tunables
 
 // weapon_modules_2313 starts its own sweep at menu frame 120 and needs about
-// 25 frames for its 42 definitions. This port starts later on purpose: both
-// drive the same stock transaction and must not overlap on a single frame.
-constexpr uint64_t kWarmupFrames = 300;
+// 25 frames for its 42 definitions. This port starts after that on purpose:
+// both drive the same stock transaction and must not overlap on a single
+// frame. 180 leaves a comfortable margin while still starting the bulk work
+// inside the first few seconds of the menu.
+constexpr uint64_t kWarmupFrames = 180;
 
 // Read-only checks per main-menu frame (list access, owned count, catalogue
-// lookup). These are cheap: no transaction, no persist, no allocation.
-constexpr int32_t kChecksPerTick = 24;
+// lookup). These are cheap: no transaction, no persist, no allocation. This
+// number also decides how fast a *second* launch skips over an inventory that
+// is already complete.
+constexpr int32_t kChecksPerTick = 64;
 
-// Wall-clock grant budget per main-menu frame. Cheap grants share a frame
-// until the budget is spent; a single grant that costs more than this on its
-// own also arms the backoff below.
-constexpr uint64_t kGrantBudgetUs = 10000u;  // 10 ms
+// Bulk pass (the first one): budgeted for throughput, not for frame rate. The
+// menu is expected to drop to single-digit fps for a few seconds while the
+// arsenal lands, which is the whole point.
+constexpr uint64_t kBurstBudgetUs = 120000u;  // 120 ms per frame
+constexpr int32_t kBurstGrantsPerFrame = 64;
 
-// Hard cap on transactions per frame, so a device that reports implausibly
-// cheap grants still cannot run an unbounded number of them in one frame.
-constexpr int32_t kGrantsPerFrameCap = 4;
+// Steady state (re-check passes over an inventory that is already full).
+constexpr uint64_t kGrantBudgetUs = 20000u;  // 20 ms per frame
+constexpr int32_t kGrantsPerFrameCap = 8;
 
-constexpr uint64_t kBackoffStartFrames = 6u;
-constexpr uint64_t kBackoffMaxFrames = 90u;  // ~1.5 s at 60 fps
+// A single transaction slower than this is pathological, not merely expensive,
+// and is the only thing that arms the backoff. v3 armed it at the frame budget
+// instead, which is why the backoff saturated and the sweep crawled.
+constexpr uint64_t kGrantStallUs = 250000u;  // 250 ms
+
+// The backoff may slow the sweep down; it may not stop it.
+constexpr uint64_t kBackoffStartFrames = 2u;
+constexpr uint64_t kBackoffMaxFrames = 8u;
 
 // Full sweeps attempted in total (late registry population included).
 constexpr int32_t kMaxPasses = 2;
@@ -129,7 +156,11 @@ constexpr int32_t kMaxListEntries = 8192;
 
 // Log the first kLogBurst grants in full, then every kLogPeriod-th one.
 constexpr uint64_t kLogBurst = 12u;
-constexpr uint64_t kLogPeriod = 16u;
+constexpr uint64_t kLogPeriod = 64u;
+
+// Running progress line every N successful grants, so the actual rate can be
+// read off logcat instead of guessed at.
+constexpr int32_t kRateLogEvery = 100;
 
 // Character, weapon and armor skins are cosmetics with a much larger
 // catalogue and are not part of the "hidden and impossible to craft" set, so
@@ -189,8 +220,10 @@ constexpr int32_t kTypeCape = 60;
 constexpr int32_t kTypeSkin = 65;
 constexpr int32_t kTypeGadget = 70;
 
+// Weapons first: they are the bulk of the work and the reason the sweep
+// exists, so they should land while the player is still on the main menu.
 constexpr int32_t kSweptTypes[] = {
-    kTypeGadget, kTypeWeapon, kTypeArmor, kTypeMask,
+    kTypeWeapon, kTypeGadget, kTypeArmor, kTypeMask,
     kTypeHat,    kTypeBoots,  kTypeCape,  kTypeSkin,
 };
 constexpr int32_t kSweptTypeCount =
@@ -233,7 +266,7 @@ constexpr const char* kItemKeyField = "<下丕三上丂三丝丅丐>k__BackingFi
 constexpr const char* kItemNameField = "<世下丐不丞与丞七丄>k__BackingField";
 
 // Static catalogue helper (extension class). Two of its members are only bound
-// to prove the image (see verify_image) and are never called by v2.
+// to prove the image (see verify_image) and are never called here.
 constexpr const char* kCatalogClass = "丄丝丘丆丈丆丝丆丄";
 constexpr const char* kCatalogByCategory = "三与七丆丅丆丕丒业";  // static, 2 args
 constexpr const char* kEntryKey = "丌丄丛丈与丝丑世丆";            // static, 1 arg
@@ -263,6 +296,11 @@ constexpr uintptr_t kRegistryItemsOfTypeRva = 0x3060030u;
 constexpr uintptr_t kRegistryCountRva = 0x304F634u;
 // 丘上丄三业丏丙不且(key, Nullable<cause>, Action) -> item, the stock grant.
 constexpr uintptr_t kRegistryGrantRva = 0x3062B08u;
+// 丘上丄三业丏丙不且(List<key>, Nullable<cause>, Action) -> List<item>, the batch
+// grant. Recorded for the follow-up work described in the header comment; not
+// called yet, because a managed List<key> cannot be constructed from native
+// code with the current il2cpp.h surface.
+constexpr uintptr_t kRegistryGrantBatchRva = 0x3061C20u;
 // 与丒丅丝丕丕丒丟丆(OfferItemType, string) -> item, find a definition by id.
 constexpr uintptr_t kRegistryFindByIdRva = 0x3060088u;
 // 与丅丟七与丌东丙丌(item) -> catalogue entry, null when nothing offers the item.
@@ -380,6 +418,9 @@ inline uint64_t g_next_grant_frame = 0;
 inline uint64_t g_backoff_frames = 0;
 inline uint64_t g_worst_grant_us = 0;
 inline uint64_t g_frame_spent_us = 0;
+inline uint64_t g_total_grant_us = 0;
+inline uint64_t g_sweep_started_us = 0;
+inline int32_t g_stalled_grants = 0;
 inline int32_t g_grants_this_frame = 0;
 inline Stage g_stage = Stage::Probe;
 inline int32_t g_slot = 0;    // index into kSweptTypes
@@ -502,21 +543,37 @@ inline bool wants_grant(int32_t type, int32_t offered,
 
 inline bool grant_allowed_now() { return g_frames >= g_next_grant_frame; }
 
+// The first pass is bulk work and is budgeted for throughput; every later pass
+// is a re-check over an inventory that should already be full, so it goes back
+// to being invisible.
+inline bool bulk_phase() { return g_pass == 0; }
+
+inline uint64_t frame_budget_us() {
+    return bulk_phase() ? kBurstBudgetUs : kGrantBudgetUs;
+}
+
+inline int32_t frame_grant_cap() {
+    return bulk_phase() ? kBurstGrantsPerFrame : kGrantsPerFrameCap;
+}
+
 // True once this frame has spent its transaction budget, so the sweep must
 // suspend and resume on the next frame with its cursor in place.
 inline bool frame_budget_spent() {
-    return g_frame_spent_us >= kGrantBudgetUs ||
-           g_grants_this_frame >= kGrantsPerFrameCap;
+    return g_frame_spent_us >= frame_budget_us() ||
+           g_grants_this_frame >= frame_grant_cap();
 }
 
 inline void note_grant_cost(uint64_t cost_us) {
     if (cost_us > g_worst_grant_us) g_worst_grant_us = cost_us;
     g_frame_spent_us += cost_us;
+    g_total_grant_us += cost_us;
     ++g_grants_this_frame;
 
-    if (cost_us > kGrantBudgetUs) {
-        // One transaction alone outgrew a whole frame: back off hard, and do
-        // not attempt another grant until the backoff has elapsed.
+    // Only a pathological transaction arms the backoff. An ordinary grant that
+    // happens to be more expensive than one frame is normal for this API and
+    // must not throttle the sweep: that mistake is what made v3 crawl.
+    if (cost_us > kGrantStallUs) {
+        ++g_stalled_grants;
         g_backoff_frames = (g_backoff_frames == 0u)
                                ? kBackoffStartFrames
                                : g_backoff_frames * 2u;
@@ -527,14 +584,10 @@ inline void note_grant_cost(uint64_t cost_us) {
         return;
     }
 
-    if (g_backoff_frames > 0u) {
-        g_backoff_frames /= 2u;
-        g_next_grant_frame = g_frames + 1u + g_backoff_frames;
-        return;
-    }
+    if (g_backoff_frames > 0u) g_backoff_frames /= 2u;
 
-    // Cheap grant with no backoff pending: another one may run in this same
-    // frame as long as frame_budget_spent() still says there is room.
+    // Another grant may run in this same frame for as long as
+    // frame_budget_spent() still says there is room.
     g_next_grant_frame = g_frames;
 }
 
@@ -552,6 +605,7 @@ inline bool grant_missing(void* registry, void* key, int32_t type,
     // and no completion callback is needed.
     alignas(8) unsigned char cause[kObtainCauseSize] = {};
     const uint64_t started = now_us();
+    if (g_sweep_started_us == 0u) g_sweep_started_us = started;
     g_registry_grant(registry, key, cause, nullptr, nullptr);
     const uint64_t cost = now_us() - started;
     note_grant_cost(cost);
@@ -576,6 +630,16 @@ inline bool grant_missing(void* registry, void* key, int32_t type,
              " this frame, backoff %" PRIu64 " frames)",
              type_label(type), display_name(name), cost, g_grants_this_frame,
              g_backoff_frames);
+    }
+
+    if (kRateLogEvery > 0 && (g_total_granted % kRateLogEvery) == 0) {
+        const uint64_t elapsed = now_us() - g_sweep_started_us;
+        LOGI("23.1.3-hidden-items: progress: %" PRId32 " granted in %" PRIu64
+             " ms wall clock (%" PRIu64 " ms inside transactions, avg %" PRIu64
+             " us each, %" PRId32 " stalls)",
+             g_total_granted, elapsed / 1000ull, g_total_grant_us / 1000ull,
+             g_total_grant_us / static_cast<uint64_t>(g_total_granted),
+             g_stalled_grants);
     }
     return true;
 }
@@ -612,12 +676,16 @@ inline void begin_pass() {
 
 inline void finish_pass() {
     ++g_pass;
+    const uint64_t elapsed =
+        g_sweep_started_us == 0u ? 0u : (now_us() - g_sweep_started_us);
     LOGI("23.1.3-hidden-items: pass %" PRId32 " complete (seen=%" PRId32
          " already owned=%" PRId32 " wanted=%" PRId32 " granted=%" PRId32
-         " left to the shop=%" PRId32 " failed=%" PRId32 ", worst grant %"
-         PRIu64 " us)",
+         " left to the shop=%" PRId32 " failed=%" PRId32 ") in %" PRIu64
+         " ms wall clock, %" PRIu64 " ms inside transactions, worst grant %"
+         PRIu64 " us, %" PRId32 " stalls",
          g_pass, g_seen, g_already_owned, g_candidates, g_granted,
-         g_offered_skipped, g_failed, g_worst_grant_us);
+         g_offered_skipped, g_failed, elapsed / 1000ull,
+         g_total_grant_us / 1000ull, g_worst_grant_us, g_stalled_grants);
 
     // Safety net: if not a single definition was selected even though the
     // build clearly ships plenty, the catalogue assumption is wrong for this
@@ -903,15 +971,18 @@ inline bool install(uintptr_t il2cpp_base) {
     g_armed = true;
     g_installed = true;
     LOGI("23.1.3-hidden-items: armed: %s are granted through the stock item"
-         " inventory (%" PRIu64 " us budget and max %" PRId32 " transactions"
-         " per menu frame, skins %s)",
+         " inventory, starting at menu frame %" PRIu64 " (bulk budget %" PRIu64
+         " us and max %" PRId32 " transactions per frame, steady state %"
+         PRIu64 " us and %" PRId32 ", backoff only above %" PRIu64
+         " us, skins %s)",
          g_grant_everything
              ? "every definition the build ships"
              : (kGrantEveryWeapon
                     ? "every weapon the build ships, plus wear and gadgets no"
                       " shop or craft list offers"
                     : "definitions no shop or craft list offers"),
-         kGrantBudgetUs, kGrantsPerFrameCap,
+         kWarmupFrames, kBurstBudgetUs, kBurstGrantsPerFrame, kGrantBudgetUs,
+         kGrantsPerFrameCap, kGrantStallUs,
          kIncludeSkins ? "included" : "excluded");
     return true;
 }
