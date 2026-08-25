@@ -31,6 +31,7 @@
 #include "post_match_2313.h"
 #include "progression_2313.h"
 #include "rank_ui_2313.h"
+#include "season_2313.h"
 #include "startup_guards_2313.h"
 #include "startup_trace_2313.h"
 #include "version_2313.h"
@@ -145,6 +146,7 @@ void* init_thread(void*) {
     const bool live_content    = live_content_2313::install_hooks(base);
     const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     const bool hidden_items    = hidden_items_2313::install_hooks(base);
+    const bool season_drip     = season_2313::install_hooks(base);
     const bool local_identity   = identity_2313::install_hooks();
     const bool assets_payload   = assets_data_2313::install_hooks(base);
     const bool net_stall        = net_stall_guard_2313::install_hooks();
@@ -157,8 +159,9 @@ void* init_thread(void*) {
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && live_content && weapon_modules && hidden_items &&
-        local_identity && assets_payload && net_stall && post_match &&
-        online_state && battle_ui && rank_ui && bots_trace && backend_emu) {
+        season_drip && local_identity && assets_payload && net_stall &&
+        post_match && online_state && battle_ui && rank_ui && bots_trace &&
+        backend_emu) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
@@ -171,7 +174,9 @@ void* init_thread(void*) {
              "by the empty offline ExpOpenSystem table, every weapon "
              "and armor module is unlocked at level 10, every hidden weapon, "
              "wear item and gadget the build ships is granted through the "
-             "stock item inventory, the player id is "
+             "stock item inventory, weapon skins and graffiti arrive one at "
+             "a time as offline season tiers and lottery spins, the player "
+             "id is "
              "minted on device with no backend round-trip, and an in-APK "
              "assets/data payload is unpacked into the game's own resource "
              "root, the repeated blocking backend name lookup no longer "
@@ -189,7 +194,7 @@ void* init_thread(void*) {
              "local-backend=%d photon=%d plugin=%d photon-trace=%d "
              "progression=%d crafting=%d lobby-catalog=%d live-content=%d "
              "modules=%d "
-             "hidden-items=%d "
+             "hidden-items=%d season=%d "
              "identity=%d assets-data=%d net-stall=%d "
              "post-match=%d online-state=%d battle-ui=%d rank-ui=%d "
              "bots=%d backend-emu=%d",
@@ -200,7 +205,7 @@ void* init_thread(void*) {
              photon_trace ? 1 : 0, progression ? 1 : 0,
              crafting ? 1 : 0, lobby_catalog ? 1 : 0, live_content ? 1 : 0,
              weapon_modules ? 1 : 0,
-             hidden_items ? 1 : 0,
+             hidden_items ? 1 : 0, season_drip ? 1 : 0,
              local_identity ? 1 : 0, assets_payload ? 1 : 0,
              net_stall ? 1 : 0, post_match ? 1 : 0,
              online_state ? 1 : 0, battle_ui ? 1 : 0, rank_ui ? 1 : 0,
