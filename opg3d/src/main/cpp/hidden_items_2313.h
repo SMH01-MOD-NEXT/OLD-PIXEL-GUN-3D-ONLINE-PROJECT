@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v2, stall free
+// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v3, stall free
 //
 // v1 worked (Ultimatum, Locator and the hidden wear pieces show up and stay),
 // but it granted every definition the build ships, one full stock inventory
@@ -27,25 +27,33 @@
 // (v1 kGrantsPerTick) cannot help, because the cost lives inside one
 // transaction rather than across frames.
 //
-// v2 attacks the transaction count instead:
+// v2 attacked the transaction count instead: only definitions that no shop
+// tab, craft list or event list offers were granted, which cut ~1500
+// transactions down to a few dozen.
 //
-//  1. Only unobtainable definitions are granted, which is what was asked for in
-//     the first place (hidden items and items with no reachable recipe). The
-//     question is answered structurally by the stock catalogue lookup
-//     与丅丟七与丌东丙丌(item) -> 丒专与三七丁丌丟丆 at 0x305C6C0: a definition with no
-//     catalogue entry is offered by no shop tab, no craft list and no event
-//     list, so the player has no way to reach it. Everything the shop already
-//     sells is left alone. That turns ~1500 transactions into a few dozen.
-//  2. Grants are budgeted in wall-clock time, not frames. Every grant is timed
-//     with CLOCK_MONOTONIC; when one costs more than kGrantBudgetUs the driver
-//     backs off exponentially (up to kBackoffMaxFrames) before it attempts the
-//     next one, and never runs two transactions in the same frame. A slow
-//     device degrades into a slower trickle instead of a freeze.
-//  3. The redundant category grant stage is gone. v1 walked 22 catalogue
-//     categories after the registry sweep and re-checked the same definitions
-//     many times, for up to three passes.
+// v3 restores the full weapon sweep, because v2 solved the freeze by also
+// dropping something that was wanted: every weapon the build ships should be
+// in the player's hands on a private server, whether or not the shop happens
+// to sell it. The freeze does not come back, because the cost is now bounded
+// from two sides at once:
 //
-// Also new, for the missing harpoon: a targeted find-by-id probe
+//  1. kGrantEveryWeapon grants every weapon definition, catalogue or not.
+//     Wear, gadgets and skins keep the cheap v2 filter, so the extra work is
+//     paid only where it was asked for.
+//  2. Grants are budgeted in wall-clock time per frame (kGrantBudgetUs), not
+//     per transaction. Several cheap grants may share one frame while the
+//     budget lasts; the moment it is spent the sweep suspends with its cursor
+//     in place and resumes on the next frame. A grant that blows the budget on
+//     its own still triggers the exponential backoff, so the late (expensive)
+//     part of the sweep degrades into a slow trickle rather than a freeze.
+//
+// That combination matters: v2's "at most one transaction per frame, whatever
+// it cost" rule was safe for a few dozen grants, but across ~800 weapons the
+// mandatory one-frame gap plus a saturating backoff would have stretched the
+// sweep over an hour. Letting cheap grants share a frame keeps the early bulk
+// fast, and the budget keeps the late, expensive grants from stuttering.
+//
+// Also kept from v2, for the missing harpoon: a targeted find-by-id probe
 // 与丒丅丝丕丕丒丟丆(OfferItemType, string) at 0x3060088 reaches definitions that the
 // per-type enumeration may not list at all, and the gadget definitions are
 // dumped to logcat once. 23.1.3 metadata contains no harpoon item id: Harpoon
@@ -94,11 +102,17 @@ constexpr uint64_t kWarmupFrames = 300;
 // lookup). These are cheap: no transaction, no persist, no allocation.
 constexpr int32_t kChecksPerTick = 24;
 
-// A grant is the expensive part, so at most one per frame, and only when the
-// budget below allows it.
-constexpr uint64_t kGrantBudgetUs = 6000u;  // 6 ms, about a third of a frame
+// Wall-clock grant budget per main-menu frame. Cheap grants share a frame
+// until the budget is spent; a single grant that costs more than this on its
+// own also arms the backoff below.
+constexpr uint64_t kGrantBudgetUs = 10000u;  // 10 ms
+
+// Hard cap on transactions per frame, so a device that reports implausibly
+// cheap grants still cannot run an unbounded number of them in one frame.
+constexpr int32_t kGrantsPerFrameCap = 4;
+
 constexpr uint64_t kBackoffStartFrames = 6u;
-constexpr uint64_t kBackoffMaxFrames = 240u;  // ~4 s at 60 fps
+constexpr uint64_t kBackoffMaxFrames = 90u;  // ~1.5 s at 60 fps
 
 // Full sweeps attempted in total (late registry population included).
 constexpr int32_t kMaxPasses = 2;
@@ -122,10 +136,17 @@ constexpr uint64_t kLogPeriod = 16u;
 // they stay opt-in.
 constexpr bool kIncludeSkins = false;
 
-// Set to true to restore the v1 behaviour (grant everything the build ships,
-// now paced). The driver also flips this on by itself for one retry if the
-// unobtainable-only filter selects nothing at all, so a wrong assumption about
-// the catalogue degrades into "slower but complete" instead of "does nothing".
+// Every weapon definition the build ships is granted, whether or not a shop
+// tab, craft list or event list offers it. This is the v1 behaviour for
+// weapons specifically, restored on purpose: on a private server the point is
+// to own the whole arsenal, not only the parts nothing else sells.
+constexpr bool kGrantEveryWeapon = true;
+
+// Set to true to restore the v1 behaviour for *every* item type (wear,
+// gadgets and, if enabled, skins included), now paced. The driver also flips
+// this on by itself for one retry if the unobtainable-only filter selects
+// nothing at all, so a wrong assumption about the catalogue degrades into
+// "slower but complete" instead of "does nothing".
 constexpr bool kGrantEverything = false;
 constexpr int32_t kFallbackMinDefinitions = 64;
 
@@ -358,6 +379,8 @@ inline uint64_t g_grant_log = 0;
 inline uint64_t g_next_grant_frame = 0;
 inline uint64_t g_backoff_frames = 0;
 inline uint64_t g_worst_grant_us = 0;
+inline uint64_t g_frame_spent_us = 0;
+inline int32_t g_grants_this_frame = 0;
 inline Stage g_stage = Stage::Probe;
 inline int32_t g_slot = 0;    // index into kSweptTypes
 inline int32_t g_cursor = 0;  // index inside the current managed list
@@ -459,10 +482,18 @@ inline int32_t is_offered(void* item) {
     return g_catalog_entry(item, nullptr) != nullptr ? 1 : 0;
 }
 
-// Definitions the player can already buy or craft are left alone: granting
-// them is what made v1 take minutes, and it was never the point.
-inline bool wants_grant(int32_t offered, const std::string& name) {
+// Weapons are granted in full (v1 behaviour, restored on purpose). For every
+// other type the catalogue filter stays: definitions the player can already
+// buy or craft are left alone, because granting them is what made v1 take
+// minutes and it was never the point for wear and gadgets.
+inline bool grants_whole_type(int32_t type) {
     if (g_grant_everything) return true;
+    return kGrantEveryWeapon && type == kTypeWeapon;
+}
+
+inline bool wants_grant(int32_t type, int32_t offered,
+                        const std::string& name) {
+    if (grants_whole_type(type)) return true;
     if (is_always_granted(name)) return true;
     return offered == 0;  // unknown (-1) is treated as offered: do nothing
 }
@@ -471,19 +502,40 @@ inline bool wants_grant(int32_t offered, const std::string& name) {
 
 inline bool grant_allowed_now() { return g_frames >= g_next_grant_frame; }
 
+// True once this frame has spent its transaction budget, so the sweep must
+// suspend and resume on the next frame with its cursor in place.
+inline bool frame_budget_spent() {
+    return g_frame_spent_us >= kGrantBudgetUs ||
+           g_grants_this_frame >= kGrantsPerFrameCap;
+}
+
 inline void note_grant_cost(uint64_t cost_us) {
     if (cost_us > g_worst_grant_us) g_worst_grant_us = cost_us;
+    g_frame_spent_us += cost_us;
+    ++g_grants_this_frame;
+
     if (cost_us > kGrantBudgetUs) {
+        // One transaction alone outgrew a whole frame: back off hard, and do
+        // not attempt another grant until the backoff has elapsed.
         g_backoff_frames = (g_backoff_frames == 0u)
                                ? kBackoffStartFrames
                                : g_backoff_frames * 2u;
         if (g_backoff_frames > kBackoffMaxFrames) {
             g_backoff_frames = kBackoffMaxFrames;
         }
-    } else if (g_backoff_frames > 0u) {
-        g_backoff_frames /= 2u;
+        g_next_grant_frame = g_frames + 1u + g_backoff_frames;
+        return;
     }
-    g_next_grant_frame = g_frames + 1u + g_backoff_frames;
+
+    if (g_backoff_frames > 0u) {
+        g_backoff_frames /= 2u;
+        g_next_grant_frame = g_frames + 1u + g_backoff_frames;
+        return;
+    }
+
+    // Cheap grant with no backoff pending: another one may run in this same
+    // frame as long as frame_budget_spent() still says there is room.
+    g_next_grant_frame = g_frames;
 }
 
 // Runs the stock grant for one definition that is known to be missing, then
@@ -520,9 +572,10 @@ inline bool grant_missing(void* registry, void* key, int32_t type,
     g_consecutive_failures = 0;
     ++g_grant_log;
     if (should_log(g_grant_log)) {
-        LOGI("23.1.3-hidden-items: granted %s '%s' (%" PRIu64 " us, next grant"
-             " in %" PRIu64 " frames)",
-             type_label(type), display_name(name), cost, g_backoff_frames + 1u);
+        LOGI("23.1.3-hidden-items: granted %s '%s' (%" PRIu64 " us, %" PRId32
+             " this frame, backoff %" PRIu64 " frames)",
+             type_label(type), display_name(name), cost, g_grants_this_frame,
+             g_backoff_frames);
     }
     return true;
 }
@@ -560,21 +613,20 @@ inline void begin_pass() {
 inline void finish_pass() {
     ++g_pass;
     LOGI("23.1.3-hidden-items: pass %" PRId32 " complete (seen=%" PRId32
-         " already owned=%" PRId32 " unobtainable=%" PRId32 " granted=%" PRId32
+         " already owned=%" PRId32 " wanted=%" PRId32 " granted=%" PRId32
          " left to the shop=%" PRId32 " failed=%" PRId32 ", worst grant %"
          PRIu64 " us)",
          g_pass, g_seen, g_already_owned, g_candidates, g_granted,
          g_offered_skipped, g_failed, g_worst_grant_us);
 
-    // Safety net: if not a single definition looked unobtainable even though
-    // the build clearly ships plenty, the catalogue assumption is wrong for
-    // this profile. Retry once granting everything, which is now paced and no
-    // longer freezes the menu, instead of silently doing nothing.
+    // Safety net: if not a single definition was selected even though the
+    // build clearly ships plenty, the catalogue assumption is wrong for this
+    // profile. Retry once granting everything, which is paced and no longer
+    // freezes the menu, instead of silently doing nothing.
     if (!g_grant_everything && g_candidates == 0 &&
         g_seen >= kFallbackMinDefinitions) {
-        LOGW("23.1.3-hidden-items: every one of the %" PRId32 " definitions is"
-             " offered by some catalogue, so nothing looked hidden; retrying"
-             " with the full inventory sweep",
+        LOGW("23.1.3-hidden-items: none of the %" PRId32 " definitions was"
+             " selected for a grant; retrying with the full inventory sweep",
              g_seen);
         g_grant_everything = true;
         g_stage = Stage::Idle;
@@ -584,9 +636,8 @@ inline void finish_pass() {
 
     const bool nothing_left = (g_granted == 0 && g_seen > 0);
     if (nothing_left || g_pass >= kMaxPasses) {
-        LOGI("23.1.3-hidden-items: hidden weapon, wear and gadget inventory"
-             " complete (%" PRId32 " granted in total, %" PRId32
-             " already owned)",
+        LOGI("23.1.3-hidden-items: weapon, wear and gadget inventory complete"
+             " (%" PRId32 " granted in total, %" PRId32 " already owned)",
              g_total_granted, g_already_owned);
         g_armed = false;
         return;
@@ -599,7 +650,7 @@ inline void finish_pass() {
 inline void advance_slot() {
     if (g_type_seen > 0) {
         LOGI("23.1.3-hidden-items: %s: %" PRId32 " definitions, %" PRId32
-             " already owned, %" PRId32 " unobtainable, %" PRId32 " granted",
+             " already owned, %" PRId32 " wanted, %" PRId32 " granted",
              type_label(kSweptTypes[g_slot]), g_type_seen, g_type_owned,
              g_type_hidden, g_type_granted);
     }
@@ -703,6 +754,9 @@ inline void run_sweep() {
     }
 
     const bool dump_type = kDumpGadgetIds && type == kTypeGadget;
+    // A type that is granted whole needs no catalogue lookup at all: the
+    // answer cannot change the decision.
+    const bool whole_type = grants_whole_type(type);
     int32_t checks = 0;
 
     while (g_cursor < total && checks < kChecksPerTick) {
@@ -713,12 +767,13 @@ inline void run_sweep() {
 
         const bool need_name = dump_type || owned == 0;
         const std::string name = need_name ? item_name(item) : std::string();
-        const int32_t offered = need_name ? is_offered(item) : -1;
-        const bool grant_it = (owned == 0) && wants_grant(offered, name);
+        const int32_t offered =
+            (need_name && (dump_type || !whole_type)) ? is_offered(item) : -1;
+        const bool grant_it = (owned == 0) && wants_grant(type, offered, name);
 
         // A grant is the only expensive step, so it waits for its budget. The
         // cursor stays put, and this definition is retried on a later frame.
-        if (grant_it && !grant_allowed_now()) return;
+        if (grant_it && (!grant_allowed_now() || frame_budget_spent())) return;
 
         ++g_seen;
         ++g_type_seen;
@@ -756,9 +811,11 @@ inline void run_sweep() {
         ++g_type_hidden;
         grant_missing(registry, key, type, name);
 
-        // One transaction per frame, whatever it cost.
         if (g_consecutive_failures >= kMaxConsecutiveFailures) break;
-        return;
+
+        // Cheap grants keep going inside this frame; the moment the frame
+        // budget is gone the sweep suspends here and resumes next frame.
+        if (frame_budget_spent()) return;
     }
 
     if (g_consecutive_failures >= kMaxConsecutiveFailures) {
@@ -846,17 +903,24 @@ inline bool install(uintptr_t il2cpp_base) {
     g_armed = true;
     g_installed = true;
     LOGI("23.1.3-hidden-items: armed: %s are granted through the stock item"
-         " inventory (max 1 transaction per menu frame, %" PRIu64 " us budget,"
-         " skins %s)",
-         g_grant_everything ? "every definition the build ships"
-                            : "definitions no shop or craft list offers",
-         kGrantBudgetUs, kIncludeSkins ? "included" : "excluded");
+         " inventory (%" PRIu64 " us budget and max %" PRId32 " transactions"
+         " per menu frame, skins %s)",
+         g_grant_everything
+             ? "every definition the build ships"
+             : (kGrantEveryWeapon
+                    ? "every weapon the build ships, plus wear and gadgets no"
+                      " shop or craft list offers"
+                    : "definitions no shop or craft list offers"),
+         kGrantBudgetUs, kGrantsPerFrameCap,
+         kIncludeSkins ? "included" : "excluded");
     return true;
 }
 
 inline void pump() {
     if (!g_installed) return;
     ++g_frames;
+    g_frame_spent_us = 0u;
+    g_grants_this_frame = 0;
     run_sweep();
 }
 
