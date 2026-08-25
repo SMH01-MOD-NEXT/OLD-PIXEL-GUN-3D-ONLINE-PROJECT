@@ -9,6 +9,7 @@
 #include "il2cpp.h"
 #include "live_content_2313.h"
 #include "log.h"
+#include "season_2313.h"
 #include "weapon_modules_2313.h"
 
 // Offline progression for the exact supplied 23.1.3 ARM64 libil2cpp.so:
@@ -39,23 +40,23 @@ constexpr uint64_t kWarmupFrames = 60;
 
 constexpr const char* kGlobalNs = "";
 constexpr const char* kProgressNs = "Progress";
-constexpr const char* kServiceClass = "东丝丂丄业丕且丙丑";
-constexpr const char* kServiceInstance = "丞丏业丐丒与业丗与";
-constexpr const char* kAddCurrency = "丄丝丄丙且丝丟上丒";
-constexpr const char* kWalletHolderClass = "与丅丟丈丕上东丟丁";
-constexpr const char* kWalletInstance = "万丒丗丅丆丗丗下三";
-constexpr const char* kWalletClass = "丁丞万上专上万丞丂";
-constexpr const char* kCoins = "丄业丛三丒丌专丈世";
-constexpr const char* kGems = "丗丛七丝专丄业不丂";
-constexpr const char* kWalletKeyed = "丐世东丑上丙丗丕丁";
+constexpr const char* kServiceClass = "\u4e1c\u4e1d\u4e02\u4e04\u4e1a\u4e15\u4e14\u4e19\u4e11";
+constexpr const char* kServiceInstance = "\u4e1e\u4e0f\u4e1a\u4e10\u4e12\u4e0e\u4e1a\u4e17\u4e0e";
+constexpr const char* kAddCurrency = "\u4e04\u4e1d\u4e04\u4e19\u4e14\u4e1d\u4e1f\u4e0a\u4e12";
+constexpr const char* kWalletHolderClass = "\u4e0e\u4e05\u4e1f\u4e08\u4e15\u4e0a\u4e1c\u4e1f\u4e01";
+constexpr const char* kWalletInstance = "\u4e07\u4e12\u4e17\u4e05\u4e06\u4e17\u4e17\u4e0b\u4e09";
+constexpr const char* kWalletClass = "\u4e01\u4e1e\u4e07\u4e0a\u4e13\u4e0a\u4e07\u4e1e\u4e02";
+constexpr const char* kCoins = "\u4e04\u4e1a\u4e1b\u4e09\u4e12\u4e0c\u4e13\u4e08\u4e16";
+constexpr const char* kGems = "\u4e17\u4e1b\u4e03\u4e1d\u4e13\u4e04\u4e1a\u4e0d\u4e02";
+constexpr const char* kWalletKeyed = "\u4e10\u4e16\u4e1c\u4e11\u4e0a\u4e19\u4e17\u4e15\u4e01";
 constexpr const char* kExperienceClass = "ExperienceController";
-constexpr const char* kLevel = "世丐丙丆业一丄丙丒";
-constexpr const char* kExperience = "丕三丙上丏与下与丟";
-constexpr const char* kAddExperience = "东丙丑万且专丞世丂";
+constexpr const char* kLevel = "\u4e16\u4e10\u4e19\u4e06\u4e1a\u4e00\u4e04\u4e19\u4e12";
+constexpr const char* kExperience = "\u4e15\u4e09\u4e19\u4e0a\u4e0f\u4e0e\u4e0b\u4e0e\u4e1f";
+constexpr const char* kAddExperience = "\u4e1c\u4e19\u4e11\u4e07\u4e14\u4e13\u4e1e\u4e16\u4e02";
 constexpr const char* kSharedController = "sharedController";
 constexpr const char* kBannerClass = "CheatDetectedBanner";
-constexpr const char* kBannerWipe = "丏万且丝上丙丐下丗";
-constexpr const char* kBannerKick = "丈且丁丞丛丅丄七上";
+constexpr const char* kBannerWipe = "\u4e0f\u4e07\u4e14\u4e1d\u4e0a\u4e19\u4e10\u4e0b\u4e17";
+constexpr const char* kBannerKick = "\u4e08\u4e14\u4e01\u4e1e\u4e1b\u4e05\u4e04\u4e03\u4e0a";
 constexpr const char* kMenuClass = "MainMenuController";
 constexpr const char* kMenuUpdate = "Update";
 
@@ -230,7 +231,7 @@ inline void add_experience(int32_t amount) {
 // stored experience as a per-level remainder: it subtracts the level
 // threshold on every level-up and then, at 0x01C7AFF4, executes
 //
-//     bl   0x01C79A50        ; 世丐丙丆业一丄丙丒()  -> level
+//     bl   0x01C79A50        ; \u4e16\u4e10\u4e19\u4e06\u4e1a\u4e00\u4e04\u4e19\u4e12()  -> level
 //     cmp  w0, #0x41         ; maxLevel (65)
 //     csel w26, w26, wzr, lt ; level < 65 ? remainder : 0
 //
@@ -239,7 +240,7 @@ inline void add_experience(int32_t amount) {
 // xp 0.
 //
 // At maxLevel the same entry point instead tail-branches to the max-level
-// overload 丏三万丕丂业专丌丏 (0x01C7B374), which reads the stored experience,
+// overload \u4e0f\u4e09\u4e07\u4e15\u4e02\u4e1a\u4e13\u4e0c\u4e0f (0x01C7B374), which reads the stored experience,
 // adds the requested amount and persists the sum through the Progress
 // service (0x01B4FD5C) with no level-up bookkeeping and no zeroing. So the
 // counter is filled by continuing to drive the *same* stock routine once the
@@ -306,6 +307,11 @@ inline void menu_update_hook(void* self, void* method) {
     // Same slot again, read-only: the content gate reports which live
     // content the offline ExpOpenSystem table still keeps closed.
     live_content_2313::pump_from_main_menu();
+    // Same slot, last in the chain and by far the rarest writer: the offline
+    // season hands out one weapon skin or graffiti at a time on a monotonic
+    // clock, so the cosmetics arrive as the player keeps playing instead of
+    // all at once.
+    season_2313::pump_from_main_menu();
 }
 
 inline bool install() {
