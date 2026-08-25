@@ -7,9 +7,24 @@
 // <app data>/files/opg3d-backend/state.kv. Nothing here touches PlayerPrefs:
 // this build encrypts every pref through CryptoPlayerPrefsManager (salt +
 // Rijndael + XOR), so the plaintext key of a pref never exists at runtime and
-// hooking PlayerPrefs by key name can never match. The account id therefore
-// lives here and is handed to the game the only way the game accepts it: as
-// the answer of the (now local) authentication endpoint.
+// hooking PlayerPrefs by key name can never match.
+//
+// Who owns the account id
+// -----------------------
+// The game does. Because the pref that holds the id is encrypted, this port
+// can neither read nor overwrite it, so the id the player sees on screen is
+// always the id the game itself keeps. The game does however send that id with
+// every authentication call (auth_v2/?id_player=...), so the local backend
+// adopts what the game presents and stores it here. An id is minted locally
+// only when the game presents none at all, which is what a genuinely fresh
+// install looks like, and such an id is provisional: the first authentication
+// that names a real account replaces it.
+//
+// The previous revision minted an id unconditionally and the auth route
+// answered with it while ignoring the request, so the game kept its own id and
+// state.kv held a different one. That is the reported "the game shows 35...,
+// the file holds something else" mismatch, and it could never converge on its
+// own.
 //
 // Format: one "key\tvalue" line per entry, with \\, \n, \r and \t escaped, so
 // JSON blobs can be stored verbatim as values. Writes go through a temporary
@@ -43,10 +58,16 @@ constexpr const char* kDirName = "opg3d-backend";
 constexpr const char* kFileName = "state.kv";
 constexpr size_t kMaxStateBytes = 8u * 1024u * 1024u;
 
-// Exactly nine digits, never a leading zero: the shape the old account service
-// handed out, and the shape every id_player parser in this build accepts.
+// Minting shape: exactly nine digits, never a leading zero - the shape the old
+// account service handed out to a brand new account.
 constexpr uint32_t kIdFirst = 100000000u;
 constexpr uint32_t kIdSpan = 900000000u;
+
+// Accepting shape: any plausible account id, because an id that comes from the
+// game is not necessarily nine digits wide. The ids this build carries are ten
+// digits ("35..."), and a nine-digit-only check silently rejected them.
+constexpr size_t kIdMinDigits = 5u;
+constexpr size_t kIdMaxDigits = 18u;
 
 inline pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 inline std::map<std::string, std::string> g_values;
@@ -54,7 +75,7 @@ inline std::string g_dir;
 inline std::string g_file;
 inline bool g_loaded = false;
 inline bool g_persistent = false;
-inline char g_id[16] = {};
+inline char g_id[24] = {};
 inline char g_session[33] = {};
 
 struct Guard {
@@ -280,13 +301,32 @@ inline uint64_t whiten(uint64_t seed) {
     return z ^ (z >> 31);
 }
 
+// Digits only, no leading zero, plausible width. Deliberately wider than the
+// minting shape so an id that arrives from the game is accepted as it is
+// rather than replaced by one of ours.
 inline bool looks_like_id(const std::string& text) {
-    if (text.size() != 9u) return false;
+    if (text.size() < kIdMinDigits || text.size() > kIdMaxDigits) return false;
     if (text[0] < '1' || text[0] > '9') return false;
     for (size_t i = 1u; i < text.size(); ++i) {
         if (text[i] < '0' || text[i] > '9') return false;
     }
     return true;
+}
+
+// Trims the padding a query string or a form field can carry, then applies the
+// shape test. An empty result means "this is not an account id", which is what
+// the "?id_player=1" an unregistered client sends comes back as.
+inline std::string normalize(const std::string& raw) {
+    const auto strip = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' ||
+               c == '\'';
+    };
+    size_t start = 0u;
+    size_t end = raw.size();
+    while (start < end && strip(raw[start])) ++start;
+    while (end > start && strip(raw[end - 1u])) --end;
+    const std::string trimmed = raw.substr(start, end - start);
+    return looks_like_id(trimmed) ? trimmed : std::string();
 }
 
 inline std::string get_locked(const std::string& key, const char* fallback) {
@@ -305,6 +345,13 @@ inline void set_locked(const std::string& key, const std::string& value) {
 }  // namespace detail
 
 // ---------------------------------------------------------------- public API
+
+// What happened to an id the game presented.
+enum class Adoption {
+    kRejected,   // not an account id (empty, a placeholder such as "1", ...)
+    kUnchanged,  // already the stored id
+    kAdopted,    // the stored id was replaced by the presented one
+};
 
 inline std::string get(const char* key, const char* fallback = "") {
     if (key == nullptr) return std::string();
@@ -360,8 +407,18 @@ inline int64_t add_int(const char* key, int64_t delta, int64_t fallback) {
     return current;
 }
 
-// The account id of this device. Minted once, reused by every later launch,
-// and regenerated only when the player wipes the game data.
+// "" when the text is not an account id, the trimmed id otherwise.
+inline std::string normalize_id(const std::string& raw) {
+    return detail::normalize(raw);
+}
+
+inline bool id_shaped(const std::string& raw) {
+    return !detail::normalize(raw).empty();
+}
+
+// The account id this device answers for. Adopted from the game on the first
+// authentication, reused by every later launch, and regenerated only when the
+// player wipes the game data.
 inline const char* player_id() {
     if (detail::g_id[0] != '\0') return detail::g_id;
     detail::Guard guard;
@@ -371,7 +428,9 @@ inline const char* player_id() {
     const std::string stored = detail::get_locked("id_player", "");
     if (detail::looks_like_id(stored)) {
         std::snprintf(detail::g_id, sizeof(detail::g_id), "%s", stored.c_str());
-        LOGI("23.1.3-backend-store: reusing local account id %s", detail::g_id);
+        LOGI("23.1.3-backend-store: reusing local account id %s (source '%s')",
+             detail::g_id,
+             detail::get_locked("id_player_source", "minted").c_str());
         return detail::g_id;
     }
     const uint32_t minted =
@@ -379,9 +438,61 @@ inline const char* player_id() {
         static_cast<uint32_t>(detail::whiten(detail::random64()) % detail::kIdSpan);
     std::snprintf(detail::g_id, sizeof(detail::g_id), "%" PRIu32, minted);
     detail::set_locked("id_player", detail::g_id);
-    LOGI("23.1.3-backend-store: minted local account id %s (no backend"
-         " round-trip)", detail::g_id);
+    detail::set_locked("id_player_source", "minted");
+    LOGI("23.1.3-backend-store: minted the provisional account id %s; the"
+         " first authentication that names a real account replaces it",
+         detail::g_id);
     return detail::g_id;
+}
+
+// "client" once an id was adopted from the game, "minted" while the id is
+// still the provisional one this port generated.
+inline std::string player_id_source() {
+    const std::string stored = get("id_player_source", "");
+    return stored.empty() ? std::string("minted") : stored;
+}
+
+// Binds this device's state to the id the game says it is running as.
+//
+// This is the only direction that can work on this build: the pref that holds
+// the game's id is encrypted, so it cannot be read or rewritten from here, and
+// an authentication answer naming a different id leaves the game on its own
+// id. Following the game instead makes the id on screen and the id in
+// state.kv the same account by construction.
+inline Adoption adopt_player_id(const std::string& presented) {
+    const std::string candidate = detail::normalize(presented);
+    if (candidate.empty()) return Adoption::kRejected;
+
+    detail::Guard guard;
+    detail::load_locked();
+    detail::set_locked("id_player_presented", candidate);
+
+    const std::string current = detail::get_locked("id_player", "");
+    if (current == candidate) {
+        if (detail::g_id[0] == '\0') {
+            std::snprintf(detail::g_id, sizeof(detail::g_id), "%s",
+                          candidate.c_str());
+        }
+        detail::set_locked("id_player_source", "client");
+        return Adoption::kUnchanged;
+    }
+
+    detail::set_locked("id_player", candidate);
+    detail::set_locked("id_player_source", "client");
+    if (!current.empty()) detail::set_locked("id_player_previous", current);
+    std::snprintf(detail::g_id, sizeof(detail::g_id), "%s", candidate.c_str());
+
+    // A nickname derived from the replaced id would keep naming an account that
+    // never existed, so it is dropped and derived again on the next read. A
+    // nickname the player chose is left alone.
+    if (detail::get_locked("nick_auto", "") == "1") {
+        detail::set_locked("nick", "");
+    }
+
+    LOGI("23.1.3-backend-store: adopted the account id the game presented"
+         " (%s -> %s); state.kv now names the account the game shows",
+         current.empty() ? "none" : current.c_str(), candidate.c_str());
+    return Adoption::kAdopted;
 }
 
 // Session token of this process run. Regenerated per launch, exactly like the
@@ -405,6 +516,7 @@ inline std::string nickname() {
     const char* tail = length > 4u ? id + (length - 4u) : id;
     stored = std::string("Player") + tail;
     set("nick", stored);
+    set("nick_auto", "1");
     return stored;
 }
 

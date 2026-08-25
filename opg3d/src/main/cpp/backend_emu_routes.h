@@ -10,12 +10,14 @@
 //
 // Two deliberate choices
 // ----------------------
-//   * the account id is served from here, not from a PlayerPrefs hook. This
-//     build encrypts every pref (CryptoPlayerPrefsManager: salt + Rijndael +
-//     XOR), so a plaintext pref key never exists at runtime and a key-name
-//     hook can never match. The authentication answer is the one place the
-//     game itself accepts an id from, which is why the earlier approach did
-//     not take and this one does;
+//   * the account id is read out of the authentication request rather than
+//     dictated to the game. This build encrypts every pref
+//     (CryptoPlayerPrefsManager: salt + Rijndael + XOR), so the id the game
+//     runs as can neither be read nor rewritten from here, and an answer that
+//     names a different id simply loses: the game keeps its own. The game does
+//     send that id with every call (auth_v2/?id_player=...), so the local
+//     backend adopts it and binds its own state to it. That is what makes the
+//     id on screen and the id in state.kv the same account;
 //   * unknown endpoints are answered by a permissive generic payload instead
 //     of failing. A miss then costs a warning line in logcat naming the exact
 //     host and path, which is what the next iteration needs in order to give
@@ -42,6 +44,17 @@ namespace detail {
 
 using backend_emu_http::Request;
 using backend_emu_http::Response;
+
+constexpr uint64_t kLogBurst = 8u;
+constexpr uint64_t kLogPeriod = 64u;
+
+inline uint64_t g_auth_without_id = 0u;
+inline uint64_t g_auth_lan = 0u;
+inline uint64_t g_auth_kept = 0u;
+
+inline bool should_log(uint64_t counter) {
+    return counter <= kLogBurst || (counter % kLogPeriod) == 0u;
+}
 
 // ---------------------------------------------------------------- JSON tools
 
@@ -122,14 +135,86 @@ inline bool handle_time(const Request& request, Response& response) {
 
 // ------------------------------------------------------------------- account
 
-// The identity handshake. This is where the account id enters the game.
+// Every spelling of the id field the retired services accepted. Request::param
+// looks in the query string first and then in the body, so an urlencoded
+// WWWForm and a multipart one are both covered.
+constexpr const char* kIdAliases[] = {
+    "id_player", "player_id", "user_id", "account_id", "id_user", "uid", "id",
+};
+
+// The id the game itself is running as, or "" when it presented none. The
+// "?id_player=1" an unregistered client sends fails the shape test, so it is
+// correctly reported as "no id" instead of being adopted as account 1.
+inline std::string presented_id(const Request& request) {
+    for (const char* alias : kIdAliases) {
+        const std::string raw = request.param(alias, "");
+        if (raw.empty()) continue;
+        const std::string candidate = backend_emu_store::normalize_id(raw);
+        if (!candidate.empty()) return candidate;
+    }
+    return std::string();
+}
+
+// Only this device may rewrite this device's account. On a LAN host the peers
+// are other players, and adopting their ids would hand the host's state to
+// whoever authenticated last.
+inline bool from_this_device(const Request& request) {
+    if (request.peer.empty()) return true;
+    if (request.peer == "::1") return true;
+    return request.peer.compare(0u, 4u, "127.") == 0;
+}
+
+// The identity handshake, and the one place the two sides of the account id
+// meet: whatever the game presents here becomes the id this backend answers
+// for, so the id on screen and the id in state.kv cannot drift apart.
 inline bool handle_auth(const Request& request, Response& response) {
-    const std::string id = backend_emu_store::player_id();
+    const std::string presented = presented_id(request);
+    const bool local = from_this_device(request);
+
+    std::string id;
+    if (!presented.empty() && local) {
+        const backend_emu_store::Adoption outcome =
+            backend_emu_store::adopt_player_id(presented);
+        id = backend_emu_store::player_id();
+        if (outcome == backend_emu_store::Adoption::kUnchanged) {
+            ++g_auth_kept;
+            if (should_log(g_auth_kept)) {
+                LOGI("23.1.3-backend-auth: the game authenticated as"
+                     " id_player=%s, which is already the stored account"
+                     " (confirmation #%" PRIu64 ")", id.c_str(), g_auth_kept);
+            }
+        }
+    } else if (!presented.empty()) {
+        // A LAN client: answer about its own account and leave ours untouched.
+        id = presented;
+        ++g_auth_lan;
+        if (should_log(g_auth_lan)) {
+            LOGI("23.1.3-backend-auth: LAN client %s authenticated as"
+                 " id_player=%s; this host keeps its own id %s"
+                 " (request #%" PRIu64 ")", request.peer.c_str(), id.c_str(),
+                 backend_emu_store::player_id(), g_auth_lan);
+        }
+    } else {
+        // No id presented: a fresh install. Offer the stored one, which the
+        // game is free to take.
+        id = backend_emu_store::player_id();
+        ++g_auth_without_id;
+        if (should_log(g_auth_without_id)) {
+            LOGI("23.1.3-backend-auth: the game presented no account id"
+                 " (target '%s'); it was offered the stored id %s, source"
+                 " '%s' (request #%" PRIu64 ")", request.target.c_str(),
+                 id.c_str(), backend_emu_store::player_id_source().c_str(),
+                 g_auth_without_id);
+        }
+    }
+
     const std::string session = backend_emu_store::session_token();
     const std::string nick = backend_emu_store::nickname();
 
     const int64_t logins = backend_emu_store::add_int("logins", 1, 0);
-    const bool first_login = logins <= 1;
+    // A game that presents an id is not a new player, whatever the login
+    // counter says.
+    const bool first_login = logins <= 1 && presented.empty();
 
     std::string body("{");
     body += envelope();
@@ -160,7 +245,6 @@ inline bool handle_auth(const Request& request, Response& response) {
              " (nick '%s'); the retired account service is never contacted",
              id.c_str(), nick.c_str());
     }
-    (void)request;
     return true;
 }
 
@@ -278,7 +362,9 @@ inline bool handle_matchmaking(const Request& request, Response& response) {
 // --------------------------------------------------------------- diagnostics
 
 // Not a game endpoint: a status page for the port itself, reachable from the
-// device or from any LAN client at http://<host>:<port>/opg3d/status.
+// device or from any LAN client at http://<host>:<port>/opg3d/status. The id
+// fields are the fastest way to confirm that the account the game shows and
+// the account on disk are the same one.
 inline bool handle_status(const Request& request, Response& response) {
     (void)request;
     std::string body("{");
@@ -290,6 +376,12 @@ inline bool handle_status(const Request& request, Response& response) {
     body += "," + number_member(
                       "served", static_cast<int64_t>(backend_emu_http::served()));
     body += "," + text_member("id_player", backend_emu_store::player_id());
+    body += "," + text_member("id_player_source",
+                              backend_emu_store::player_id_source());
+    body += "," + text_member("id_player_presented",
+                              backend_emu_store::get("id_player_presented", ""));
+    body += "," + text_member("id_player_previous",
+                              backend_emu_store::get("id_player_previous", ""));
     body += "," + text_member("nick", backend_emu_store::nickname());
     body += "," + text_member("state_dir", backend_emu_store::directory());
     body += "}";
