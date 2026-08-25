@@ -6,9 +6,6 @@
 #include <pthread.h>
 #include <unistd.h>
 
-// maps_unlock_2313.h is deliberately not included. See
-// docs/PORT_23_1_3_STARTUP_CRASH.md: the module is withdrawn, not merely
-// unmerged, and the header stays in the tree only as reference material.
 #include "assets_data_2313.h"
 #include "backend_emu_2313.h"
 #include "backend_local_2313.h"
@@ -146,12 +143,6 @@ void* init_thread(void*) {
     const bool lobby_catalog   = lobby_catalog_2313::install_hooks();
     const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     const bool hidden_items    = hidden_items_2313::install_hooks(base);
-    // maps_unlock_2313::install_hooks() is intentionally absent. It appends
-    // every shipped scene into every mode bucket, and the 2026-08-25 tombstone
-    // puts a fatal SIGSEGV inside UnityEngine.Object.Instantiate called from
-    // the InitializeSwitcher coroutine -- the same startup step that walks
-    // those scene lists. Read docs/PORT_23_1_3_STARTUP_CRASH.md before
-    // re-arming it, and re-arm it on its own build so it can be bisected.
     const bool local_identity   = identity_2313::install_hooks();
     const bool assets_payload   = assets_data_2313::install_hooks(base);
     const bool net_stall        = net_stall_guard_2313::install_hooks();
@@ -163,9 +154,9 @@ void* init_thread(void*) {
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&
-        lobby_catalog && weapon_modules && hidden_items &&
-        local_identity && assets_payload && net_stall && post_match &&
-        online_state && battle_ui && rank_ui && bots_trace && backend_emu) {
+        lobby_catalog && weapon_modules && hidden_items && local_identity &&
+        assets_payload && net_stall && post_match && online_state &&
+        battle_ui && rank_ui && bots_trace && backend_emu) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "

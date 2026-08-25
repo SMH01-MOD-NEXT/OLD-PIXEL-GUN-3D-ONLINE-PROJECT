@@ -2,8 +2,7 @@
 
 Two consecutive launches on a freshly wiped profile died about 5.5-6 s after
 process start, i.e. while the loading bar was still on screen. This note records
-what the tombstone proves, what it does not, and why `maps_unlock_2313` is no
-longer installed.
+what the tombstone proves and what it does not.
 
 ## Tombstone facts
 
@@ -27,6 +26,10 @@ Both are the signature of a **dangling or already-released managed object being
 used as a live reference**, not of a null dereference (a null would surface as a
 managed exception, not `SEGV_MAPERR`).
 
+Both crashes are byte-identical in `x0`, `x2`, `x7` and fault address, and they
+come from two different APK installs, so this is a deterministic clean-profile
+startup path rather than a race.
+
 ## Symbolized stack
 
 `libil2cpp.so` frames resolved against `dump2313.cs` by nearest preceding RVA.
@@ -35,13 +38,13 @@ Frames `#0`-`#13` were not captured, so the exact fault instruction is unknown.
 | # | Module | Symbol |
 | --- | --- | --- |
 | 33-43 | libunity | player loop / JNI entry |
-| 31-32 | libil2cpp | unresolved (RVA gap) |
+| 31-32 | libil2cpp | unresolved (below the dump's lowest RVA) |
 | 30 | libil2cpp | `UnityEngine.SetupCoroutine.InvokeMoveNext + 0xd4` |
 | 29 | **libopg3d** | `startup_trace_2313::hook_sw_start + 200` |
 | 28 | libil2cpp | `Switcher.<Start iterator>.MoveNext + 0x194` |
 | 27 | **libopg3d** | `startup_trace_2313::hook_sw_init + 320` |
 | 26 | libil2cpp | `Switcher.<InitializeSwitcher iterator>.MoveNext + 0x2b88` |
-| 25 | libil2cpp | unresolved (RVA gap) |
+| 25 | libil2cpp | unresolved (landed in an RVA gap) |
 | 24 | libil2cpp | `UnityEngine.Object.Instantiate(Object, Vector3, Quaternion) + 0x104` |
 | 23 | libil2cpp | `UnityEngine.Object.Internal_InstantiateSingle + 0x84` |
 | 14-22 | libunity | `Instantiate` internals (clone / serialization walk) |
@@ -59,7 +62,8 @@ Frames `#0`-`#13` were not captured, so the exact fault instruction is unknown.
 3. `hidden_items_2313` is **not** on the stack and cannot be. It performs no
    managed work at install time and is pumped from
    `MainMenuController.Update` starting at menu frame `kWarmupFrames`, which is
-   reached only after the main menu scene exists. The weapon sweep never ran.
+   reached only after the main menu scene exists. The weapon sweep never ran,
+   so this tombstone is not evidence about the sweep either way.
 
 ### What this does not prove
 
@@ -69,29 +73,30 @@ cannot be inspected (`dump2313.cs` is declaration-only and no aarch64
 disassembler is available), so the culprit is reasoned about from what the step
 consumes rather than observed.
 
-## Why maps_unlock_2313 is no longer installed
+## maps_unlock_2313
 
-The maps work was withdrawn after it crashed the game, but only the pull request
-was withdrawn: `maps_unlock_2313::install_hooks()` was still called from
-`main.cpp` on `23.1.3`, so every build cut from that branch still ran it.
+The module is gone from `23.1.3`: the header is deleted and `main.cpp` is back
+to its pre-maps content. Recorded here because it was the leading suspect and
+because the earlier withdrawal removed only the pull request, leaving
+`maps_unlock_2313::install_hooks()` live in `main.cpp` on the base branch for a
+while -- so builds cut in that window still ran it even though the change looked
+reverted.
 
-That module hooks the `SceneInfoController` per-mode bucket getters and, with
-`kOpenEveryMode = true`, appends every entry of `allScenes` into every mode's
-`avaliableScenes`. Startup walks those lists and instantiates per-map objects
-from them. Scenes that a mode never advertised can carry asset references that
-were never resolved or whose bundle is not loaded, which is exactly how a
-released native object reaches `Instantiate`. That makes it the leading suspect
-for this tombstone, consistent with the earlier report that the maps build
-crashed.
+Why it was the leading suspect: with `kOpenEveryMode = true` it appends every
+entry of `allScenes` into every mode's `avaliableScenes`, and startup walks
+those lists and instantiates per-map objects from them. Scenes a mode never
+advertised can carry asset references that were never resolved or whose bundle
+is not loaded, which is one way a released native object reaches `Instantiate`.
+That is consistent with the earlier report that the maps build crashed, but it
+was never confirmed against a capture that includes the faulting frames.
 
-The include and the install call are removed. `maps_unlock_2313.h` stays in the
-tree as reference material; nothing compiles it, because it is header-only and
-no translation unit includes it.
+If the module is ever re-armed, do it on its own build so it can be bisected,
+and start from `kOpenEveryMode = false` with `kClearUnlockLevels = false`.
 
 ## Confirming on device
 
-After this change the loading bar should complete. If it still dies at the same
-place, the next build needs two things the current capture lacks:
+Without the module the loading bar should complete. If it still dies at the same
+place, the next capture needs two things the current one lacks:
 
 ```sh
 # 1. the OPG3D log around the crash -- the last line pins the exact step
