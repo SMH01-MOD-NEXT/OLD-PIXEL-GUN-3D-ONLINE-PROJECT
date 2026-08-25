@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v4, fast bulk sweep
+// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v5, wear included
 //
 // v1 granted every definition the build ships, one full stock inventory
 // transaction at a time, and locked the main menu up for minutes on the first
@@ -37,10 +37,28 @@
 //  4. The sweep starts earlier (kWarmupFrames), so it overlaps the time the
 //     player spends reading the main menu instead of starting after it.
 //
-// Expected shape on device: ~800 weapon transactions at 15-40 ms each, 3-8 per
-// frame, so the arsenal completes in single-digit seconds rather than tens of
-// minutes. The progress log prints a running rate so this can be checked
-// instead of assumed.
+// v5 extends that treatment from weapons to wear. Until now armor, masks,
+// hats, boots and capes were still filtered by v2's rule "grant only what
+// nothing offers", and the craft screen is exactly what that rule excludes: a
+// wear piece priced at 250 gears *is* offered, by the craft list, so the sweep
+// deliberately walked past it and left the player to pay. That is the same
+// mistake the weapon filter made, so kGrantEveryWear now grants every wear
+// definition the build ships, catalogue or not.
+//
+// Cost of that decision: wear is a wider catalogue than weapons (five types,
+// much of it seasonal), so the bulk pass grows from roughly 800 transactions
+// to a few thousand. At the 15-40 ms per transaction v4 measured, that is on
+// the order of ten seconds of reduced frame rate on the main menu rather than
+// the few seconds v4 needed. The progress log reports the real figure instead
+// of this estimate.
+//
+// One thing gets cheaper per definition: a type that is granted whole needs no
+// catalogue lookup at all, because the answer cannot change the decision. In
+// v4 every wear definition paid for an is_offered() call whose only effect was
+// to skip it.
+//
+// Gadgets keep the catalogue filter and skins stay opt-in (kIncludeSkins):
+// neither was asked for, and both are a one-line flip if that changes.
 //
 // Where the time goes (BL scan of the shipped ARM64 code):
 //
@@ -66,8 +84,11 @@
 // List<丑一丘与丁丄专专专> (for instance Progress.东丝丂丄业丕且丙丑::专与丁丞丂丁丐与丝(enum) at
 // 0x1B4B0E0), and List<T>.GetRange(0, 0) on any of them yields a fresh, empty,
 // correctly typed list that we own outright. That is the next step; it needs a
-// device to validate the borrow source, so v4 deliberately ships the pacing fix
-// first, on code paths that are already known to work on the target hardware.
+// device to validate the borrow source, so v4 deliberately shipped the pacing
+// fix first, on code paths already known to work on the target hardware. v5
+// keeps that decision, and widening the sweep to wear makes the batch call more
+// valuable rather than less: it multiplies the number of transactions without
+// changing what any one of them costs.
 //
 // Also kept: a targeted find-by-id probe 与丒丅丝丕丕丒丟丆(OfferItemType, string) at
 // 0x3060088 reaches definitions the per-type enumeration may not list, and the
@@ -173,11 +194,23 @@ constexpr bool kIncludeSkins = false;
 // to own the whole arsenal, not only the parts nothing else sells.
 constexpr bool kGrantEveryWeapon = true;
 
-// Set to true to restore the v1 behaviour for *every* item type (wear,
-// gadgets and, if enabled, skins included), now paced. The driver also flips
-// this on by itself for one retry if the unobtainable-only filter selects
-// nothing at all, so a wrong assumption about the catalogue degrades into
-// "slower but complete" instead of "does nothing".
+// The same for wear: armor, masks, hats, boots and capes. These are what the
+// craft screen prices at 250 gears each, so the catalogue filter classified
+// them as "offered, leave them to the shop" and the sweep walked straight past
+// them -- which is why the arsenal filled up while the wardrobe stayed empty.
+// On a private server owning the whole wardrobe is the point, exactly as it is
+// for the whole arsenal.
+//
+// Gadgets are deliberately not included here: they were not asked for, and the
+// gadget catalogue is also where the one-shot id dump below is still doing
+// useful diagnostic work.
+constexpr bool kGrantEveryWear = true;
+
+// Set to true to restore the v1 behaviour for *every* item type (gadgets and,
+// if enabled, skins included), now paced. The driver also flips this on by
+// itself for one retry if the unobtainable-only filter selects nothing at all,
+// so a wrong assumption about the catalogue degrades into "slower but
+// complete" instead of "does nothing".
 constexpr bool kGrantEverything = false;
 constexpr int32_t kFallbackMinDefinitions = 64;
 
@@ -220,11 +253,20 @@ constexpr int32_t kTypeCape = 60;
 constexpr int32_t kTypeSkin = 65;
 constexpr int32_t kTypeGadget = 70;
 
-// Weapons first: they are the bulk of the work and the reason the sweep
-// exists, so they should land while the player is still on the main menu.
+// The five wear slots. A predicate rather than a table because it is asked
+// once per definition inside the sweep loop.
+inline bool is_wear_type(int32_t type) {
+    return type == kTypeArmor || type == kTypeMask || type == kTypeHat ||
+           type == kTypeBoots || type == kTypeCape;
+}
+
+// Weapons first, then the five wear slots: those are the two groups that are
+// granted whole, so they are both the bulk of the work and the part the player
+// checks first. Gadgets and skins follow because they are filtered (cheap)
+// rather than granted whole.
 constexpr int32_t kSweptTypes[] = {
-    kTypeWeapon, kTypeGadget, kTypeArmor, kTypeMask,
-    kTypeHat,    kTypeBoots,  kTypeCape,  kTypeSkin,
+    kTypeWeapon, kTypeArmor, kTypeMask,   kTypeHat,
+    kTypeBoots,  kTypeCape,  kTypeGadget, kTypeSkin,
 };
 constexpr int32_t kSweptTypeCount =
     static_cast<int32_t>(sizeof(kSweptTypes) / sizeof(kSweptTypes[0]));
@@ -523,13 +565,37 @@ inline int32_t is_offered(void* item) {
     return g_catalog_entry(item, nullptr) != nullptr ? 1 : 0;
 }
 
-// Weapons are granted in full (v1 behaviour, restored on purpose). For every
-// other type the catalogue filter stays: definitions the player can already
-// buy or craft are left alone, because granting them is what made v1 take
-// minutes and it was never the point for wear and gadgets.
+// Weapons and wear are granted in full: the v1 behaviour, restored on purpose
+// for both. Gadgets keep the catalogue filter, so definitions the player can
+// already buy or craft are left alone there -- granting absolutely everything
+// is what made v1 take minutes, and gadgets were not what was asked for.
+//
+// This predicate is also what makes the wider v5 sweep cheaper per definition
+// than the filtered v4 one: a type that is granted whole needs no catalogue
+// lookup, because the answer cannot change the decision.
 inline bool grants_whole_type(int32_t type) {
     if (g_grant_everything) return true;
-    return kGrantEveryWeapon && type == kTypeWeapon;
+    if (kGrantEveryWeapon && type == kTypeWeapon) return true;
+    if (kGrantEveryWear && is_wear_type(type)) return true;
+    return false;
+}
+
+// Human-readable form of the above, for the arm line.
+inline const char* grant_scope_label() {
+    if (g_grant_everything) return "every definition the build ships";
+    if (kGrantEveryWeapon && kGrantEveryWear) {
+        return "every weapon and every wear piece the build ships, plus gadgets"
+               " no shop or craft list offers";
+    }
+    if (kGrantEveryWeapon) {
+        return "every weapon the build ships, plus wear and gadgets no shop or"
+               " craft list offers";
+    }
+    if (kGrantEveryWear) {
+        return "every wear piece the build ships, plus weapons and gadgets no"
+               " shop or craft list offers";
+    }
+    return "definitions no shop or craft list offers";
 }
 
 inline bool wants_grant(int32_t type, int32_t offered,
@@ -975,15 +1041,9 @@ inline bool install(uintptr_t il2cpp_base) {
          " us and max %" PRId32 " transactions per frame, steady state %"
          PRIu64 " us and %" PRId32 ", backoff only above %" PRIu64
          " us, skins %s)",
-         g_grant_everything
-             ? "every definition the build ships"
-             : (kGrantEveryWeapon
-                    ? "every weapon the build ships, plus wear and gadgets no"
-                      " shop or craft list offers"
-                    : "definitions no shop or craft list offers"),
-         kWarmupFrames, kBurstBudgetUs, kBurstGrantsPerFrame, kGrantBudgetUs,
-         kGrantsPerFrameCap, kGrantStallUs,
-         kIncludeSkins ? "included" : "excluded");
+         grant_scope_label(), kWarmupFrames, kBurstBudgetUs,
+         kBurstGrantsPerFrame, kGrantBudgetUs, kGrantsPerFrameCap,
+         kGrantStallUs, kIncludeSkins ? "included" : "excluded");
     return true;
 }
 
