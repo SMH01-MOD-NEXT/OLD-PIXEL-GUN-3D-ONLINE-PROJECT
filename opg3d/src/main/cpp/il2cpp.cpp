@@ -102,6 +102,14 @@ bool resolve() {
     // blocks degrade to the same "not found" warning they produced before.
     bind(class_get_nested_types, "il2cpp_class_get_nested_types");
     bind(class_get_name,         "il2cpp_class_get_name");
+
+    // Optional for the same reason: only the PixelPass season construction
+    // path allocates a managed object or needs a reflection Type. Every caller
+    // checks these for null before use, so a layout without them loses the
+    // battle pass and nothing else.
+    bind(object_new,      "il2cpp_object_new");
+    bind(class_get_type,  "il2cpp_class_get_type");
+    bind(type_get_object, "il2cpp_type_get_object");
     return ok;
 }
 

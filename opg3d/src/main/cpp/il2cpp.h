@@ -36,6 +36,25 @@ inline const char* (*class_get_name)(void* klass) = nullptr;
 inline void*       (*object_get_class)(void* object) = nullptr;
 inline void        (*field_get_value)(void* object, void* field, void* value) = nullptr;
 
+// Managed allocation and reflection Type lookup.
+//
+// These three are bound outside the required set (see resolve()), because only
+// the PixelPass season path needs them: a layout without them still installs
+// every other hook instead of failing the whole library.
+//
+// il2cpp_object_new allocates a zeroed instance and does NOT run any
+// constructor -- the .ctor has to be invoked separately, exactly the way the
+// `newobj` IL instruction does it. Calling a managed .ctor on an object that
+// was never allocated by the runtime would corrupt the heap, so these two
+// always travel together.
+//
+// class_get_type + type_get_object turn an Il2CppClass* into the managed
+// System.Type object that reflection-shaped APIs such as
+// JsonConvert.DeserializeObject(string, Type) expect.
+inline void*       (*object_new)(void* klass) = nullptr;
+inline const void* (*class_get_type)(void* klass) = nullptr;
+inline void*       (*type_get_object)(const void* type) = nullptr;
+
 // In the old embedding IL2CPP API the third argument of
 // il2cpp_field_set_value has an asymmetric ABI: for value types it is a
 // pointer to the value, while for managed references (string/class/object/
