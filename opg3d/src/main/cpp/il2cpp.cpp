@@ -20,6 +20,10 @@ constexpr size_t kMaxAssemblies = 8192u;
 // hands back an inconsistent iterator.
 constexpr size_t kMaxNestedTypes = 4096u;
 
+// Upper bound for one method walk. The largest classes in this build hold a
+// few hundred methods; the cap only guarantees termination.
+constexpr size_t kMaxClassMethods = 8192u;
+
 template <typename T>
 bool bind(T& fn, const char* name) {
     if (fn != nullptr) return true;
@@ -102,6 +106,10 @@ bool resolve() {
     // blocks degrade to the same "not found" warning they produced before.
     bind(class_get_nested_types, "il2cpp_class_get_nested_types");
     bind(class_get_name,         "il2cpp_class_get_name");
+
+    // Optional for the same reason: only overload-exact lookup needs the method
+    // walk, and every caller keeps a fallback that does not use it.
+    bind(class_get_methods, "il2cpp_class_get_methods");
 
     // Optional for the same reason: only the PixelPass season construction
     // path allocates a managed object or needs a reflection Type. Every caller
@@ -194,6 +202,37 @@ void* find_method_info(const char* namespaze, const char* klass,
     void* type = find_class(namespaze, klass);
     if (type == nullptr) return nullptr;
     return class_get_method_from_name(type, method, args_count);
+}
+
+void* find_method_by_address(void* klass, void* address) {
+    if (klass == nullptr || address == nullptr ||
+        class_get_methods == nullptr) {
+        return nullptr;
+    }
+
+    // Nudge the class through initialization before walking its method list.
+    // GetMethodFromName() populates the method table as a side effect; the
+    // result is deliberately ignored, and a name that does not exist is
+    // harmless because the lookup still walks the table. Neither call runs a
+    // managed static constructor, so this keeps the contract of this file.
+    if (class_get_method_from_name != nullptr) {
+        (void)class_get_method_from_name(klass, ".ctor", 0);
+    }
+
+    void* iter = nullptr;
+    for (size_t guard = 0; guard < kMaxClassMethods; ++guard) {
+        void* method = class_get_methods(klass, &iter);
+        if (method == nullptr) break;
+        if (method_pointer(method) == address) return method;
+    }
+    return nullptr;
+}
+
+void* find_method_by_address(const char* namespaze, const char* klass,
+                             void* address) {
+    void* type = find_class(namespaze, klass);
+    if (type == nullptr) return nullptr;
+    return find_method_by_address(type, address);
 }
 
 void* method_pointer(void* method_info) {
