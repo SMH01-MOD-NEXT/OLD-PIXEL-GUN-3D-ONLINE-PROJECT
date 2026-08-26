@@ -124,8 +124,66 @@ The two had to be fixed together: repairing only the ordering would have made
 the gate the earliest caller, at the moment the catalogue is *guaranteed* to be
 empty, and poisoned the module harder.
 
-**Current design, below:** the gates build the season, and only entering managed
-construction is treated as irreversible.
+**5. Gate-driven construction (v2).** This worked — up to the last step. The
+capture of Aug 26 16:29 shows the whole chain succeeding:
+
+```
+#000181 +003619ms pixelpass: gate C was asked before a season existed; building one now
+#000182 +003624ms pixelpass: season authored (4341 json bytes, 50 tiers, 17 skin ids, graffiti tiers 10)
+#000183 +003625ms pixelpass: parsing the season with the game's own Newtonsoft
+#000184 +003751ms pixelpass: the season parsed cleanly
+#000185 +003751ms pixelpass: allocating the pass service
+#000187 +003935ms pixelpass: handing the pass service to the manager
+#000188 +003936ms E pixelpass: the pass manager kept the service but still reports no season
+#000205 +004492ms pixelpass: the pass manager answered gate A = false while the season is absent
+```
+
+Both v2 defects were genuinely fixed: the gates now drive construction, and the
+latch no longer swallows transient misses. A real 4341-byte season with 50 tiers
+and 17 skin ids is authored, the game's own Newtonsoft accepts it, the service
+is constructed and the manager keeps it. Only the **read-back** fails.
+
+The `#000188` line above states a guess — that the manager reads its season from
+a "pass state holder" — and disassembly disproved it. Two separate reads are at
+fault, and neither one looks at the service:
+
+*The manager's season getter does not read the manager.* `丒不丏一丂丈丙东丟`
+(`0x1A08038`) decodes to:
+
+```csharp
+var season = 东丈与专专丈丘七丄<丐丑业丒丈丅丐专丅>.丒不丏一丂丈丙东丟(123);  // static config store
+var other  = 东丈与专专丈丘七丄<T140>.丒不丏一丂丈丙东丟(140);
+if (season != null && other != null) season.f_0x50 = other.f_0x10;
+return season;
+```
+
+It reads a **static, `this`-free config store keyed by ConfigId**, through the
+generic-shared accessor at `0x2606038`. Writing the service could never satisfy
+it. Offline that store is empty for both 123 and 140, which also means the
+`+0x50` merge is a no-op on the stock path and needs no reproducing. Note this
+also corrects the older claim that "the config cache is never asked for" the
+season — only the *loader* entry points this module hooks are never asked; this
+separate generic accessor is.
+
+*Gate A never looks at the season at all.* `丈丁上一丟丈丗七业` (`0x1A0811C`) is:
+
+```csharp
+return service != null && service.东与丞且丘丈专东丆() && service.一丒丄丘不七与丁万();
+```
+
+and both predicates fail offline, for unrelated reasons:
+
+| Predicate | RVA | What it really does | Why it fails offline |
+| --- | --- | --- | --- |
+| `东与丞且丘丈专东丆` | `0x18EEC4C` | forwards to `与下丗丆丛丕丂丈丌(default)` (`0x18EEC58`): `now >= start && now < end` | bounds are **int32** unix seconds (`0x18EE4A0`/`0x18EE5B0`), so the old `2099-01-01` end (4 070 908 800 s) wrapped to −224 058 496; and the server clock `0x3D5E394` returns **−1** until synchronised, which it never is offline |
+| `一丒丄丘不七与丁万` | `0x18EEF7C` | `世丁丒专东专丛一且::一丈丞丞万丐与丏业(丂丁不丙丅下不丐下)` over the pass's ExpOpenSystem row (`0x1A0D51C`) | that **entry overload lives at `0x20DF334`**, past the prologue `live_content_2313` patches at `0x20DF308`, so it reaches stock code, finds no row in the empty offline table and answers `false` |
+
+The second row is the mechanical reason gate A stayed shut. The content-gate
+module's own header already documented `0x20DF334` as an unhooked entry point;
+what was new is that the pass depends on exactly that entry point.
+
+**Current design, below:** the gates build the season, only entering managed
+construction is irreversible, and all three decisive reads are answered.
 
 ## Current design
 
@@ -153,6 +211,40 @@ Why this is better than seeding:
   would have been cached permanently and would have blocked its own repair.
 * **Real content always wins.** A stock payload of ≥ 3 bytes is returned
   untouched; the hook only fills a hole.
+
+That read hook is a safety net, not the delivery route. The season actually
+reaches the game as a constructed object handed to the pass manager, and v2
+proved that handing it over is only half the job — it also has to be *readable*
+back. So v3 answers the three reads that decide the lobby entry.
+
+### Answering the three decisive reads
+
+| Hook | RVA | Behaviour |
+| --- | --- | --- |
+| `万丈丏丈丙丑万万丙::丒不丏一丂丈丙东丟` | `0x1A08038` | stock first; if it returns null, return the season held by the service the manager is carrying |
+| `三丄三丂丈七业丁丞::东与丞且丘丈专东丆` | `0x18EEC4C` | stock first; report the window open once a season is installed |
+| `三丄三丂丈七业丁丞::一丒丄丘不七与丁万` | `0x18EEF7C` | stock first; report the pass unlocked once a season is installed |
+
+Three properties hold for all three:
+
+* **Stock always wins.** Each hook calls the original first and only substitutes
+  an answer when the stock one is null/false. A build that has a real season
+  from a real backend behaves exactly as shipped.
+* **Nothing is forced before an install succeeds.** All three are gated on
+  `g_install_succeeded` — a season that was authored, parsed by the game's own
+  Newtonsoft, and wrapped in a real service. If the season path does not verify
+  on a given `libil2cpp.so`, the module is inert rather than lying.
+* **No managed pointer is cached.** The season getter walks the game's own
+  object graph on demand — manager → service → season field, resolved by field
+  metadata rather than by the `+0x10` offset. The manager roots the service and
+  the service roots the season, so this is GC-safe without a GC handle, which is
+  the same rule the rest of the module follows.
+
+Because the two predicates are answered at the source, gate A's *stock*
+implementation now succeeds on its own. `kForceGatesWhenSeasonExists` remains as
+a backstop, but it is now keyed on `g_install_succeeded` rather than on
+`manager_season() != nullptr` — the latter made the whole branch dead code in
+v2, since the getter it consulted could never report a season.
 
 ### Overload safety
 
@@ -267,18 +359,34 @@ guaranteed to be populated.
 
 ## Expected log
 
-The build tag is now `lobby gate v6 + ... + pixel pass v2 (gate-driven
-season)`. If `#000005 init:` still says `lobby gate v5`, the old `.so` is
-running and nothing below applies.
+The build tag is now `lobby gate v7 + ... + pixel pass v3 (season read-back +
+gate A predicates)`. If `#000005 init:` still says `lobby gate v6` or `v5`, the
+old `.so` is running and nothing below applies.
 
 ```
-23.1.3-pixelpass: pass manager armed (gates A=1 B=1 C=1, lobby view OnEnable=1, season construction=1); the season is built from the first gate query that finds none
-23.1.3-pixelpass: gate A was asked before a season existed; building one now
+23.1.3-pixelpass: season read-back armed (manager season getter=1, season window=1, pass unlock=1)
+23.1.3-pixelpass: pass manager armed (gates A=1 B=1 C=1, lobby view OnEnable=1, season construction=1)
+23.1.3-pixelpass: gate C was asked before a season existed; building one now
 23.1.3-pixelpass: no season could be built yet (the local weapon skin catalogue is still empty); this is retried, not fatal
 23.1.3-pixelpass: season authored (N json bytes, 50 tiers, M skin ids, graffiti tiers 10)
+23.1.3-pixelpass: the season parsed cleanly
+23.1.3-pixelpass: the manager's season getter reads the static config store by id, which is empty offline; answering it from the service this module installed instead
 23.1.3-pixelpass: the pass manager now holds a service and reports its season; 50 tiers over 5 page(s) are live
-23.1.3-pixelpass: the season exists but gate A was shut; opening it so the lobby pass button can appear
+23.1.3-pixelpass: the season window read as closed (the bounds are int32 unix seconds and the server clock is -1 offline); reporting the installed season as current
+23.1.3-pixelpass: the pass has no row in the offline ExpOpenSystem table and its entry overload bypasses the content gate hook; reporting the installed season as unlocked
 ```
+
+The three lines that are new in v3 are the ones that matter. `answering it from
+the service` proves the config-store read-back is live; the `window` and
+`unlock` lines prove the two gate A predicates are being answered. After them,
+gate A should report **`= true`** on its own — the `the season exists but gate A
+was shut` backstop line should now be *absent*, because the stock gate
+implementation succeeds by itself.
+
+If `season read-back armed` reports `manager season getter=0`, the season will
+never be visible no matter how cleanly it parses — that is the v2 failure mode
+and it is now called out explicitly at arming time rather than three seconds
+later.
 
 The middle line is expected and harmless — the first gate query happens on the
 loading screen, before the skin catalogue exists. It should be followed by

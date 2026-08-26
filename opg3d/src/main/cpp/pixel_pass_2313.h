@@ -197,6 +197,37 @@ constexpr const char* kManagerGateC = "专丒丂丂丕业丛丐丂";       // bo
 constexpr const char* kSeasonClass = "丐丑业丒丈丅丐专丅";        // 13225
 constexpr const char* kServiceClass = "三丄三丂丈七业丁丞";       // 13268
 constexpr const char* kCtor = ".ctor";
+// The season the service was constructed with, at service+0x10. Read by name
+// rather than by offset, and used as the manager's season when the manager's
+// own getter comes back empty (see kManagerSeason below).
+constexpr const char* kServiceSeason = "丟三一丄丈丒三丈丞";      // 0x10
+
+// The two predicates gate A asks the service, and why each one shuts offline.
+//
+// 东与丞且丘丈专东丆/0 (0x18EEC4C) forwards to 与下丗丆丛丕丂丈丌(default(long?))
+// (0x18EEC58), which is a season time window:
+//
+//     long now = PixelTime.丒万丟且丑上东丂丈();          // 0x3D5E394
+//     return now >= this.丗不丒丘丘丄丘万下() && now < this.丐不丑不专不丕世丕();
+//
+// Both bounds come back as **int32** unix seconds (0x18EE4A0 and 0x18EE5B0
+// convert the season's DateTime bounds through 0x4CA9984), so any end date past
+// 2038 wraps negative and the season reads as expired. Worse, 0x3D5E394 returns
+// -1 until the server clock has been synchronised, and offline it never is --
+// so `now` is -1 and every window comparison fails regardless of the dates.
+//
+// 一丒丄丘不七与丁万/0 (0x18EEF7C) is the content gate applied to the pass:
+//
+//     return 世丁丒专东专丛一且::一丈丞丞万丐与丏业(丈丆且七且且丞丒专.丂七且丐丗丗一且丛());
+//
+// 0x1A0D51C looks the pass up in the ExpOpenSystem table and 0x20DF334 answers
+// `entry != null && playerLevel >= entry.RequiredLevel`. That entry overload
+// sits at 0x20DF334 -- *past* the prologue live_content_2313 patches at
+// 0x20DF308 -- so a direct call reaches stock code, the offline table has no
+// pass entry, and it always answers false. This is the mechanical reason
+// gate A stayed shut in the v2 capture even with the service in place.
+constexpr const char* kServiceInWindow = "东与丞且丘丈专东丆";   // bool /0, 0x18EEC4C
+constexpr const char* kServiceUnlocked = "一丒丄丘不七与丁万";   // bool /0, 0x18EEF7C
 
 // The lobby view itself. Its serialised field names are not obfuscated.
 constexpr const char* kLobbyViewClass = "PixelPassLobbyView";  // 12069
@@ -241,6 +272,11 @@ constexpr uintptr_t kRvaSeasonCtor = 0x1A05768u;
 constexpr uintptr_t kRvaServiceCtor = 0x18F0594u;
 constexpr uintptr_t kRvaManagerSetService = 0x1A08114u;
 constexpr uintptr_t kRvaManagerSeason = 0x1A08038u;
+// The two service predicates gate A depends on. Both are the only method with
+// their name and argument count on the service, but they are hooked, so the
+// address check is what proves this is the verified image before patching.
+constexpr uintptr_t kRvaServiceInWindow = 0x18EEC4Cu;
+constexpr uintptr_t kRvaServiceUnlocked = 0x18EEF7Cu;
 
 // ---------------------------------------------------------------- constants
 
@@ -307,8 +343,15 @@ constexpr bool kForceGatesWhenSeasonExists = true;
 constexpr const char* kSeasonName = "OPG3D Offline Season";
 // Fixed, always-current window: the season must be active whatever the device
 // clock says, so no runtime date arithmetic is involved.
+//
+// Both bounds have to stay inside **int32 unix seconds**. The service converts
+// them with 0x18EE4A0 / 0x18EE5B0, which return `int`, so the previous end date
+// of 2099-01-01 (4 070 908 800 s) wrapped to -224 058 496 and made the season
+// read as long expired -- one of the two reasons gate A stayed shut in the v2
+// capture. 2035-01-01 is 2 051 222 400 s, comfortably under INT32_MAX
+// (2 147 483 647), and 2020-01-01 is 1 577 836 800 s.
 constexpr const char* kSeasonStart = "2020-01-01T00:00:00Z";
-constexpr const char* kSeasonEnd = "2099-01-01T00:00:00Z";
+constexpr const char* kSeasonEnd = "2035-01-01T00:00:00Z";
 
 // Written instead of a quote character so this source stays free of escape
 // sequences while emitting JSON.
@@ -488,6 +531,38 @@ inline InstanceBoolFn g_gate_a_orig = nullptr;
 inline InstanceBoolFn g_gate_b_orig = nullptr;
 inline InstanceBoolFn g_gate_c_orig = nullptr;
 inline InstanceVoidFn g_view_enable_orig = nullptr;
+
+// --- the three reads that actually decide the lobby entry ------------------
+//
+// v2 built a real season, parsed it and handed a real service to the manager,
+// and the manager kept it -- yet the manager still reported no season and
+// gate A still answered false. The disassembly explains both, and neither had
+// anything to do with the service:
+//
+//   * The manager's season getter (0x1A08038) does not read the manager or the
+//     service at all. It reads the *static config store*,
+//     东丈与专专丈丘七丄<丐丑业丒丈丅丐专丅>.丒不丏一丂丈丙东丟(123), and merges ConfigId 140's
+//     field into season+0x50 when both are present. Offline the store is empty
+//     for both ids, so it returns null no matter what the service holds --
+//     which also means the +0x50 merge is a no-op on the stock path and does
+//     not need reproducing here.
+//   * Gate A (0x1A0811C) is
+//     `service != null && service.东与丞且丘丈专东丆() && service.一丒丄丘不七与丁万()`,
+//     and both predicates fail offline for reasons documented at
+//     kServiceInWindow / kServiceUnlocked.
+//
+// So all three reads are hooked. The season getter answers from the service
+// this module installed, and the two predicates report the season live once it
+// is installed. Nothing is forced before an install succeeds, so a build where
+// the season path does not verify behaves exactly like stock.
+inline InstanceObjFn g_mgr_season_orig = nullptr;
+inline InstanceBoolFn g_svc_window_orig = nullptr;
+inline InstanceBoolFn g_svc_unlock_orig = nullptr;
+inline void* g_service_season_field = nullptr;
+inline uint64_t g_season_served = 0u;
+inline bool g_season_served_logged = false;
+inline bool g_window_forced_logged = false;
+inline bool g_unlock_forced_logged = false;
 
 inline void* g_view_holder_field = nullptr;
 inline void* g_view_lock_field = nullptr;
@@ -893,6 +968,89 @@ inline void* manager_service(void* manager) {
                                                               g_mgr_service.info);
 }
 
+// The season held by the service the manager is carrying, read through the
+// service's own field metadata.
+//
+// This is the object the manager's season getter *should* have returned. No
+// managed pointer is cached to get here: the manager roots the service and the
+// service roots the season, so walking the game's own object graph on demand
+// is both GC-safe and always current.
+inline void* service_season(void* manager) {
+    if (g_service_season_field == nullptr ||
+        il2cpp::field_get_value == nullptr) {
+        return nullptr;
+    }
+    void* service = manager_service(manager);
+    if (service == nullptr) return nullptr;
+    void* season = nullptr;
+    il2cpp::field_get_value(service, g_service_season_field, &season);
+    return season;
+}
+
+// ------------------------------------------------- the three decisive reads
+
+// The manager's season getter reads the static config store by ConfigId, never
+// the service (see the note at g_mgr_season_orig). Offline that store is empty,
+// so the stock answer is null and every consumer -- the gates, the lobby view,
+// the tier list -- concludes there is no season. Answer from the service
+// instead, and only ever as a fallback: a real stock season always wins.
+inline void* mgr_season_hook(void* self, void* method) {
+    void* season = (g_mgr_season_orig != nullptr)
+                       ? g_mgr_season_orig(self, method)
+                       : nullptr;
+    if (season != nullptr) return season;
+
+    season = service_season(self);
+    if (season == nullptr) return nullptr;
+
+    ++g_season_served;
+    if (!g_season_served_logged) {
+        g_season_served_logged = true;
+        LOGI("23.1.3-pixelpass: the manager's season getter reads the static "
+             "config store by id, which is empty offline; answering it from "
+             "the service this module installed instead");
+    }
+    return season;
+}
+
+// service.东与丞且丘丈专东丆(): `start <= now < end` over int32 unix seconds, against a
+// server clock that returns -1 until it is synchronised. Offline it therefore
+// answers false even for a season that is genuinely current. Report the window
+// open once a season is actually installed.
+inline bool svc_window_hook(void* self, void* method) {
+    const bool stock =
+        (g_svc_window_orig != nullptr) ? g_svc_window_orig(self, method) : false;
+    if (stock || !g_install_succeeded) return stock;
+
+    if (!g_window_forced_logged) {
+        g_window_forced_logged = true;
+        LOGI("23.1.3-pixelpass: the season window read as closed (the bounds "
+             "are int32 unix seconds and the server clock is -1 offline); "
+             "reporting the installed season as current");
+    }
+    return true;
+}
+
+// service.一丒丄丘不七与丁万(): the ExpOpenSystem lookup for the pass, taken through
+// the entry overload at 0x20DF334. That entry point sits past the prologue
+// live_content_2313 patches at 0x20DF308, so it reaches stock code, finds no
+// row in the empty offline table and answers false. This is what shut gate A in
+// the v2 capture. Answer it here rather than widening the content-gate hook,
+// so only the pass is affected.
+inline bool svc_unlock_hook(void* self, void* method) {
+    const bool stock =
+        (g_svc_unlock_orig != nullptr) ? g_svc_unlock_orig(self, method) : false;
+    if (stock || !g_install_succeeded) return stock;
+
+    if (!g_unlock_forced_logged) {
+        g_unlock_forced_logged = true;
+        LOGI("23.1.3-pixelpass: the pass has no row in the offline "
+             "ExpOpenSystem table and its entry overload bypasses the content "
+             "gate hook; reporting the installed season as unlocked");
+    }
+    return true;
+}
+
 // ------------------------------------------------- season object construction
 
 // Turns the authored JSON into a real managed season DTO using the game's own
@@ -1046,13 +1204,15 @@ inline bool install_season(void* manager) {
              " page(s) are live",
              kTierCount, (kTierCount + kTiersPerPage - 1) / kTiersPerPage);
     } else {
-        // Worth saying precisely, because it decides where to write next: the
-        // manager would then be reading its season from the pass state holder
-        // rather than from the service, and that holder needs setting too.
+        // v2 logged a guess here -- that the manager reads its season from a
+        // "pass state holder" -- and the disassembly disproved it. The getter
+        // reads the static config store by ConfigId 123, so the service was
+        // never going to satisfy it and the season getter is hooked instead.
+        // Reaching this branch now means that hook is not armed.
         LOGE("23.1.3-pixelpass: the pass manager kept the service but still "
-             "reports no season, so it reads the season from the pass state "
-             "holder rather than from the service; that holder is the "
-             "remaining place to write");
+             "reports no season; the season getter reads the static config "
+             "store by id and its fallback hook is not armed, so the lobby "
+             "entry will stay hidden");
     }
     return true;
 }
@@ -1105,7 +1265,12 @@ inline bool handle_gate(void* self, int slot, bool stock) {
     }
 
     if (stock) return true;
-    if (!kForceGatesWhenSeasonExists || season == nullptr) return stock;
+    // Keyed on this module's own install state, not on manager_season(). The v2
+    // capture proved why: the manager's season getter reads the static config
+    // store, so before the getter was hooked it answered null forever and this
+    // whole branch was dead code. g_install_succeeded is the honest signal --
+    // a real season was authored, parsed and handed to a real service.
+    if (!kForceGatesWhenSeasonExists || !g_install_succeeded) return stock;
 
     ++g_gate_forced[slot];
     if (!g_gate_forced_logged[slot]) {
@@ -1409,6 +1574,26 @@ inline bool install_season_path() {
     return true;
 }
 
+// Proves a method that is about to be *hooked* is the one this port verified,
+// by address. hook::install() resolves the same MethodInfo through the same
+// metadata lookup, so proving the resolved pointer proves what gets patched; a
+// mismatch means a different libil2cpp.so and nothing is patched.
+inline bool hook_target_verified(const char* label, const char* ns,
+                                 const char* klass, const char* method,
+                                 int argc, uintptr_t rva) {
+    if (g_base == 0u) return false;
+    void* info = il2cpp::find_method_info(ns, klass, method, argc);
+    void* ptr = (info != nullptr) ? il2cpp::method_pointer(info) : nullptr;
+    const auto expected = reinterpret_cast<void*>(g_base + rva);
+    if (ptr != expected) {
+        LOGE("23.1.3-pixelpass: %s resolved to %p but this build expects %p "
+             "(RVA 0x%" PRIxPTR "); refusing to hook it",
+             label, ptr, expected, rva);
+        return false;
+    }
+    return true;
+}
+
 // Binds the pass manager and hooks its gates plus the lobby view.
 inline bool install_manager() {
     bool resolved = true;
@@ -1423,6 +1608,45 @@ inline bool install_manager() {
     }
 
     g_season_path_ready = install_season_path();
+
+    // The three reads that decide whether the lobby entry exists at all. v2
+    // proved that writing the service is not enough on its own: the manager's
+    // season getter reads the static config store by ConfigId, and gate A asks
+    // the service two predicates that both fail offline. See the note at
+    // g_mgr_season_orig for the full derivation.
+    g_service_season_field =
+        il2cpp::find_field(kPassNs, kServiceClass, kServiceSeason);
+    const bool season_read =
+        g_service_season_field != nullptr &&
+        hook::install({kPassNs, kManagerClass, kManagerSeason, 0},
+                      reinterpret_cast<void*>(&mgr_season_hook),
+                      reinterpret_cast<void**>(&g_mgr_season_orig), false);
+    if (g_service_season_field == nullptr) {
+        LOGE("23.1.3-pixelpass: the pass service has no '%s' season field in "
+             "this build; the manager's season getter cannot be answered and "
+             "the lobby entry will stay hidden", kServiceSeason);
+    }
+
+    const bool window =
+        hook_target_verified("the season window predicate", kPassNs,
+                             kServiceClass, kServiceInWindow, 0,
+                             kRvaServiceInWindow) &&
+        hook::install({kPassNs, kServiceClass, kServiceInWindow, 0},
+                      reinterpret_cast<void*>(&svc_window_hook),
+                      reinterpret_cast<void**>(&g_svc_window_orig), false);
+    const bool unlocked =
+        hook_target_verified("the pass unlock predicate", kPassNs,
+                             kServiceClass, kServiceUnlocked, 0,
+                             kRvaServiceUnlocked) &&
+        hook::install({kPassNs, kServiceClass, kServiceUnlocked, 0},
+                      reinterpret_cast<void*>(&svc_unlock_hook),
+                      reinterpret_cast<void**>(&g_svc_unlock_orig), false);
+
+    LOGI("23.1.3-pixelpass: season read-back armed (manager season getter=%d, "
+         "season window=%d, pass unlock=%d); the manager's getter reads the "
+         "static config store by id, so it is answered from the installed "
+         "service instead",
+         season_read ? 1 : 0, window ? 1 : 0, unlocked ? 1 : 0);
 
     const bool gate_a =
         hook::install({kPassNs, kManagerClass, kManagerGateA, 0},
@@ -1506,8 +1730,9 @@ inline bool install(uintptr_t base) {
          " tiers, %" PRId32 " per page; cache probes primary=%d secondary=%d "
          "inner=%d save=%d, manager=%d, season construction=%d, typed "
          "parse=%d, allocate and populate=%d); the season is constructed on "
-         "device and handed to the game's own pass manager, because the device "
-         "proved the config cache is never asked for it",
+         "device and handed to the game's own pass manager, and the manager's "
+         "season getter is answered from that service because the getter reads "
+         "the static config store by id and that store is empty offline",
          kConfigPixelPass, kTierCount, kTiersPerPage, primary ? 1 : 0,
          alt ? 1 : 0, inner ? 1 : 0, save ? 1 : 0, g_manager_armed ? 1 : 0,
          g_season_path_ready ? 1 : 0, g_route_deserialize ? 1 : 0,
