@@ -30,49 +30,79 @@
 // backend never computed that payload, it only shipped it -- so it can be
 // supplied locally.
 //
-// Why the previous approach never worked
-// --------------------------------------
-// The first attempt granted cosmetics natively and never created a season.
-// The second attempt created a season, but wrote it into the on-device cache
-// from the MainMenuController.Update slot owned by progression_2313 -- and
-// that hook was never installed, because progression_2313 was binding a
-// Progress service getter name that does not exist in 23.1.3 metadata and
-// bailed out before reaching its hook installation. The supplied logcat shows
-// exactly that: "东丝丂丄业丕且丙丑::丞丏业丐丒与业/0 not found in metadata",
-// "nothing was hooked", progression=0 -- and, decisively, the pixelpass tag
-// reports only its bind phase ("armed") with neither a success line nor the
-// "giving up after N attempts" line anywhere in the log. The seeder never ran
-// a single time.
+// History of this module, and what each device log actually proved
+// ---------------------------------------------------------------
+// Attempt 1 granted cosmetics natively and never created a season at all.
 //
-// Two lessons are baked into the design below.
+// Attempt 2 created a season, but wrote it into the on-device cache from the
+// MainMenuController.Update slot owned by progression_2313 -- and that hook
+// was never installed, because progression_2313 bound a Progress service
+// getter name that does not exist in 23.1.3 metadata and bailed out before
+// reaching its hook installation. The first device log showed exactly that:
+// "东丝丂丄业丕且丙丑::丞丏业丐丒与业/0 not found in metadata", "nothing was hooked",
+// progression=0. The seeder never ran a single time.
 //
-//   1. This module must not depend on another module's hook. It installs its
-//      own and is driven by the game, not by a frame counter someone else
-//      owns.
-//   2. Writing the season into the cache and hoping the config pipeline reads
-//      it afterwards is a timing bet. Worse, it is a one-way bet: the old
-//      code skipped writing whenever a payload of >= 3 bytes was already
-//      cached, so a single malformed season would have been cached forever
-//      and would have blocked its own repair.
+// Attempt 3 -- the read hook below -- fixed that dependency and moved the
+// season onto the config pipeline's own read path. The 89 second device log
+// taken afterwards proves the repair worked and that the remaining problem is
+// somewhere else entirely:
 //
-// How the season is supplied now
-// ------------------------------
-// 23.1.3 ships its own on-device config cache, PGCompany.丅丝业七三丈丝丑丏
-// (TypeDefIndex 11078) -- the class that owns the "BinaryConfigStorage.Key"
-// marker. Rather than writing into it, this module hooks the read:
+//   * "23.1.3-progression: installed", then at runtime "armed; coin
+//     key='Coins' ... level=65" and "max level reached; experience topped up
+//     999995 -> 900000000". Both of those runtime lines come out of the
+//     MainMenuController.Update pump, so the pump is alive.
+//   * "23.1.3-trace: MAIN MENU REACHED", and the sibling pumps report from the
+//     same slot: modules pass 1 complete, hidden-items pass 1 complete,
+//     content "opens 21/21 curated content features on its own (gate
+//     queries=78434)". The PixelPass feature gate is open.
+//   * Zero E/OPG3D lines in the entire capture.
+//   * And the pixelpass tag prints exactly one line: its own "armed". No
+//     "season authored", no "served the local season".
 //
-//   东丗与丏丟丛丂三丞(ConfigId, out byte[], out string)   // RVA 0x249D670
+// The hook is installed and the game is in the lobby, yet the season was
+// never authored. Authoring happens lazily inside the read hook, so the only
+// possible reading is that 东丗与丏丟丛丂三丞/3 was never entered with ConfigId 123.
 //
-// and answers ConfigId 123 with the season whenever the stock lookup comes
-// back empty. Any real cached payload always wins, so this cannot mask real
-// content. Nothing is persisted, so nothing can rot in the cache. And the
-// season arrives exactly when the config pipeline asks for it, whenever that
-// happens to be, instead of at a guessed frame number.
+// Why one read hook was not enough
+// --------------------------------
+// The stock cache class PGCompany.丅丝业七三丈丝丑丏 (TypeDefIndex 11078, the class
+// that owns the "BinaryConfigStorage.Key" marker) does not have one read entry
+// point. It has three, and two of them share an identical signature:
 //
-// Overload safety: the metadata name 东丗与丏丟丛丂三丞 occurs exactly once in the
-// whole 23.1.3 dump, so name plus argument count selects it unambiguously --
-// unlike the sibling loader 与丌下丑丝丁丄丏丛/3 (0x249E064), which is a different
-// name and is left untouched.
+//   内 东丗与丏丟丛丂三丞(ConfigId, out byte[], out string)            // 0x249D670
+//   内 与丌下丑丝丁丄丏丛(ConfigId, out byte[], out string)            // 0x249E064
+//   内 丅专东与上丆不丏丐(ConfigId, string, out byte[], out string)   // 0x249DACC, private
+//
+// Attempt 3 hooked only the first because its metadata name occurs once in
+// the dump -- but uniqueness of a name says nothing about which overload the
+// config pipeline calls. All three are covered now, and the season is served
+// from whichever one the game actually uses.
+//
+// Nesting resolves itself: if a public loader delegates to the private one,
+// the inner hook serves the season first, and the outer hook then sees a
+// payload that is already real and lets it through untouched.
+//
+// Reading the pipeline from the other end also shows why the cache may simply
+// never be consulted for 123. The generic holder PGCompany.东丈与专专丈丘七丄<T>
+// (11083) keeps a Dictionary<ConfigId, holder> plus one cached T, and its
+// slot-5 virtual is 丆丕丙丛丑不丟丁丗(object, 不丟丌丌丌世丅丄与) -- an event handler,
+// where 不丟丌丌丌世丅丄与 (11081) is an EventArgs carrying a ConfigId and a string.
+// BalanceController has the matching pieces: 丑不业丑专专丝专丝(object,
+// 不丟丌丌丌世丅丄与) at 0x471BF94, 丛丐丄一丞不且丂下(ConfigId) at 0x471C074, the gate
+// 丁丁丁丏丟丄丘丄专(ConfigId) at 0x471CAC0, and 世丄丅丏丌专上世丄(string, byte[],
+// 丐丛丏丒丘东三专一, ConfigId) at 0x471CB40. So configs are pushed in when bytes
+// arrive and an event is raised -- and in this port no bytes ever arrive for
+// 123: the log shows the emulated backend answering every config request
+// (rating maps, BuffSettings, rating minigame) with 200 and two bytes, and
+// nothing at all requesting a pass.
+//
+// That is the question the diagnostics below answer without another guess. If
+// the report line shows the cache was read at least once, the read path is
+// live and only the ConfigId set matters. If it shows zero reads while the
+// lobby is up, the cache is never consulted and the season has to be supplied
+// one level higher, at the pass manager PGCompany.PixelPass.万丈丏丈丙丑万万丙
+// (season getter 丒不丏一丂丈丙东丟 at 0x1A08038, gates at 0x1A0811C / 0x1A0815C /
+// 0x1A08460, config sink 一丐且专丕丐丝丕业 at 0x1A09820).
 //
 // Two properties of the build make hand-authored JSON safe here:
 //
@@ -89,6 +119,15 @@
 //     on ':' (movz w1, #0x3A) and int-parses the first field, which matches
 //     the (OfferItemType, string id, int amount) constructor at 0x24B39D8. A
 //     reward is therefore "<type>:<id>:<amount>", e.g. "1170:<skin id>:1".
+//
+// One risk stays explicitly unproven. The season is validated by
+// DataSystem.DataValidation.FluentValidators.丅丑世丈世七丈丂丁, an
+// AbstractValidator<丐丑业丒丈丅丐专丅> (TypeDefIndex 7760, ctor 0x2D484D0), with
+// sibling validators for the Common (7762) and Page (7764) DTOs. Those rules
+// live in constructor bodies, which a metadata dump does not contain, so a
+// deliberately minimal season could parse and still be rejected. If the
+// diagnostics show the season being served and the button still does not
+// appear, that validator is the next thing to look at.
 //
 // Only ids the build itself reports are written for skins: they come from
 // Rilisoft.与世且一丁丆丈丄丈.丛上丌丏丟丒东丂且(), which is backed by the local
@@ -110,8 +149,14 @@ constexpr const char* kSystemNs = "System";
 
 constexpr const char* kStorageClass = "丅丝业七三丈丝丑丏";
 constexpr const char* kStorageInstance = "下丌丑丁下丟丛丘上";
-// Unique in the whole 23.1.3 dump, so name + argc is an unambiguous selector.
-constexpr const char* kStorageLoad = "东丗与丏丟丛丂三丞";
+
+// The three read entry points of the stock cache, plus the write path. Every
+// one of them is covered: which overload the config pipeline prefers is not
+// something a metadata dump can answer.
+constexpr const char* kStorageLoad = "东丗与丏丟丛丂三丞";       // /3, RVA 0x249D670
+constexpr const char* kStorageLoadAlt = "与丌下丑丝丁丄丏丛";    // /3, RVA 0x249E064
+constexpr const char* kStorageLoadInner = "丅专东与上丆不丏丐";  // /4, RVA 0x249DACC
+constexpr const char* kStorageSave = "与万丝丗丁不丗一丗";       // /3, RVA 0x249CD64
 
 constexpr const char* kConvertClass = "Convert";
 constexpr const char* kFromBase64 = "FromBase64String";
@@ -157,7 +202,17 @@ constexpr int64_t kMinRealPayload = 3;
 // legitimately be empty on the first few reads).
 constexpr int32_t kMaxBuildAttempts = 32;
 
-constexpr uint64_t kReportPeriodFrames = 3600u;
+// The previous build only reported once every 3600 menu frames, which is
+// about a minute of lobby time -- long enough that a normal capture ended
+// before the one line that says whether the read path is used at all. The
+// first report now lands within a few seconds of the menu appearing.
+constexpr uint64_t kFirstReportFrame = 120u;
+constexpr uint64_t kReportPeriodFrames = 1800u;
+
+// Bounded, one-shot-per-pair tracing of which ConfigIds reach which entry
+// point. Capped so a chatty pipeline cannot flood the log.
+constexpr size_t kMaxNotedPairs = 64u;
+constexpr size_t kMaxNoteLines = 24u;
 
 constexpr const char* kSeasonName = "OPG3D Offline Season";
 // Fixed, always-current window: the season must be active whatever the device
@@ -180,9 +235,18 @@ using StaticObjFn = void* (*)(void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using InstanceIndexFn = void* (*)(void* self, int32_t index, void* method);
 using FromBase64Fn = void* (*)(void* text, void* method);
-// bool 东丗与丏丟丛丂三丞(ConfigId, out byte[], out string) -- instance method, so
-// `this` first and MethodInfo* last; both `out` parameters arrive as pointers.
+// bool 东丗与丏丟丛丂三丞(ConfigId, out byte[], out string) and its identically
+// shaped sibling 与丌下丑丝丁丄丏丛 -- instance methods, so `this` first and
+// MethodInfo* last; both `out` parameters arrive as pointers.
 using LoadConfigFn = bool (*)(void* self, int32_t config_id, void** payload,
+                              void** error, void* method);
+// bool 丅专东与上丆不丏丐(ConfigId, string, out byte[], out string) -- the private
+// loader takes an extra managed string between the id and the outputs.
+using LoadConfigPathFn = bool (*)(void* self, int32_t config_id, void* path,
+                                  void** payload, void** error, void* method);
+// bool 与万丝丗丁不丗一丗(ConfigId, byte[], out string) -- the write path, hooked
+// read-only so the log shows what the game itself decides to persist.
+using SaveConfigFn = bool (*)(void* self, int32_t config_id, void* payload,
                               void** error, void* method);
 
 struct Managed {
@@ -215,15 +279,22 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
 inline Managed g_from_base64{};
 inline Managed g_skin_ids{};
 inline LoadConfigFn g_load_orig = nullptr;
+inline LoadConfigFn g_load_alt_orig = nullptr;
+inline LoadConfigPathFn g_load_inner_orig = nullptr;
+inline SaveConfigFn g_save_orig = nullptr;
 inline bool g_installed = false;
 inline bool g_exhausted = false;
 inline int32_t g_build_attempts = 0;
 inline uint64_t g_frames = 0u;
+inline uint64_t g_reads_total = 0u;
 inline uint64_t g_queries = 0u;
 inline uint64_t g_served = 0u;
 inline uint64_t g_stock_wins = 0u;
 inline bool g_logged_first_serve = false;
 inline size_t g_skin_count = 0u;
+inline std::vector<uint64_t> g_noted_pairs;
+inline size_t g_note_lines = 0u;
+inline size_t g_save_lines = 0u;
 // The season is built once and kept as base64 text. A managed byte[] is NOT
 // cached: without a GC handle a stored managed pointer can be moved or
 // collected, so the array is re-created from this text on every read instead.
@@ -546,19 +617,41 @@ inline void* season_payload() {
         text, g_from_base64.info);
 }
 
-// ---------------------------------------------------------------- the hook
+// --------------------------------------------------------- read path tracing
 
-inline bool storage_load_hook(void* self, int32_t config_id, void** payload,
-                              void** error, void* method) {
-    const bool stock =
-        (g_load_orig != nullptr)
-            ? g_load_orig(self, config_id, payload, error, method)
-            : false;
+// Records, once per (entry point, ConfigId) pair, that the stock cache was
+// asked for something. This is the line that decides where the season has to
+// be supplied: if it never appears while the lobby is up, the cache is not on
+// the path at all and hooking any loader is pointless.
+inline void note_config(const char* where, int32_t source, int32_t config_id) {
+    const uint64_t key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(source)) << 32) |
+        static_cast<uint64_t>(static_cast<uint32_t>(config_id));
+    for (const uint64_t seen : g_noted_pairs) {
+        if (seen == key) return;
+    }
+    if (g_noted_pairs.size() < kMaxNotedPairs) g_noted_pairs.push_back(key);
+    if (g_note_lines >= kMaxNoteLines) return;
+    ++g_note_lines;
+    LOGI("23.1.3-pixelpass: the stock config cache asked %s for config id "
+         "%" PRId32,
+         where, config_id);
+}
+
+// ---------------------------------------------------------------- the hooks
+
+// Shared tail for all three loaders. `stock` is whatever the original returned.
+inline bool handle_load(int32_t config_id, void** payload, void** error,
+                        bool stock, const char* where, int32_t source) {
+    ++g_reads_total;
+    note_config(where, source, config_id);
     if (config_id != kConfigPixelPass) return stock;
 
     ++g_queries;
 
-    // A real cached season always wins: this module only fills a hole.
+    // A real cached season always wins: this module only fills a hole. This is
+    // also what makes nested loaders safe -- if the inner hook already served
+    // the season, the outer hook sees a real payload and defers to it.
     if (stock && payload != nullptr && *payload != nullptr &&
         array_length(*payload) >= kMinRealPayload) {
         ++g_stock_wins;
@@ -575,11 +668,60 @@ inline bool storage_load_hook(void* self, int32_t config_id, void** payload,
     if (!g_logged_first_serve) {
         g_logged_first_serve = true;
         LOGI("23.1.3-pixelpass: config %" PRId32 " was empty in the stock "
-             "on-device cache; served the local season (%" PRId64 " bytes) -- "
-             "the lobby pass button and its tiers exist from here on",
-             kConfigPixelPass, array_length(season));
+             "on-device cache; served the local season (%" PRId64 " bytes) "
+             "through %s -- the lobby pass button and its tiers exist from "
+             "here on",
+             kConfigPixelPass, array_length(season), where);
     }
     return true;
+}
+
+inline bool storage_load_hook(void* self, int32_t config_id, void** payload,
+                              void** error, void* method) {
+    const bool stock =
+        (g_load_orig != nullptr)
+            ? g_load_orig(self, config_id, payload, error, method)
+            : false;
+    return handle_load(config_id, payload, error, stock, "the primary loader",
+                       0);
+}
+
+inline bool storage_load_alt_hook(void* self, int32_t config_id, void** payload,
+                                  void** error, void* method) {
+    const bool stock =
+        (g_load_alt_orig != nullptr)
+            ? g_load_alt_orig(self, config_id, payload, error, method)
+            : false;
+    return handle_load(config_id, payload, error, stock, "the secondary loader",
+                       1);
+}
+
+inline bool storage_load_inner_hook(void* self, int32_t config_id, void* path,
+                                    void** payload, void** error,
+                                    void* method) {
+    const bool stock =
+        (g_load_inner_orig != nullptr)
+            ? g_load_inner_orig(self, config_id, path, payload, error, method)
+            : false;
+    return handle_load(config_id, payload, error, stock, "the inner loader", 2);
+}
+
+// Read-only: the write path is never altered, it is only reported. If the game
+// ever persists ConfigId 123 itself, that payload is real content and the
+// loaders above will hand it back in preference to the local season.
+inline bool storage_save_hook(void* self, int32_t config_id, void* payload,
+                              void** error, void* method) {
+    const bool stock =
+        (g_save_orig != nullptr)
+            ? g_save_orig(self, config_id, payload, error, method)
+            : false;
+    if (g_save_lines < kMaxNoteLines) {
+        ++g_save_lines;
+        LOGI("23.1.3-pixelpass: the game stored config id %" PRId32
+             " itself (%" PRId64 " byte(s), stored=%d)",
+             config_id, array_length(payload), stock ? 1 : 0);
+    }
+    return stock;
 }
 
 // ------------------------------------------------------------ diagnostics
@@ -587,11 +729,20 @@ inline bool storage_load_hook(void* self, int32_t config_id, void** payload,
 inline void pump() {
     if (!g_installed) return;
     ++g_frames;
-    if ((g_frames % kReportPeriodFrames) != 0u) return;
-    LOGI("23.1.3-pixelpass: config %" PRId32 " reads=%" PRIu64
-         " served locally=%" PRIu64 " stock payload won=%" PRIu64
-         " skin ids=%zu",
-         kConfigPixelPass, g_queries, g_served, g_stock_wins, g_skin_count);
+    const bool due = (g_frames == kFirstReportFrame) ||
+                     ((g_frames % kReportPeriodFrames) == 0u);
+    if (!due) return;
+    LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in, the stock config "
+         "cache was read %" PRIu64 " time(s) in total; config %" PRId32
+         " reads=%" PRIu64 " served locally=%" PRIu64
+         " stock payload won=%" PRIu64 " skin ids=%zu",
+         g_frames, g_reads_total, kConfigPixelPass, g_queries, g_served,
+         g_stock_wins, g_skin_count);
+    if (g_reads_total == 0u) {
+        LOGI("23.1.3-pixelpass: the lobby is up and the stock config cache has "
+             "not been read once, so the season cannot be delivered through it "
+             "on this build; the pass manager is the next place to supply it");
+    }
 }
 
 // ------------------------------------------------------------ installation
@@ -620,25 +771,45 @@ inline bool install() {
         return false;
     }
 
+    // The remaining entry points are best effort: the previous build proved
+    // that hooking one loader is not enough, but none of them is individually
+    // required for the module to work.
+    const bool alt =
+        hook::install({kPgNs, kStorageClass, kStorageLoadAlt, 3},
+                      reinterpret_cast<void*>(&storage_load_alt_hook),
+                      reinterpret_cast<void**>(&g_load_alt_orig), false);
+    const bool inner =
+        hook::install({kPgNs, kStorageClass, kStorageLoadInner, 4},
+                      reinterpret_cast<void*>(&storage_load_inner_hook),
+                      reinterpret_cast<void**>(&g_load_inner_orig), false);
+    const bool save =
+        hook::install({kPgNs, kStorageClass, kStorageSave, 3},
+                      reinterpret_cast<void*>(&storage_save_hook),
+                      reinterpret_cast<void**>(&g_save_orig), false);
+
     g_installed = true;
-    LOGI("23.1.3-pixelpass: armed on the config cache read path (config id "
-         "%" PRId32 ", %" PRId32 " tiers, %" PRId32 " per page); the season is "
-         "served on demand and nothing is persisted",
-         kConfigPixelPass, kTierCount, kTiersPerPage);
+    LOGI("23.1.3-pixelpass: armed on every config cache read path (config id "
+         "%" PRId32 ", %" PRId32 " tiers, %" PRId32 " per page; primary=1 "
+         "secondary=%d inner=%d save-probe=%d); the season is served on demand "
+         "and nothing is persisted",
+         kConfigPixelPass, kTierCount, kTiersPerPage, alt ? 1 : 0,
+         inner ? 1 : 0, save ? 1 : 0);
     return true;
 }
 
 } // namespace detail
 
-// Hooks the stock on-device config cache read and binds the base64 decoder and
-// the local weapon skin catalogue. The season itself is authored lazily, on
-// the first config read that comes back empty, where a game thread and a
-// populated skin catalogue are both available.
+// Hooks every read path of the stock on-device config cache and binds the
+// base64 decoder and the local weapon skin catalogue. The season itself is
+// authored lazily, on the first config read that comes back empty, where a
+// game thread and a populated skin catalogue are both available.
 inline bool install_hooks() { return detail::install(); }
 
-// Optional read-only counters, driven from the main-menu Update slot when that
-// slot happens to be available. The season does NOT depend on this being
-// called: that dependency is exactly what kept the pass missing before.
+// Read-only counters, driven from the main-menu Update slot. The season does
+// NOT depend on this being called: that dependency is exactly what kept the
+// pass missing two attempts ago. It now reports early, because the one fact
+// that matters -- whether the stock config cache is read at all while the
+// lobby is up -- has to survive a short capture.
 inline void pump_from_main_menu() { detail::pump(); }
 
 } // namespace pixel_pass_2313
