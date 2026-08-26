@@ -12,34 +12,59 @@
 
 // Offline PixelPass season for the exact supplied 23.1.3 ARM64 libil2cpp.so.
 //
-// What the device finally proved
-// -----------------------------
-// The instrumented build answered the question completely. From a 33 s capture
-// with the lobby up:
+// What the device proved, in order
+// -------------------------------
+// 1. The UI is complete and the view runs. From a 33 s capture with the lobby
+//    up:
 //
-//   pixelpass: the pass manager answered gate C = true while the season is absent
-//   pixelpass: the pass manager answered gate A = false while the season is absent
-//   pixelpass: the pass manager answered gate B = false while the season is absent
-//   pixelpass: PixelPassLobbyView.OnEnable ran (holder=1 lock=1 unlock=1
-//              coming-soon=1 need-level=1 button=1 view service=null;
-//              manager=alive manager service=null season=absent)
-//   pixelpass: pass manager alive (service=null season=absent); lobby view
-//              OnEnable ran 1 time(s); gates opened by this port A=0 B=0 C=0
+//      PixelPassLobbyView.OnEnable ran (holder=1 lock=1 unlock=1
+//        coming-soon=1 need-level=1 button=1 view service=null;
+//        manager=alive manager service=null season=absent)
+//      pass manager alive (service=null season=absent); lobby view OnEnable
+//        ran 1 time(s); gates opened by this port A=0 B=0 C=0
 //
-// Nothing is missing from the scene and nothing is broken in the view. Every
-// state container and the lobby button itself are present, the manager
-// singleton is alive, and the view's OnEnable does run. Exactly one object is
-// missing: the season. And because the pass service takes the season in its
-// constructor, a null season means a null service, which is what makes the
-// view switch its whole _holder off -- no button, not even a coming-soon
-// state.
+//    Every state container and the lobby button itself are present, the
+//    manager singleton is alive, and OnEnable does run. Exactly one object is
+//    missing: the season. Because the pass service takes the season in its
+//    constructor, a null season means a null service, which is what makes the
+//    view switch its whole _holder off -- no button, not even a coming-soon
+//    state.
 //
-// The conditional gate override deliberately stayed off (A=0 B=0 C=0). With a
-// null season, opening a gate would have sent the view straight into
-// dereferencing it: a broken menu instead of a missing button.
+//    The gate override deliberately stayed off (A=0 B=0 C=0). With a null
+//    season, opening a gate would have sent the view straight into
+//    dereferencing it: a broken menu instead of a missing button. These gates
+//    must never be forced without a season.
 //
-// How the season is built now
-// ---------------------------
+// 2. Overload ambiguity is real, not theoretical. The first attempt at
+//    building the season was refused by its own guard:
+//
+//      JsonConvert::DeserializeObject/2 resolved to RVA 0x40bc7c4 but this
+//        build expects 0x40bc82c; refusing it
+//      the season construction path did not verify against this build
+//
+//    0x40BC7C4 is DeserializeObject(string, JsonSerializerSettings), so
+//    il2cpp_class_get_method_from_name really does return whichever overload
+//    metadata lists first. Passing a System.Type where a settings object
+//    belongs would have been a type-confused call into managed code.
+//    Everything else on the path verified silently in that same run: both
+//    classes resolved, the service .ctor at 0x18F0594 and the manager setter
+//    at 0x1A08114 matched their RVAs, and il2cpp_object_new,
+//    il2cpp_class_get_type and il2cpp_type_get_object all bound.
+//
+// 3. The config cache is not the route, confirmed three sessions running:
+//
+//      the stock config cache asked the inner loader for config id 102
+//      the stock config cache asked the primary loader for config id 102
+//      ... cache reads=2 (config 123 reads=0)
+//
+//    ConfigId 102 is MessagePackTest. Over a whole session the cache is
+//    consulted exactly twice, both times for a serialiser self-test, and never
+//    once for PixelPass; the save path never fires. Those hooks are kept
+//    because they cost nothing and produced this evidence, but they are not
+//    the mechanism.
+//
+// How the season is built
+// -----------------------
 // PGCompany.PixelPass.丐丑业丒丈丅丐专丅 (TypeDefIndex 13225) is [JsonObject] and
 // every field carries an explicit [JsonProperty] name:
 //
@@ -48,48 +73,44 @@
 //   "tb"  TasksBase            "at"  TasksForAds
 //   "r"   GameRewards          "of"  Offers
 //
-// That is precisely the JSON this module has been authoring since attempt 2
-// and never had anywhere to send. So the stock serialiser can build it:
-// Newtonsoft.Json.JsonConvert.DeserializeObject(string, Type) at 0x40BC82C
-// materialises the entire object graph, including every List<T> instantiation
-// and the salted-int converter on SeasonId, Level, NumPage, Exp and IsFree --
-// none of which native code in this port could construct by hand, because
-// there is no generic-instantiation helper here.
+// That is precisely the JSON this module authors, so the stock serialiser can
+// build it. Native code here could not: the DTO graph is full of List<T>
+// instantiations and converter-backed salted ints, and this port has no
+// generic-instantiation helper.
 //
-// The chain, every step verified against the dump before it was written:
+// There are two independent routes, and every target on both is selected by
+// RVA so neither can pick a sibling overload:
 //
-//   DeserializeObject(json, typeof(丐丑业丒丈丅丐专丅))     0x40BC82C
-//     -> il2cpp_object_new(三丄三丂丈七业丁丞)
-//     -> 三丄三丂丈七业丁丞..ctor(season)                  0x18F0594
-//     -> manager 丝世东丛丗下丑丟丞(service)                0x1A08114
+//   route 1   DeserializeObject(string, Type)            0x40BC82C
+//             found by walking JsonConvert's method list for the entry point
+//             at base + that RVA, which yields the correct pointer and the
+//             MethodInfo that belongs to it, together.
+//
+//   route 2   il2cpp_object_new(season)
+//               -> season .ctor()                        0x1A05768
+//               -> PopulateObject(json, season)          0x40BCAB8
+//             PopulateObject has exactly one two-argument overload, so name
+//             plus arity already identifies it and the RVA check only
+//             confirms the build. This route needs no method walk, so it
+//             survives a runtime that does not export one.
+//
+// Route 1 runs first because it builds the graph in a single managed call. If
+// it returns null rather than throwing, route 2 still runs: PopulateObject
+// fills an already-allocated instance and does not have to construct the root,
+// so it tolerates shapes the typed parse rejects.
+//
+// Then, in both cases:
+//
+//   il2cpp_object_new(pass service)
+//     -> pass service .ctor(season)                      0x18F0594
+//     -> manager 丝世东丛丗下丑丟丞(service)                    0x1A08114
 //     -> PixelPassLobbyView 丗且丈丁丕丕丘一丞 (+0x110)
 //
-// Overload safety is not optional here. DeserializeObject has four
-// two-argument overloads and il2cpp_class_get_method_from_name cannot tell
-// them apart, so binding by name and argument count alone could return
-// (string, JsonSerializerSettings) and produce a type-confused call passing a
-// Type where settings are expected. Every target on this path therefore goes
-// through bind_exact(), which refuses it unless the resolved pointer equals
-// base + the expected RVA. That is also why install_hooks() now takes the
-// module base.
-//
-// Why the config cache is only instrumentation
-// --------------------------------------------
-// An earlier build hooked all three read entry points of the stock cache class
-// PGCompany.丅丝业七三丈丝丑丏 (TypeDefIndex 11078) plus its write path, and traced
-// every (entry point, ConfigId) pair. The device answered:
-//
-//   pixelpass: the stock config cache asked the inner loader for config id 102
-//   pixelpass: the stock config cache asked the primary loader for config id 102
-//   pixelpass: 120 menu frame(s) in, the stock config cache was read 2 time(s)
-//              in total; config 123 reads=0 ...
-//
-// ConfigId 102 is MessagePackTest. Over a whole session the cache is consulted
-// exactly twice, both times for a serialiser self-test, and never once for
-// PixelPass; the save probe never fired at all. Those hooks are kept because
-// they cost nothing, they produced this evidence, and they will serve the
-// season correctly if some build ever does route 123 through the cache -- but
-// they are not the mechanism.
+// Construction runs from inside the view's own OnEnable, before the original,
+// so the view initialises against a populated manager instead of the null it
+// used to find. The view's field is written too, because the view may have
+// cached it in Awake, before this hook ever ran. The pump keeps a backstop for
+// the case where the view was enabled before the module was ready.
 //
 // Also ruled out: BalanceController.世丄丅丏丌专上世丄(string, byte[], 丐丛丏丒丘东三专一,
 // ConfigId) at 0x471CB40 would drive the game's own parse/validate/raise path,
@@ -168,7 +189,7 @@ constexpr const char* kManagerGateC = "专丒丂丂丕业丛丐丂";       // bo
 // The season DTO and the pass service that wraps it.
 constexpr const char* kSeasonClass = "丐丑业丒丈丅丐专丅";        // 13225
 constexpr const char* kServiceClass = "三丄三丂丈七业丁丞";       // 13268
-constexpr const char* kCtor = ".ctor";                       // /1, 0x18F0594
+constexpr const char* kCtor = ".ctor";
 
 // The lobby view itself. Its serialised field names are not obfuscated.
 constexpr const char* kLobbyViewClass = "PixelPassLobbyView";  // 12069
@@ -185,7 +206,7 @@ constexpr const char* kConvertClass = "Convert";
 constexpr const char* kFromBase64 = "FromBase64String";
 
 constexpr const char* kJsonConvertClass = "JsonConvert";       // 18246
-constexpr const char* kDeserializeObject = "DeserializeObject";  // /2, 0x40BC82C
+constexpr const char* kPopulateObject = "PopulateObject";      // /2, 0x40BCAB8
 
 constexpr const char* kSkinCatalogueClass = "与世且一丁丆丈丄丈";
 constexpr const char* kSkinIdList = "丛上丌丏丟丒东丂且";
@@ -193,11 +214,23 @@ constexpr const char* kSkinIdList = "丛上丌丏丟丒东丂且";
 // ------------------------------------------------------------------- RVAs
 //
 // Every managed target this module *calls* (as opposed to hooks) is verified
-// against these before use. Two reasons: DeserializeObject has four
-// two-argument overloads that metadata lookup cannot distinguish, and a
-// different libil2cpp.so must disarm the season path instead of jumping to an
-// arbitrary address.
+// against these before use. Two reasons: methods that share a name and an
+// argument count cannot be told apart by metadata lookup, and a different
+// libil2cpp.so must disarm the season path instead of jumping to an arbitrary
+// address.
+//
+// DeserializeObject is the case that forced this. Its two-argument overloads
+// are (string, JsonSerializerSettings) at 0x40BC7C4 and (string, Type) at
+// 0x40BC82C, and the device showed metadata lookup returning the former. It is
+// therefore bound by walking the method list for the entry point at base plus
+// its RVA, not by name.
+//
+// PopulateObject needs no walk: (string, object) at 0x40BCAB8 is the only
+// two-argument overload, the other being (string, object,
+// JsonSerializerSettings) at 0x40BCB20.
 constexpr uintptr_t kRvaDeserializeStringType = 0x40BC82Cu;
+constexpr uintptr_t kRvaPopulateObject = 0x40BCAB8u;
+constexpr uintptr_t kRvaSeasonCtor = 0x1A05768u;
 constexpr uintptr_t kRvaServiceCtor = 0x18F0594u;
 constexpr uintptr_t kRvaManagerSetService = 0x1A08114u;
 constexpr uintptr_t kRvaManagerSeason = 0x1A08038u;
@@ -283,6 +316,8 @@ using InstanceIndexFn = void* (*)(void* self, int32_t index, void* method);
 using FromBase64Fn = void* (*)(void* text, void* method);
 // object JsonConvert.DeserializeObject(string, Type) -- static, so no `this`.
 using DeserializeFn = void* (*)(void* json, void* type, void* method);
+// void JsonConvert.PopulateObject(string, object) -- static as well.
+using PopulateFn = void (*)(void* json, void* target, void* method);
 // 三丄三丂丈七业丁丞..ctor(丐丑业丒丈丅丐专丅) and the manager's service setter: both
 // instance methods taking one managed reference.
 using InstanceArgVoidFn = void (*)(void* self, void* arg, void* method);
@@ -327,13 +362,10 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
     return true;
 }
 
-// Same as bind(), plus an identity check against the expected RVA. Used for
-// every method this module *calls* on the season path.
-//
-// This is what keeps the DeserializeObject binding honest: that name has four
-// two-argument overloads, and il2cpp_class_get_method_from_name returns
-// whichever the metadata lists first. Accepting the wrong one would mean
-// passing a Type object where a JsonSerializerSettings is expected.
+// Name-and-arity binding plus an identity check against the expected RVA. Safe
+// only where the name and argument count already pick out one method, which is
+// true for the service .ctor, the manager setter, the season .ctor and
+// PopulateObject -- all verified against the dump.
 inline bool bind_exact(Managed& out, const char* namespaze, const char* klass,
                        const char* method, int args_count,
                        uintptr_t expected_rva) {
@@ -354,6 +386,48 @@ inline bool bind_exact(Managed& out, const char* namespaze, const char* klass,
         out = Managed{};
         return false;
     }
+    return true;
+}
+
+// Binding by address, for methods that share a name and an argument count with
+// a sibling overload. The method list of the class is walked and the entry
+// whose compiled entry point is exactly base + rva is taken, which yields the
+// correct pointer and the MethodInfo that belongs to it, together.
+//
+// This is what the device forced: asking for "DeserializeObject"/2 by name
+// returned (string, JsonSerializerSettings) at 0x40BC7C4 instead of
+// (string, Type) at 0x40BC82C.
+inline bool bind_at_rva(Managed& out, const char* namespaze, const char* klass,
+                        uintptr_t rva, const char* label) {
+    if (g_base == 0u) {
+        LOGE("23.1.3-pixelpass: no module base, so %s cannot be located", label);
+        return false;
+    }
+    if (il2cpp::class_get_methods == nullptr) {
+        LOGE("23.1.3-pixelpass: this runtime exposes no method walk, so %s "
+             "cannot be picked out of its overloads",
+             label);
+        return false;
+    }
+
+    void* address = reinterpret_cast<void*>(g_base + rva);
+    out.info = il2cpp::find_method_by_address(namespaze, klass, address);
+    if (out.info == nullptr) {
+        LOGE("23.1.3-pixelpass: no method of %s sits at RVA 0x%" PRIxPTR
+             ", so %s was not bound",
+             klass, rva, label);
+        return false;
+    }
+
+    out.ptr = il2cpp::method_pointer(out.info);
+    if (out.ptr != address) {
+        LOGE("23.1.3-pixelpass: the method found for %s does not report the "
+             "address it was matched on; refusing it",
+             label);
+        out = Managed{};
+        return false;
+    }
+    LOGI("23.1.3-pixelpass: %s bound by address at RVA 0x%" PRIxPTR, label, rva);
     return true;
 }
 
@@ -391,6 +465,8 @@ inline Managed g_mgr_season{};
 inline Managed g_mgr_service{};
 inline Managed g_mgr_set_service{};
 inline Managed g_deserialize{};
+inline Managed g_populate{};
+inline Managed g_season_ctor{};
 inline Managed g_service_ctor{};
 inline void* g_season_klass = nullptr;
 inline void* g_service_klass = nullptr;
@@ -409,6 +485,8 @@ inline void* g_view_service_field = nullptr;
 
 inline bool g_manager_armed = false;
 inline bool g_season_path_ready = false;
+inline bool g_route_deserialize = false;
+inline bool g_route_populate = false;
 inline bool g_install_attempted = false;
 inline bool g_install_succeeded = false;
 inline bool g_gate_logged[3] = {false, false, false};
@@ -783,15 +861,15 @@ inline void* manager_service(void* manager) {
 // Newtonsoft. Doing this by hand is not an option: the DTO graph is full of
 // List<T> instantiations and converter-backed salted ints, and this port has
 // no generic-instantiation helper to build any of that.
+//
+// Route 1 parses straight into a typed instance. Route 2 allocates the
+// instance, runs its real constructor and lets Newtonsoft fill the fields; it
+// needs no method walk, so it is the one that survives a runtime without one,
+// and it can also succeed where the typed parse merely returns null.
 inline void* build_season_object() {
     if (!g_season_path_ready) return nullptr;
     if (!ensure_season_text()) return nullptr;
-    if (il2cpp::string_new == nullptr || il2cpp::class_get_type == nullptr ||
-        il2cpp::type_get_object == nullptr) {
-        LOGE("23.1.3-pixelpass: the runtime lacks the allocation or reflection "
-             "exports needed to build a season");
-        return nullptr;
-    }
+    if (il2cpp::string_new == nullptr) return nullptr;
 
     void* json = il2cpp::string_new(g_season_json.c_str());
     if (json == nullptr) {
@@ -799,26 +877,51 @@ inline void* build_season_object() {
         return nullptr;
     }
 
-    const void* season_type = il2cpp::class_get_type(g_season_klass);
-    void* type_object =
-        (season_type != nullptr) ? il2cpp::type_get_object(season_type) : nullptr;
-    if (type_object == nullptr) {
-        LOGE("23.1.3-pixelpass: the season type object could not be obtained");
-        return nullptr;
+    if (g_route_deserialize && il2cpp::class_get_type != nullptr &&
+        il2cpp::type_get_object != nullptr) {
+        const void* season_type = il2cpp::class_get_type(g_season_klass);
+        void* type_object = (season_type != nullptr)
+                                ? il2cpp::type_get_object(season_type)
+                                : nullptr;
+        if (type_object == nullptr) {
+            LOGE("23.1.3-pixelpass: the season type object could not be "
+                 "obtained; falling back to allocate and populate");
+        } else {
+            LOGI("23.1.3-pixelpass: parsing the season with the game's own "
+                 "Newtonsoft (%zu json bytes, %" PRId32 " tiers, %zu skin ids)",
+                 g_season_json.size(), kTierCount, g_skin_count);
+            void* season = reinterpret_cast<DeserializeFn>(g_deserialize.ptr)(
+                json, type_object, g_deserialize.info);
+            if (season != nullptr) {
+                LOGI("23.1.3-pixelpass: the season parsed cleanly");
+                return season;
+            }
+            LOGE("23.1.3-pixelpass: the typed parse returned no season; "
+                 "falling back to allocate and populate");
+        }
     }
 
-    LOGI("23.1.3-pixelpass: parsing the season with the game's own "
-         "Newtonsoft (%zu json bytes, %" PRId32 " tiers, %zu skin ids)",
-         g_season_json.size(), kTierCount, g_skin_count);
-    void* season = reinterpret_cast<DeserializeFn>(g_deserialize.ptr)(
-        json, type_object, g_deserialize.info);
-    if (season == nullptr) {
-        LOGE("23.1.3-pixelpass: the serialiser returned no season; the payload "
-             "shape was rejected");
-        return nullptr;
+    if (g_route_populate && il2cpp::object_new != nullptr) {
+        LOGI("23.1.3-pixelpass: allocating a season and populating it (%zu "
+             "json bytes, %" PRId32 " tiers, %zu skin ids)",
+             g_season_json.size(), kTierCount, g_skin_count);
+        void* season = il2cpp::object_new(g_season_klass);
+        if (season == nullptr) {
+            LOGE("23.1.3-pixelpass: the season could not be allocated");
+            return nullptr;
+        }
+        // il2cpp_object_new does not run constructors, so this is the `newobj`
+        // second half and has to happen before anything reads the instance.
+        reinterpret_cast<InstanceVoidFn>(g_season_ctor.ptr)(season,
+                                                            g_season_ctor.info);
+        reinterpret_cast<PopulateFn>(g_populate.ptr)(json, season,
+                                                     g_populate.info);
+        LOGI("23.1.3-pixelpass: the season was populated");
+        return season;
     }
-    LOGI("23.1.3-pixelpass: the season parsed cleanly");
-    return season;
+
+    LOGE("23.1.3-pixelpass: no season construction route is available");
+    return nullptr;
 }
 
 // Builds the season, wraps it in a pass service and hands that to the manager.
@@ -858,8 +961,6 @@ inline bool install_season(void* manager) {
         return false;
     }
 
-    // il2cpp_object_new does not run constructors, so this is the `newobj`
-    // second half. It must happen before the object is published anywhere.
     LOGI("23.1.3-pixelpass: running the pass service constructor");
     reinterpret_cast<InstanceArgVoidFn>(g_service_ctor.ptr)(
         service, season, g_service_ctor.info);
@@ -872,17 +973,27 @@ inline bool install_season(void* manager) {
     void* stored_season = manager_season(manager);
     g_install_succeeded = (stored_service != nullptr);
 
-    if (g_install_succeeded) {
-        LOGI("23.1.3-pixelpass: the pass manager now holds a service and its "
-             "season reads back %s; %" PRId32 " tiers over %" PRId32
-             " page(s) are live",
-             stored_season != nullptr ? "present" : "absent", kTierCount,
-             (kTierCount + kTiersPerPage - 1) / kTiersPerPage);
-    } else {
+    if (!g_install_succeeded) {
         LOGE("23.1.3-pixelpass: the service was constructed but the manager did "
              "not keep it");
+        return false;
     }
-    return g_install_succeeded;
+
+    if (stored_season != nullptr) {
+        LOGI("23.1.3-pixelpass: the pass manager now holds a service and "
+             "reports its season; %" PRId32 " tiers over %" PRId32
+             " page(s) are live",
+             kTierCount, (kTierCount + kTiersPerPage - 1) / kTiersPerPage);
+    } else {
+        // Worth saying precisely, because it decides where to write next: the
+        // manager would then be reading its season from the pass state holder
+        // rather than from the service, and that holder needs setting too.
+        LOGE("23.1.3-pixelpass: the pass manager kept the service but still "
+             "reports no season, so it reads the season from the pass state "
+             "holder rather than from the service; that holder is the "
+             "remaining place to write");
+    }
+    return true;
 }
 
 // ---------------------------------------------------------- the gate hooks
@@ -1140,10 +1251,9 @@ inline void pump() {
 // Binds everything needed to build a season and hand it over. Every method
 // called on this path is identity-checked against its expected RVA first.
 inline bool install_season_path() {
-    if (il2cpp::object_new == nullptr || il2cpp::class_get_type == nullptr ||
-        il2cpp::type_get_object == nullptr) {
-        LOGE("23.1.3-pixelpass: this runtime does not export the allocation or "
-             "reflection entry points, so no season can be constructed");
+    if (il2cpp::object_new == nullptr) {
+        LOGE("23.1.3-pixelpass: this runtime does not export managed "
+             "allocation, so no season can be constructed");
         return false;
     }
 
@@ -1155,18 +1265,46 @@ inline bool install_season_path() {
         return false;
     }
 
+    // Route 1: parse straight into a typed instance. Bound by address, because
+    // this name has four two-argument overloads and the device showed metadata
+    // lookup returning the wrong one.
+    g_route_deserialize =
+        (il2cpp::class_get_type != nullptr &&
+         il2cpp::type_get_object != nullptr) &&
+        bind_at_rva(g_deserialize, kJsonNs, kJsonConvertClass,
+                    kRvaDeserializeStringType,
+                    "JsonConvert.DeserializeObject(string, Type)");
+
+    // Route 2: allocate, run the real constructor, let Newtonsoft fill the
+    // fields. PopulateObject has exactly one two-argument overload and the
+    // season .ctor takes none, so name plus arity is unambiguous for both and
+    // the RVA check only confirms the build. No method walk is needed here.
+    g_route_populate =
+        bind_exact(g_populate, kJsonNs, kJsonConvertClass, kPopulateObject, 2,
+                   kRvaPopulateObject) &&
+        bind_exact(g_season_ctor, kPassNs, kSeasonClass, kCtor, 0,
+                   kRvaSeasonCtor);
+
+    if (!g_route_deserialize && !g_route_populate) {
+        LOGE("23.1.3-pixelpass: neither season construction route verified "
+             "against this build; nothing will be injected");
+        return false;
+    }
+
     bool ok = true;
-    ok &= bind_exact(g_deserialize, kJsonNs, kJsonConvertClass,
-                     kDeserializeObject, 2, kRvaDeserializeStringType);
     ok &= bind_exact(g_service_ctor, kPassNs, kServiceClass, kCtor, 1,
                      kRvaServiceCtor);
     ok &= bind_exact(g_mgr_set_service, kPassNs, kManagerClass,
                      kManagerSetService, 1, kRvaManagerSetService);
     if (!ok) {
-        LOGE("23.1.3-pixelpass: the season construction path did not verify "
-             "against this build; nothing will be injected");
+        LOGE("23.1.3-pixelpass: the pass service constructor or the manager "
+             "setter did not verify; nothing will be injected");
         return false;
     }
+
+    LOGI("23.1.3-pixelpass: season construction armed (typed parse=%d, "
+         "allocate and populate=%d)",
+         g_route_deserialize ? 1 : 0, g_route_populate ? 1 : 0);
     return true;
 }
 
@@ -1264,12 +1402,14 @@ inline bool install(uintptr_t base) {
     g_installed = true;
     LOGI("23.1.3-pixelpass: armed (config id %" PRId32 ", %" PRId32
          " tiers, %" PRId32 " per page; cache probes primary=%d secondary=%d "
-         "inner=%d save=%d, manager=%d, season construction=%d); the season is "
-         "constructed on device and handed to the game's own pass manager, "
-         "because the device proved the config cache is never asked for it",
+         "inner=%d save=%d, manager=%d, season construction=%d, typed "
+         "parse=%d, allocate and populate=%d); the season is constructed on "
+         "device and handed to the game's own pass manager, because the device "
+         "proved the config cache is never asked for it",
          kConfigPixelPass, kTierCount, kTiersPerPage, primary ? 1 : 0,
          alt ? 1 : 0, inner ? 1 : 0, save ? 1 : 0, g_manager_armed ? 1 : 0,
-         g_season_path_ready ? 1 : 0);
+         g_season_path_ready ? 1 : 0, g_route_deserialize ? 1 : 0,
+         g_route_populate ? 1 : 0);
     return true;
 }
 
@@ -1280,8 +1420,8 @@ inline bool install(uintptr_t base) {
 // stock config cache is also instrumented, as a probe and a safety net.
 //
 // `base` is the loaded libil2cpp.so base address: every managed method this
-// module calls is identity-checked against its expected RVA before use, which
-// is what keeps the ambiguous JsonConvert.DeserializeObject overload honest.
+// module calls is identified against its expected RVA before use, which is
+// what keeps the ambiguous JsonConvert overloads apart.
 inline bool install_hooks(uintptr_t base) { return detail::install(base); }
 
 // Read-only counters plus a backstop for installing the season if the lobby
