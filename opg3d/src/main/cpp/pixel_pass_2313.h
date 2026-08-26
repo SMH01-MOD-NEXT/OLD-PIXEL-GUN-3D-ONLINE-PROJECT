@@ -3,6 +3,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -229,6 +230,33 @@ constexpr const char* kServiceSeason = "丟三一丄丈丒三丈丞";      // 0x
 constexpr const char* kServiceInWindow = "东与丞且丘丈专东丆";   // bool /0, 0x18EEC4C
 constexpr const char* kServiceUnlocked = "一丒丄丘不七与丁万";   // bool /0, 0x18EEF7C
 
+// 丈丛丛万丗丟丅丛丐/0 (0x18EF8CC) is a third service predicate, and unlike the two
+// above it belongs to no gate at all -- only the lobby view asks it:
+//
+//     return 丕丕丂七丆丕世丈三() != null && <int sibling at 0x18EF0B0>() > 0;
+//
+// It is what picks between the real pass face and the coming-soon face.
+constexpr const char* kServiceHasContent = "丈丛丛万丗丟丅丛丐";   // bool /0, 0x18EF8CC
+
+// The service's current cell. The lobby view dereferences it with no null
+// check the moment the predicates above answer true, so it has to be non-null
+// before this module reports content. See svc_content_hook.
+constexpr const char* kServiceCurrentCell = "丞丞不丈七世丕丘丝";  // 丅丅万丕不下丐丄丘, 0x68
+
+// PixelTime sits in the global namespace, and 丒万丟且丑上东丂丈/0 is the server clock:
+//
+//     if (<singleton>.statics[+0x700]) return -1;
+//     if (!PixelTime.专丒不丕万丘丈世丏) return -1;   // static bool,  +0xC
+//     return PixelTime.丈万丝丕丁万丗业丘;            // static long,  +0x0
+//
+// Offline neither condition is ever satisfied, so it returns -1 for the whole
+// session. This is the very first thing the lobby view's refresh reads, and a
+// value below 1 there switches the entire entry off before the pass manager is
+// consulted at all.
+constexpr const char* kClockNs = "";
+constexpr const char* kClockClass = "PixelTime";              // 4263
+constexpr const char* kClockNow = "丒万丟且丑上东丂丈";            // static long /0
+
 // The lobby view itself. Its serialised field names are not obfuscated.
 constexpr const char* kLobbyViewClass = "PixelPassLobbyView";  // 12069
 constexpr const char* kLobbyViewOnEnable = "OnEnable";         // /0, 0x28F4C68
@@ -277,6 +305,12 @@ constexpr uintptr_t kRvaManagerSeason = 0x1A08038u;
 // address check is what proves this is the verified image before patching.
 constexpr uintptr_t kRvaServiceInWindow = 0x18EEC4Cu;
 constexpr uintptr_t kRvaServiceUnlocked = 0x18EEF7Cu;
+// The content check the lobby view asks between those two.
+constexpr uintptr_t kRvaServiceHasContent = 0x18EF8CCu;
+// PixelTime.丒万丟且丑上东丂丈/0. Address-verified like the rest: this one is a
+// global-namespace MonoBehaviour, and hooking the wrong clock would misdate
+// every timed system in the build, not just the pass.
+constexpr uintptr_t kRvaClockNow = 0x3D5E394u;
 
 // ---------------------------------------------------------------- constants
 
@@ -365,6 +399,8 @@ constexpr size_t kArrayLengthOffset = 0x18u;
 // ------------------------------------------------------------- managed ABI
 
 using StaticObjFn = void* (*)(void* method);
+// long PixelTime.<now>() -- static, so the method info is the only argument.
+using StaticLongFn = int64_t (*)(void* method);
 using InstanceObjFn = void* (*)(void* self, void* method);
 using InstanceBoolFn = bool (*)(void* self, void* method);
 using InstanceVoidFn = void (*)(void* self, void* method);
@@ -563,6 +599,47 @@ inline uint64_t g_season_served = 0u;
 inline bool g_season_served_logged = false;
 inline bool g_window_forced_logged = false;
 inline bool g_unlock_forced_logged = false;
+
+// All three reads above are consulted by the *manager*. The lobby view never
+// gets that far. PixelPassLobbyView's refresh at 0x28F4E5C -- the method
+// OnEnable tail-branches into -- opens with
+//
+//     if (PixelTime.丒万丟且丑上东丂丈() < 1) { SetActive(_holder, false); return; }
+//
+// and only then asks the manager for gate C. The clock body at 0x3D5E394
+// decodes to
+//
+//     if (<singleton>.statics[0x700]) return -1;      // shutting down
+//     if (!PixelTime.专丒不丕万丘丈世丏) return -1;          // never synced
+//     return PixelTime.丈万丝丕丁万丗业丘;                  // server seconds
+//
+// so it returns -1 for the entire offline session, and the view switches the
+// whole pass holder off before a single gate is queried. That is why v3 opened
+// gates A, B and C, published a 50-tier season, and the entry still did not
+// appear: nothing downstream of that first statement ever ran.
+//
+// The clock answer is deliberately left global rather than keyed on the pass:
+// every timed system in the build reads this same accessor and every one of
+// them is reading -1 right now. Device time also makes the season window pass
+// on its own merits, since kSeasonStart/kSeasonEnd are both int32-safe.
+inline StaticLongFn g_clock_orig = nullptr;
+
+// bool 三丄三丂丈七业丁丞.丈丛丛万丗丟丅丛丐() at 0x18EF8CC decodes to
+//     return 丕丕丂七丆丕世丈三() != null && <int sibling 0x18EF0B0>() > 0;
+// The view asks it immediately after showing the holder and drops to the
+// lock + coming-soon face when it answers false.
+inline InstanceBoolFn g_svc_content_orig = nullptr;
+
+// The service's current cell, field 0x68 (丞丞不丈七世丕丘丝 -- nine characters, the
+// same trap as 丞丏业丐丒与业丗与 in the progression module). The view dereferences it
+// with no null check once the content answer is true, so the answer is only
+// forced when the cell is genuinely there; otherwise stock's false stands and
+// the player gets a visible coming-soon panel instead of a managed
+// NullReferenceException thrown inside OnEnable.
+inline void* g_service_cell_field = nullptr;
+inline bool g_clock_forced_logged = false;
+inline bool g_content_forced_logged = false;
+inline bool g_content_refused_logged = false;
 
 inline void* g_view_holder_field = nullptr;
 inline void* g_view_lock_field = nullptr;
@@ -1047,6 +1124,71 @@ inline bool svc_unlock_hook(void* self, void* method) {
         LOGI("23.1.3-pixelpass: the pass has no row in the offline "
              "ExpOpenSystem table and its entry overload bypasses the content "
              "gate hook; reporting the installed season as unlocked");
+    }
+    return true;
+}
+
+// The clock guard the lobby view opens with. PixelTime's accessor answers -1
+// for the whole offline session and the refresh treats anything below 1 as "no
+// time published yet", switching the pass holder off before it consults the
+// manager. Device seconds are a drop-in answer: the accessor is only ever read
+// as a wall-clock second count, and every consumer already copes with it
+// advancing between calls.
+inline int64_t clock_now_hook(void* method) {
+    const int64_t stock = (g_clock_orig != nullptr) ? g_clock_orig(method) : -1;
+    if (stock >= 1) return stock;
+
+    const int64_t now = static_cast<int64_t>(::time(nullptr));
+    if (now < 1) return stock;
+
+    if (!g_clock_forced_logged) {
+        g_clock_forced_logged = true;
+        LOGI("23.1.3-pixelpass: the server clock reads %lld, and the lobby view "
+             "switches the whole pass holder off before it asks a single gate "
+             "when that value is below 1; answering with device time %lld",
+             static_cast<long long>(stock), static_cast<long long>(now));
+    }
+    return now;
+}
+
+// True only when the service really holds a current cell. The view reads field
+// 0x68 immediately after the content check passes and dereferences it with no
+// null test, so forcing content on an empty service would throw a managed
+// NullReferenceException inside OnEnable instead of drawing the entry.
+inline bool service_has_current_cell(void* service) {
+    if (service == nullptr || g_service_cell_field == nullptr) return false;
+    void* cell = nullptr;
+    il2cpp::field_get_value(service, g_service_cell_field, &cell);
+    return cell != nullptr;
+}
+
+// The second question the view asks on its own behalf. Stock reads a
+// config-backed counter that is empty offline, which drops the entry to the
+// lock + coming-soon face. Forced only when the installed season really has a
+// current cell to show; otherwise stock's answer stands and the player sees a
+// visible coming-soon panel rather than a crash.
+inline bool svc_content_hook(void* self, void* method) {
+    const bool stock = (g_svc_content_orig != nullptr)
+                           ? g_svc_content_orig(self, method)
+                           : false;
+    if (stock || !g_install_succeeded) return stock;
+
+    if (!service_has_current_cell(self)) {
+        if (!g_content_refused_logged) {
+            g_content_refused_logged = true;
+            LOGW("23.1.3-pixelpass: the pass content check answered false and "
+                 "the service holds no current cell; keeping the stock answer "
+                 "so the lobby draws the coming-soon face instead of "
+                 "dereferencing a missing cell inside OnEnable");
+        }
+        return stock;
+    }
+
+    if (!g_content_forced_logged) {
+        g_content_forced_logged = true;
+        LOGI("23.1.3-pixelpass: the pass content check reads a config-backed "
+             "counter that is empty offline; the installed season has a current "
+             "cell, so reporting the pass content as present");
     }
     return true;
 }
@@ -1642,11 +1784,44 @@ inline bool install_manager() {
                       reinterpret_cast<void*>(&svc_unlock_hook),
                       reinterpret_cast<void**>(&g_svc_unlock_orig), false);
 
+    // Everything above answers the pass *manager*. The lobby view asks two
+    // more questions on its own behalf before it draws anything, and both of
+    // them failed in the v3 capture even though every gate was open:
+    //
+    //   1. the server clock, the very first statement of the refresh at
+    //      0x28F4E5C; below 1 the holder is switched off and the method
+    //      returns without consulting the manager at all;
+    //   2. the service's content check, which drops the entry to the
+    //      lock + coming-soon face when it answers false.
+    g_service_cell_field =
+        il2cpp::find_field(kPassNs, kServiceClass, kServiceCurrentCell);
+    if (g_service_cell_field == nullptr) {
+        LOGE("23.1.3-pixelpass: the pass service has no '%s' current-cell field "
+             "in this build; the content check keeps its stock answer so the "
+             "lobby cannot dereference a cell that is not there",
+             kServiceCurrentCell);
+    }
+    const bool content =
+        hook_target_verified("the pass content check", kPassNs, kServiceClass,
+                             kServiceHasContent, 0, kRvaServiceHasContent) &&
+        hook::install({kPassNs, kServiceClass, kServiceHasContent, 0},
+                      reinterpret_cast<void*>(&svc_content_hook),
+                      reinterpret_cast<void**>(&g_svc_content_orig), false);
+    const bool clock =
+        hook_target_verified("the server clock", kClockNs, kClockClass,
+                             kClockNow, 0, kRvaClockNow) &&
+        hook::install({kClockNs, kClockClass, kClockNow, 0},
+                      reinterpret_cast<void*>(&clock_now_hook),
+                      reinterpret_cast<void**>(&g_clock_orig), false);
+
     LOGI("23.1.3-pixelpass: season read-back armed (manager season getter=%d, "
-         "season window=%d, pass unlock=%d); the manager's getter reads the "
-         "static config store by id, so it is answered from the installed "
-         "service instead",
-         season_read ? 1 : 0, window ? 1 : 0, unlocked ? 1 : 0);
+         "season window=%d, pass unlock=%d, pass content=%d, server clock=%d); "
+         "the manager's getter reads the static config store by id, so it is "
+         "answered from the installed service, and the lobby view's own clock "
+         "guard is answered with device time because it hides the entry before "
+         "any gate is asked",
+         season_read ? 1 : 0, window ? 1 : 0, unlocked ? 1 : 0,
+         content ? 1 : 0, clock ? 1 : 0);
 
     const bool gate_a =
         hook::install({kPassNs, kManagerClass, kManagerGateA, 0},

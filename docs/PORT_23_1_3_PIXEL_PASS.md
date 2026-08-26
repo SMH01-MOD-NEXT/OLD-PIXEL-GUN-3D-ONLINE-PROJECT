@@ -45,7 +45,7 @@ elsewhere: `feature.pixelpass` is opened by `live_content_2313`, which hooks
 `世丁丒专东专丛一且::一丈丞丞万丐与丏业/1`. An open flag with no season still yields no
 button, which is why both modules are needed.
 
-## Four attempts, and what each one got wrong
+## Six attempts, and what each one got wrong
 
 **1. Grant cosmetics natively.** No season was ever created, so the lobby had
 nothing to lay out. Wrong layer.
@@ -182,8 +182,86 @@ The second row is the mechanical reason gate A stayed shut. The content-gate
 module's own header already documented `0x20DF334` as an unhooked entry point;
 what was new is that the pass depends on exactly that entry point.
 
+**6. Answering the manager's three reads (v3).** All three were fixed and the
+device proved it. The capture of Aug 26 17:05 is unambiguous:
+
+```
+#000111 +003423ms pixelpass: season read-back armed (manager season getter=1, season window=1, pass unlock=1)
+#000184 +004212ms pixelpass: gate C was asked before a season existed; building one now
+#000185 +004218ms pixelpass: season authored (4341 json bytes, 50 tiers, 17 skin ids, graffiti tiers 10)
+#000187 +004346ms pixelpass: the season parsed cleanly
+#000191 +004528ms pixelpass: the manager's season getter reads the static config store by id ...; answering it from the service this module installed instead
+#000192 +004528ms pixelpass: the pass manager now holds a service and reports its season; 50 tiers over 5 page(s) are live
+#000193 +004528ms pixelpass: the pass manager answered gate C = true  while the season is present
+#000209 +005091ms pixelpass: the season window read as closed ...; reporting the installed season as current
+#000210 +005104ms pixelpass: the pass manager answered gate A = true  while the season is present
+```
+
+Every gate that decides the entry answers `true`, the season is live with 50
+tiers over 5 pages, and the `pass has no row in the offline ExpOpenSystem
+table` line is *absent* — at level 65 stock `一丒丄丘不七与丁万()` succeeds on its own,
+exactly as attempt 5 predicted. The entry was still missing.
+
+*Because the lobby view never asks the manager anything.* `OnEnable`
+(`0x28F4C68`) subscribes its events and then tail-branches into the refresh at
+`0x28F4E5C`, and that method opens with a clock check, not a gate query:
+
+```csharp
+this.丗且丈丁丕丕丘一丞 = null;                               // field 0x110
+if (PixelTime.丒万丟且丑上东丂丈() < 1) {                     // 0x3D5E394
+    SetActive(this._holder, false);                     // field 0x48
+    return;                                             // <- every offline run ends here
+}
+if (!Manager.Instance.专丒丂丂丕业丛丐丂()) {                  // gate C, only now
+    SetActive(this._holder, false);
+    return;
+}
+this.丗且丈丁丕丕丘一丞 = Manager.Instance.service;            // manager +0x10
+SetActive(this._holder, true);
+// ... every state container is switched off, then:
+if (svc == null || !svc.丈丛丛万丗丟丅丛丐())                   // 0x18EF8CC
+    { SetActive(_lockContainer, true); SetActive(_comingSoonContainer, true); return; }
+if (!svc.一丒丄丘不七与丁万())
+    { SetActive(_lockContainer, true); SetActive(_needLevelContainer, true); ... }
+var cell = svc.丞丞不丈七世丕丘丝;                             // service +0x68, no null check
+```
+
+The clock body at `0x3D5E394` is three lines:
+
+```csharp
+if (<singleton>.statics[0x700]) return -1;    // shutting down
+if (!PixelTime.专丒不丕万丘丈世丏) return -1;         // never synchronised -> offline
+return PixelTime.丈万丝丕丁万丗业丘;                  // server seconds
+```
+
+Offline the sync flag is never set, so it returns `-1` for the entire session,
+and the view switches the whole holder off **before the manager is consulted at
+all**. Opening gates A, B and C could not possibly have helped: nothing past
+that first statement ever ran. It also explains why the hook installed at
+`base+0x28F4C68` logged nothing — the v3 capture stops at `InitSwitcher state=5
+bar=0.040`, 4 % of loading, long before a lobby exists to enable.
+
+Two further traps in the same method, both handled by v4:
+
+* `丈丛丛万丗丟丅丛丐()` (`0x18EF8CC`) decodes to `丕丕丂七丆丕世丈三() != null && <int at
+  0x18EF0B0>() > 0` — another config-backed counter, empty offline, which drops
+  the entry to the lock + coming-soon face even after the clock is answered.
+* the current cell at service `+0x68` is dereferenced with **no null check**
+  (`0x28F53D8` throws). So the content answer is only forced when the cell is
+  genuinely present; otherwise stock's `false` stands and the player gets a
+  visible coming-soon panel instead of a managed exception thrown inside
+  `OnEnable`. Note the field is the nine-character `丞丞不丈七世丕丘丝`, not the
+  eight-character prefix — the same trap as `丞丏业丐丒与业丗与` in `progression_2313`.
+
+The clock hook is deliberately **global**, not keyed on the pass: every timed
+system in this build reads that same accessor and every one of them is reading
+`-1` right now. It also makes the season window pass on its own merits, since
+`kSeasonStart`/`kSeasonEnd` are both int32-safe after attempt 5.
+
 **Current design, below:** the gates build the season, only entering managed
-construction is irreversible, and all three decisive reads are answered.
+construction is irreversible, all three manager reads are answered, and the two
+questions the lobby view asks for itself — the server clock and the pass content
+check — are answered too.
 
 ## Current design
 
@@ -359,34 +437,69 @@ guaranteed to be populated.
 
 ## Expected log
 
-The build tag is now `lobby gate v7 + ... + pixel pass v3 (season read-back +
-gate A predicates)`. If `#000005 init:` still says `lobby gate v6` or `v5`, the
+The build tag is now `lobby gate v7 + ... + pixel pass v4 (lobby view clock +
+content face)`. If `#000005 init:` still says `pixel pass v3` or earlier, the
 old `.so` is running and nothing below applies.
 
 ```
-23.1.3-pixelpass: season read-back armed (manager season getter=1, season window=1, pass unlock=1)
+23.1.3-pixelpass: season read-back armed (manager season getter=1, season window=1, pass unlock=1, pass content=1, server clock=1)
 23.1.3-pixelpass: pass manager armed (gates A=1 B=1 C=1, lobby view OnEnable=1, season construction=1)
+23.1.3-pixelpass: the server clock reads -1, and the lobby view switches the whole pass holder off before it asks a single gate when that value is below 1; answering with device time 1787...
 23.1.3-pixelpass: gate C was asked before a season existed; building one now
-23.1.3-pixelpass: no season could be built yet (the local weapon skin catalogue is still empty); this is retried, not fatal
 23.1.3-pixelpass: season authored (N json bytes, 50 tiers, M skin ids, graffiti tiers 10)
 23.1.3-pixelpass: the season parsed cleanly
 23.1.3-pixelpass: the manager's season getter reads the static config store by id, which is empty offline; answering it from the service this module installed instead
 23.1.3-pixelpass: the pass manager now holds a service and reports its season; 50 tiers over 5 page(s) are live
-23.1.3-pixelpass: the season window read as closed (the bounds are int32 unix seconds and the server clock is -1 offline); reporting the installed season as current
-23.1.3-pixelpass: the pass has no row in the offline ExpOpenSystem table and its entry overload bypasses the content gate hook; reporting the installed season as unlocked
+23.1.3-pixelpass: the pass manager answered gate C = true  while the season is present
+23.1.3-pixelpass: the pass manager answered gate A = true  while the season is present
+23.1.3-pixelpass: the pass content check reads a config-backed counter that is empty offline; the installed season has a current cell, so reporting the pass content as present
+23.1.3-pixelpass: PixelPassLobbyView.OnEnable ran
 ```
 
-The three lines that are new in v3 are the ones that matter. `answering it from
-the service` proves the config-store read-back is live; the `window` and
-`unlock` lines prove the two gate A predicates are being answered. After them,
-gate A should report **`= true`** on its own — the `the season exists but gate A
-was shut` backstop line should now be *absent*, because the stock gate
-implementation succeeds by itself.
+The two lines that are new in v4 are the ones that matter, and the arming line
+is the first thing to read:
+
+* **`server clock=1`.** Without it the entry cannot appear no matter what the
+  gates say, because the view returns at its first statement. `server clock=0`
+  means `hook_target_verified` refused the target — `PixelTime.丒万丟且丑上东丂丈` is
+  not at `0x3D5E394` in the running `libil2cpp.so`, so re-derive the RVA from
+  `analys2313/dump2313.cs` before anything else.
+* **`pass content=1`.** With it the view reaches the normal face; without it the
+  entry can still appear, but as lock + coming-soon.
+
+The clock line is logged once, on the first offline read, and that happens long
+before the lobby exists — practically every timed system in the build asks for
+it during loading. `PixelPassLobbyView.OnEnable ran` is the line that proves the
+view finally got past the guard, and it can only appear **after loading reaches
+100 %**. A capture that stops at `InitSwitcher ... bar=0.040` says nothing about
+the pass entry either way; that is what made the v3 capture look like a failure
+of the gates.
+
+Two lines that are *expected to be absent* in v4:
+
+* `the season window read as closed ...` — with a real clock the window is
+  genuinely open, since `kSeasonStart` is 2020 and `kSeasonEnd` is 2035 and both
+  are int32-safe. Seeing it is harmless; it means the window was asked before
+  the clock hook was reached.
+* `the pass has no row in the offline ExpOpenSystem table ...` — at level 65 the
+  stock unlock predicate succeeds on its own. The v3 capture already confirmed
+  this on device.
+
+One warning is worth watching for:
+
+```
+23.1.3-pixelpass: the pass content check answered false and the service holds no current cell; keeping the stock answer ...
+```
+
+That is the fail-safe, not a bug: the view dereferences the current cell at
+service `+0x68` with no null check, so a forced answer there would throw inside
+`OnEnable` instead of drawing anything. If it appears, the entry will render as
+coming-soon and the thing to chase is why the constructor chain at `0x18F05FC`
+left `+0x68` empty for a season that parsed cleanly.
 
 If `season read-back armed` reports `manager season getter=0`, the season will
 never be visible no matter how cleanly it parses — that is the v2 failure mode
-and it is now called out explicitly at arming time rather than three seconds
-later.
+and it is called out at arming time rather than three seconds later.
 
 The middle line is expected and harmless — the first gate query happens on the
 loading screen, before the skin catalogue exists. It should be followed by
