@@ -6,67 +6,103 @@
 #include <string>
 #include <vector>
 
+#include "hook.h"
 #include "il2cpp.h"
 #include "log.h"
 
-// Offline PixelPass season provisioning for the exact supplied 23.1.3 ARM64
-// libil2cpp.so.
+// Offline PixelPass season for the exact supplied 23.1.3 ARM64 libil2cpp.so.
 //
 // Why there was no battle pass at all
 // -----------------------------------
 // PGCompany.PixelPassLobbyView (TypeDefIndex 12069) owns the lobby entry
 // point. It keeps a whole set of states behind separate containers --
 // _lockContainer (0x70), _unLockContainer (0x78), _comingSoonContainer
-// (0x80), _needLevelContainer (0x88) -- but all of them live under a single
-// _holder (0x48), and the view switches that holder off wholesale when the
-// pass service (三丄三丂丈七业丁丞, held at +0x110) has no season. That is why the
-// main menu showed no pass button at all, not even a coming-soon state: with
-// no season there is nothing to lay out.
+// (0x80), _needLevelContainer (0x88), _tutorialContainer (0xA0) -- but all of
+// them live under a single _holder (0x48), and the view switches that holder
+// off wholesale when the pass service (三丄三丂丈七业丁丞, held at +0x110) has no
+// season. So with no season there is no button at all, not even a
+// coming-soon state.
 //
 // The season is pure configuration. PGCompany.PixelPass.丐丑业丒丈丅丐专丅
 // (TypeDefIndex 13225) is tagged [不丙三且丅上丞丙丏(123, 1, True)] together with
 // [JsonObject(1)] and carries the entire pass: Common ("c"), Pages ("p"),
-// Levels ("l"), tasks and offers. ConfigId 123 is the payload the stock
-// client calls "pixel-pass-v6". The retired backend never computed it, it
-// only shipped it -- so it can be supplied locally.
+// Levels ("l"), tasks and offers. ConfigId 123 is PixelPass. The retired
+// backend never computed that payload, it only shipped it -- so it can be
+// supplied locally.
 //
-// How the season is supplied, inside this library
-// ----------------------------------------------
-// 23.1.3 ships its own on-device config cache: PGCompany.丅丝业七三丈丝丑丏
-// (TypeDefIndex 11078), the class that owns the "BinaryConfigStorage.Key"
-// marker. It exposes an instance save and an instance load keyed by ConfigId:
+// Why the previous approach never worked
+// --------------------------------------
+// The first attempt granted cosmetics natively and never created a season.
+// The second attempt created a season, but wrote it into the on-device cache
+// from the MainMenuController.Update slot owned by progression_2313 -- and
+// that hook was never installed, because progression_2313 was binding a
+// Progress service getter name that does not exist in 23.1.3 metadata and
+// bailed out before reaching its hook installation. The supplied logcat shows
+// exactly that: "东丝丂丄业丕且丙丑::丞丏业丐丒与业/0 not found in metadata",
+// "nothing was hooked", progression=0 -- and, decisively, the pixelpass tag
+// reports only its bind phase ("armed") with neither a success line nor the
+// "giving up after N attempts" line anywhere in the log. The seeder never ran
+// a single time.
 //
-//   与万丝丗丁不丗一丗(ConfigId, byte[], out string)     // save
-//   东丗与丏丟丛丂三丞(ConfigId, out byte[], out string)  // load
+// Two lessons are baked into the design below.
 //
-// So the season is handed to the game through its own storage, parsed by its
-// own Newtonsoft pipeline and rendered by its own pass screens. No self-hosted
-// backend, no reimplemented UI, no synthetic managed objects.
+//   1. This module must not depend on another module's hook. It installs its
+//      own and is driven by the game, not by a frame counter someone else
+//      owns.
+//   2. Writing the season into the cache and hoping the config pipeline reads
+//      it afterwards is a timing bet. Worse, it is a one-way bet: the old
+//      code skipped writing whenever a payload of >= 3 bytes was already
+//      cached, so a single malformed season would have been cached forever
+//      and would have blocked its own repair.
+//
+// How the season is supplied now
+// ------------------------------
+// 23.1.3 ships its own on-device config cache, PGCompany.丅丝业七三丈丝丑丏
+// (TypeDefIndex 11078) -- the class that owns the "BinaryConfigStorage.Key"
+// marker. Rather than writing into it, this module hooks the read:
+//
+//   东丗与丏丟丛丂三丞(ConfigId, out byte[], out string)   // RVA 0x249D670
+//
+// and answers ConfigId 123 with the season whenever the stock lookup comes
+// back empty. Any real cached payload always wins, so this cannot mask real
+// content. Nothing is persisted, so nothing can rot in the cache. And the
+// season arrives exactly when the config pipeline asks for it, whenever that
+// happens to be, instead of at a guessed frame number.
+//
+// Overload safety: the metadata name 东丗与丏丟丛丂三丞 occurs exactly once in the
+// whole 23.1.3 dump, so name plus argument count selects it unambiguously --
+// unlike the sibling loader 与丌下丑丝丁丄丏丛/3 (0x249E064), which is a different
+// name and is left untouched.
 //
 // Two properties of the build make hand-authored JSON safe here:
 //
-//   * Rilisoft.丅丏丏丛丕丁丟上丞, the salted int used for SeasonId and tier Exp, is
-//     tagged [JsonConverter(typeof(七不不丐专世丝丄上))]. In JSON it is therefore a
-//     plain number and the converter re-salts it on read: no salt is ever
-//     fabricated, so nothing looks tampered with to the client.
+//   * Rilisoft.丅丏丏丛丕丁丟上丞, the salted int used for SeasonId, tier Level,
+//     NumPage, Exp and IsFree, is tagged
+//     [JsonConverter(typeof(七不不丐专世丝丄上))] (TypeDefIndex 9203). In JSON it is
+//     therefore a plain *number* and the converter re-salts it on read: no
+//     salt is ever fabricated, so nothing looks tampered with to the client.
+//     Note that IsFree ("f") is one of these salted ints and NOT a bool --
+//     emitting `true` there cannot be read back.
 //   * Rewards are strings. PGCompany.丏不丏丂丙丐专丏丅.ReadJson (0x33494A4) hands
 //     the token to DataSystem.DataCollectors.丒丗丘万一七与丟丕.丌丄丛丈与丝丑世丆
 //     (0x2B005A4), and 丑一丘与丁丄专专专.丅专万三丙业丗丟一 (0x24B4260) splits the string
-//     on ':' (movz w1, #0x3A) and int-parses the first field, which matches the
-//     (OfferItemType, string id, int amount) constructor at 0x24B39D8. A reward
-//     is therefore "<type>:<id>:<amount>", e.g. "1170:<skin id>:1".
+//     on ':' (movz w1, #0x3A) and int-parses the first field, which matches
+//     the (OfferItemType, string id, int amount) constructor at 0x24B39D8. A
+//     reward is therefore "<type>:<id>:<amount>", e.g. "1170:<skin id>:1".
 //
 // Only ids the build itself reports are written for skins: they come from
 // Rilisoft.与世且一丁丆丈丄丈.丛上丌丏丟丒东丂且(), which is backed by the local
 // WeaponSkins resource and is therefore populated with no network at all.
 //
-// Everything is fail-closed and idempotent. If a metadata target is missing,
-// if the skin catalogue is empty, or if a non-empty season payload is already
-// cached, nothing is written.
+// Everything is fail-closed: if a metadata target is missing, if the skin
+// catalogue is still empty, or if the payload cannot be marshalled, the stock
+// result is returned untouched and the next read tries again.
 namespace pixel_pass_2313 {
 namespace detail {
 
 static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
+
+// ----------------------------------------------------------- metadata names
 
 constexpr const char* kPgNs = "PGCompany";
 constexpr const char* kRilisoftNs = "Rilisoft";
@@ -74,7 +110,7 @@ constexpr const char* kSystemNs = "System";
 
 constexpr const char* kStorageClass = "丅丝业七三丈丝丑丏";
 constexpr const char* kStorageInstance = "下丌丑丁下丟丛丘上";
-constexpr const char* kStorageSave = "与万丝丗丁不丗一丗";
+// Unique in the whole 23.1.3 dump, so name + argc is an unambiguous selector.
 constexpr const char* kStorageLoad = "东丗与丏丟丛丂三丞";
 
 constexpr const char* kConvertClass = "Convert";
@@ -83,11 +119,14 @@ constexpr const char* kFromBase64 = "FromBase64String";
 constexpr const char* kSkinCatalogueClass = "与世且一丁丆丈丄丈";
 constexpr const char* kSkinIdList = "丛上丌丏丟丒东丂且";
 
-// ConfigId.PixelPass, proven from the ConfigId enum and the payload-name
-// table in PGCompany.丗且三丕上业丐丕丄 ("pixel-pass-v6").
+// ---------------------------------------------------------------- constants
+
+// ConfigId.PixelPass, read straight out of the ConfigId enum (TypeDefIndex
+// 11085) and cross-checked against the [不丙三且丅上丞丙丏(123, 1, True)] attribute
+// on the season DTO.
 constexpr int32_t kConfigPixelPass = 123;
 
-// OfferItemType members (dump line 364118 onwards).
+// OfferItemType members.
 constexpr int32_t kTypeWeaponSkin = 1170;
 constexpr int32_t kTypeGraffiti = 1470;
 
@@ -109,11 +148,16 @@ constexpr int32_t kGraffitiTiers = 10;
 
 constexpr size_t kMaxCatalogueEntries = 4096u;
 constexpr size_t kMaxIdLength = 96u;
-constexpr size_t kMaxErrorLength = 256u;
-constexpr uint64_t kWarmupFrames = 240u;
-constexpr uint64_t kRetryIntervalFrames = 600u;
-constexpr int32_t kMaxAttempts = 5;
-constexpr int64_t kMinExistingPayload = 3;
+
+// A stock payload at least this long is treated as real content and always
+// wins over the local season.
+constexpr int64_t kMinRealPayload = 3;
+
+// Rebuild attempts before the module stops trying (the skin catalogue may
+// legitimately be empty on the first few reads).
+constexpr int32_t kMaxBuildAttempts = 32;
+
+constexpr uint64_t kReportPeriodFrames = 3600u;
 
 constexpr const char* kSeasonName = "OPG3D Offline Season";
 // Fixed, always-current window: the season must be active whatever the device
@@ -126,17 +170,18 @@ constexpr const char* kSeasonEnd = "2099-01-01T00:00:00Z";
 constexpr char kQuote = static_cast<char>(0x22);
 constexpr unsigned char kBackslash = 0x5Cu;
 
-// Il2CppArray keeps its length one word above the vector; only the low 32 bits
-// are ever needed here and the read is bounds-free by construction because the
-// pointer comes straight out of the managed load call.
+// Il2CppArray keeps its length one word above the bounds pointer: the managed
+// object header is 16 bytes, bounds sits at 0x10 and max_length at 0x18.
 constexpr size_t kArrayLengthOffset = 0x18u;
+
+// ------------------------------------------------------------- managed ABI
 
 using StaticObjFn = void* (*)(void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using InstanceIndexFn = void* (*)(void* self, int32_t index, void* method);
 using FromBase64Fn = void* (*)(void* text, void* method);
-using SaveConfigFn = bool (*)(void* self, int32_t config_id, void* payload,
-                              void** error, void* method);
+// bool 东丗与丏丟丛丂三丞(ConfigId, out byte[], out string) -- instance method, so
+// `this` first and MethodInfo* last; both `out` parameters arrive as pointers.
 using LoadConfigFn = bool (*)(void* self, int32_t config_id, void** payload,
                               void** error, void* method);
 
@@ -165,16 +210,26 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
     return true;
 }
 
-inline Managed g_storage_instance{};
-inline Managed g_storage_save{};
-inline Managed g_storage_load{};
+// ------------------------------------------------------------------- state
+
 inline Managed g_from_base64{};
 inline Managed g_skin_ids{};
+inline LoadConfigFn g_load_orig = nullptr;
 inline bool g_installed = false;
-inline bool g_seeded = false;
-inline bool g_disabled = false;
-inline int32_t g_attempts = 0;
+inline bool g_exhausted = false;
+inline int32_t g_build_attempts = 0;
 inline uint64_t g_frames = 0u;
+inline uint64_t g_queries = 0u;
+inline uint64_t g_served = 0u;
+inline uint64_t g_stock_wins = 0u;
+inline bool g_logged_first_serve = false;
+inline size_t g_skin_count = 0u;
+// The season is built once and kept as base64 text. A managed byte[] is NOT
+// cached: without a GC handle a stored managed pointer can be moved or
+// collected, so the array is re-created from this text on every read instead.
+inline std::string g_season_base64;
+
+// ---------------------------------------------------------------- helpers
 
 // List<T> is reached through its own accessors rather than through hardcoded
 // field offsets: the concrete generic instantiation is taken from the returned
@@ -211,8 +266,7 @@ inline bool id_is_emittable(const std::string& id) {
 
 inline void collect_skin_ids(std::vector<std::string>& out) {
     if (!g_skin_ids) return;
-    void* list =
-        reinterpret_cast<StaticObjFn>(g_skin_ids.ptr)(g_skin_ids.info);
+    void* list = reinterpret_cast<StaticObjFn>(g_skin_ids.ptr)(g_skin_ids.info);
     if (list == nullptr) return;
 
     Managed count{};
@@ -262,9 +316,24 @@ inline void append_reward(std::string& json, int32_t type,
 // ambiguous (prices, premium flags, elite-task previews) is left out on
 // purpose: an omitted property keeps its default, whereas a guessed one can
 // fail the whole season parse and put the lobby back to having no pass.
+//
+// Verified against Common (TypeDefIndex 13224) and the tier DTO (13234):
+//   "i"  SeasonId          salted int  -> number
+//   "sn" SeasonName        string
+//   "s"  StartDate         DateTime    -> ISO-8601 string
+//   "e"  EndDate           DateTime    -> ISO-8601 string
+//   "vc" VideoDailyCount   salted int  -> number
+//   "hc" HintCooldown      plain int   -> number
+//   "etr"/"etp"/"tp"       lists       -> []
+//   "l"  Level             salted int  -> number
+//   "t"  Type              enum        -> number
+//   "p"  NumPage           salted int  -> number
+//   "e"  Exp               salted int  -> number
+//   "r"  Rewards           list of converted strings
+//   "f"  IsFree            salted int  -> number  (NOT a bool)
+//   "c"  IsCool            real bool   -> true/false
 inline std::string build_season(const std::vector<std::string>& skins) {
-    const int32_t pages =
-        (kTierCount + kTiersPerPage - 1) / kTiersPerPage;
+    const int32_t pages = (kTierCount + kTiersPerPage - 1) / kTiersPerPage;
 
     std::string json;
     json.reserve(8192u);
@@ -323,10 +392,9 @@ inline std::string build_season(const std::vector<std::string>& skins) {
     int32_t graffiti_index = 0;
     for (int32_t tier = 0; tier < kTierCount; ++tier) {
         if (tier != 0) json += ',';
-        const int32_t type = (tier == 0)
-                                 ? kTierFirst
-                                 : ((tier == kTierCount - 1) ? kTierLast
-                                                             : kTierRegular);
+        const int32_t type =
+            (tier == 0) ? kTierFirst
+                        : ((tier == kTierCount - 1) ? kTierLast : kTierRegular);
         json += '{';
         append_key(json, "l");
         json += std::to_string(tier + 1);
@@ -348,16 +416,16 @@ inline std::string build_season(const std::vector<std::string>& skins) {
             append_reward(json, kTypeGraffiti, key, 1);
             ++graffiti_index;
         } else {
-            const size_t slot =
-                static_cast<size_t>(tier) % skins.size();
+            const size_t slot = static_cast<size_t>(tier) % skins.size();
             append_reward(json, kTypeWeaponSkin, skins[slot], 1);
         }
         json += ']';
         json += ',';
         // Every tier is free on purpose: this port has no store to buy a
         // premium track from, so gating any tier would only hide content.
+        // IsFree is a salted int, so this is the number 1 and not `true`.
         append_key(json, "f");
-        json += "true";
+        json += "1";
         json += ',';
         append_key(json, "c");
         json += "false";
@@ -391,8 +459,8 @@ inline std::string build_season(const std::vector<std::string>& skins) {
 // port owns has no array allocator, and System.Text.Encoding.GetBytes has two
 // single-argument overloads (char[] and string) that metadata lookup by name
 // and argument count cannot tell apart -- picking the wrong one would hand a
-// string to a char[] parameter. System.Convert.FromBase64String has exactly one
-// overload, so the JSON is base64-encoded here and decoded by the runtime.
+// string to a char[] parameter. System.Convert.FromBase64String has exactly
+// one overload, so the JSON is base64-encoded here and decoded by the runtime.
 inline std::string base64(const std::string& raw) {
     static const char* kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -432,15 +500,6 @@ inline std::string base64(const std::string& raw) {
     return out;
 }
 
-inline void* managed_payload(const std::string& json) {
-    if (!g_from_base64 || il2cpp::string_new == nullptr) return nullptr;
-    const std::string encoded = base64(json);
-    void* text = il2cpp::string_new(encoded.c_str());
-    if (text == nullptr) return nullptr;
-    return reinterpret_cast<FromBase64Fn>(g_from_base64.ptr)(
-        text, g_from_base64.info);
-}
-
 inline int64_t array_length(void* array) {
     if (array == nullptr) return -1;
     const uint8_t* raw = static_cast<const uint8_t*>(array);
@@ -449,125 +508,137 @@ inline int64_t array_length(void* array) {
     return static_cast<int64_t>(length);
 }
 
-inline void* storage() {
-    if (!g_storage_instance) return nullptr;
-    return reinterpret_cast<StaticObjFn>(g_storage_instance.ptr)(
-        g_storage_instance.info);
-}
+// Builds the season text once. Returns false while the local skin catalogue
+// is still empty, so the next config read simply tries again.
+inline bool ensure_season_text() {
+    if (!g_season_base64.empty()) return true;
+    if (g_exhausted) return false;
 
-inline int64_t cached_payload_length(void* self) {
-    if (self == nullptr || !g_storage_load) return -1;
-    void* payload = nullptr;
-    void* error = nullptr;
-    const bool loaded = reinterpret_cast<LoadConfigFn>(g_storage_load.ptr)(
-        self, kConfigPixelPass, &payload, &error, g_storage_load.info);
-    if (!loaded || payload == nullptr) return 0;
-    return array_length(payload);
-}
-
-inline void seed() {
-    void* self = storage();
-    if (self == nullptr) {
-        LOGE("23.1.3-pixelpass: config storage instance not available yet");
-        return;
+    if (g_build_attempts >= kMaxBuildAttempts) {
+        g_exhausted = true;
+        LOGE("23.1.3-pixelpass: the local weapon skin catalogue stayed empty "
+             "for %" PRId32 " config reads; no season will be served",
+             g_build_attempts);
+        return false;
     }
-
-    const int64_t existing = cached_payload_length(self);
-    if (existing >= kMinExistingPayload) {
-        g_seeded = true;
-        LOGI("23.1.3-pixelpass: season config %" PRId32
-             " already cached (%" PRId64 " bytes); left untouched",
-             kConfigPixelPass, existing);
-        return;
-    }
+    ++g_build_attempts;
 
     std::vector<std::string> skins;
     collect_skin_ids(skins);
-    if (skins.empty()) {
-        LOGE("23.1.3-pixelpass: local weapon skin catalogue is still empty; "
-             "refusing to write a season with no rewards");
-        return;
-    }
+    if (skins.empty()) return false;
 
     const std::string json = build_season(skins);
-    void* payload = managed_payload(json);
-    if (payload == nullptr) {
-        LOGE("23.1.3-pixelpass: season payload could not be marshalled");
-        return;
-    }
-
-    void* error = nullptr;
-    const bool saved = reinterpret_cast<SaveConfigFn>(g_storage_save.ptr)(
-        self, kConfigPixelPass, payload, &error, g_storage_save.info);
-    if (!saved) {
-        const std::string reason =
-            (error != nullptr) ? il2cpp::to_utf8(error, kMaxErrorLength)
-                               : std::string("no reason reported");
-        LOGE("23.1.3-pixelpass: config storage refused the season: %s",
-             reason.c_str());
-        return;
-    }
-
-    const int64_t stored = cached_payload_length(self);
-    g_seeded = true;
-    LOGI("23.1.3-pixelpass: season written to the stock config cache "
-         "(id %" PRId32 ", %zu json bytes, %" PRId64 " bytes cached, "
-         "%" PRId32 " tiers, %zu skin ids, graffiti tiers %" PRId32 ")",
-         kConfigPixelPass, json.size(), stored, kTierCount, skins.size(),
+    g_season_base64 = base64(json);
+    g_skin_count = skins.size();
+    LOGI("23.1.3-pixelpass: season authored (%zu json bytes, %" PRId32
+         " tiers, %zu skin ids, graffiti tiers %" PRId32 ")",
+         json.size(), kTierCount, g_skin_count,
          kIncludeGraffiti ? kGraffitiTiers : 0);
-    LOGI("23.1.3-pixelpass: first reward token is %s",
-         json.find(std::to_string(kTypeWeaponSkin)) == std::string::npos
-             ? "absent"
-             : "present");
+    return true;
 }
+
+inline void* season_payload() {
+    if (!ensure_season_text()) return nullptr;
+    if (!g_from_base64 || il2cpp::string_new == nullptr) return nullptr;
+    void* text = il2cpp::string_new(g_season_base64.c_str());
+    if (text == nullptr) return nullptr;
+    return reinterpret_cast<FromBase64Fn>(g_from_base64.ptr)(
+        text, g_from_base64.info);
+}
+
+// ---------------------------------------------------------------- the hook
+
+inline bool storage_load_hook(void* self, int32_t config_id, void** payload,
+                              void** error, void* method) {
+    const bool stock =
+        (g_load_orig != nullptr)
+            ? g_load_orig(self, config_id, payload, error, method)
+            : false;
+    if (config_id != kConfigPixelPass) return stock;
+
+    ++g_queries;
+
+    // A real cached season always wins: this module only fills a hole.
+    if (stock && payload != nullptr && *payload != nullptr &&
+        array_length(*payload) >= kMinRealPayload) {
+        ++g_stock_wins;
+        return stock;
+    }
+
+    void* season = season_payload();
+    if (season == nullptr) return stock;
+
+    if (payload != nullptr) *payload = season;
+    if (error != nullptr) *error = nullptr;
+    ++g_served;
+
+    if (!g_logged_first_serve) {
+        g_logged_first_serve = true;
+        LOGI("23.1.3-pixelpass: config %" PRId32 " was empty in the stock "
+             "on-device cache; served the local season (%" PRId64 " bytes) -- "
+             "the lobby pass button and its tiers exist from here on",
+             kConfigPixelPass, array_length(season));
+    }
+    return true;
+}
+
+// ------------------------------------------------------------ diagnostics
 
 inline void pump() {
-    if (!g_installed || g_seeded || g_disabled) return;
+    if (!g_installed) return;
     ++g_frames;
-    if (g_frames < kWarmupFrames) return;
-    if (((g_frames - kWarmupFrames) % kRetryIntervalFrames) != 0u) return;
-
-    if (g_attempts >= kMaxAttempts) {
-        g_disabled = true;
-        LOGE("23.1.3-pixelpass: giving up after %" PRId32
-             " attempts; no season was written", g_attempts);
-        return;
-    }
-    ++g_attempts;
-    seed();
+    if ((g_frames % kReportPeriodFrames) != 0u) return;
+    LOGI("23.1.3-pixelpass: config %" PRId32 " reads=%" PRIu64
+         " served locally=%" PRIu64 " stock payload won=%" PRIu64
+         " skin ids=%zu",
+         kConfigPixelPass, g_queries, g_served, g_stock_wins, g_skin_count);
 }
+
+// ------------------------------------------------------------ installation
 
 inline bool install() {
     if (g_installed) return true;
 
     bool resolved = true;
-    resolved &= bind(g_storage_instance, kPgNs, kStorageClass, kStorageInstance, 0);
-    resolved &= bind(g_storage_save, kPgNs, kStorageClass, kStorageSave, 3);
-    resolved &= bind(g_storage_load, kPgNs, kStorageClass, kStorageLoad, 3);
     resolved &= bind(g_from_base64, kSystemNs, kConvertClass, kFromBase64, 1);
     resolved &= bind(g_skin_ids, kRilisoftNs, kSkinCatalogueClass, kSkinIdList, 0);
     if (!resolved) {
         LOGE("23.1.3-pixelpass: metadata does not match the expected 23.1.3 "
-             "build; no season will be written");
+             "build; no season will be served");
+        return false;
+    }
+
+    // The season is served from the cache read itself, so this module owns its
+    // own hook and is driven by the game's own config pipeline. It no longer
+    // depends on any other module's Update slot.
+    if (!hook::install({kPgNs, kStorageClass, kStorageLoad, 3},
+                       reinterpret_cast<void*>(&storage_load_hook),
+                       reinterpret_cast<void**>(&g_load_orig), true)) {
+        LOGE("23.1.3-pixelpass: the config cache read %s::%s/3 could not be "
+             "hooked; the lobby stays without a pass",
+             kStorageClass, kStorageLoad);
         return false;
     }
 
     g_installed = true;
-    LOGI("23.1.3-pixelpass: armed (config id %" PRId32 ", %" PRId32
-         " tiers, %" PRId32 " per page)",
+    LOGI("23.1.3-pixelpass: armed on the config cache read path (config id "
+         "%" PRId32 ", %" PRId32 " tiers, %" PRId32 " per page); the season is "
+         "served on demand and nothing is persisted",
          kConfigPixelPass, kTierCount, kTiersPerPage);
     return true;
 }
 
 } // namespace detail
 
-// Binds the stock config cache, the base64 decoder and the local weapon skin
-// catalogue. Nothing is written at install time: the season is authored from
-// the main menu, where a game thread and a settled managed heap are available.
+// Hooks the stock on-device config cache read and binds the base64 decoder and
+// the local weapon skin catalogue. The season itself is authored lazily, on
+// the first config read that comes back empty, where a game thread and a
+// populated skin catalogue are both available.
 inline bool install_hooks() { return detail::install(); }
 
-// Called from the main-menu Update slot this port already owns. Runs at most
-// once per launch, and only until the season is cached.
+// Optional read-only counters, driven from the main-menu Update slot when that
+// slot happens to be available. The season does NOT depend on this being
+// called: that dependency is exactly what kept the pass missing before.
 inline void pump_from_main_menu() { detail::pump(); }
 
 } // namespace pixel_pass_2313

@@ -41,7 +41,12 @@ constexpr uint64_t kWarmupFrames = 60;
 constexpr const char* kGlobalNs = "";
 constexpr const char* kProgressNs = "Progress";
 constexpr const char* kServiceClass = "东丝丂丄业丕且丙丑";
-constexpr const char* kServiceInstance = "丞丏业丐丒与业";
+// Instance getter of the Progress service, dump line 284773 / RVA 0x1B3BA40.
+// This name is nine metadata characters long. A shortened seven-character
+// spelling occurs nowhere in 23.1.3 metadata, and using it made bind() fail
+// on the first target and took the whole module -- including the
+// MainMenuController.Update slot every other pump depends on -- offline.
+constexpr const char* kServiceInstance = "丞丏业丐丒与业丗与";
 constexpr const char* kAddCurrency = "丄丝丄丙且丝丟上丒";
 constexpr const char* kWalletHolderClass = "与丅丟丈丕上东丟丁";
 constexpr const char* kWalletInstance = "万丒丗丅丆丗丗下三";
@@ -307,9 +312,10 @@ inline void menu_update_hook(void* self, void* method) {
     // Same slot again, read-only: the content gate reports which live
     // content the offline ExpOpenSystem table still keeps closed.
     live_content_2313::pump_from_main_menu();
-    // Same slot, at most once per launch: hands the stock on-device config
-    // cache a real PixelPass season, which is what makes the lobby pass
-    // button and its tiers exist at all offline.
+    // Read-only counters for the PixelPass season. The season itself is NOT
+    // driven from here any more: it is served from the config-cache read
+    // path inside pixel_pass_2313, so a failure in this module can no longer
+    // take the battle pass down with it.
     pixel_pass_2313::pump_from_main_menu();
 }
 
