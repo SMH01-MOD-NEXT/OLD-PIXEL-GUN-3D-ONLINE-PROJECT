@@ -7,6 +7,7 @@
 #include "hidden_items_2313.h"
 #include "hook.h"
 #include "il2cpp.h"
+#include "live_content_2313.h"
 #include "log.h"
 #include "weapon_modules_2313.h"
 
@@ -302,6 +303,9 @@ inline void menu_update_hook(void* self, void* method) {
     // It warms up later than the module sweep on purpose, so the two never
     // drive the stock item inventory on the same frame.
     hidden_items_2313::pump_from_main_menu();
+    // Same slot again, read-only: the content gate reports which live
+    // content the offline ExpOpenSystem table still keeps closed.
+    live_content_2313::pump_from_main_menu();
 }
 
 inline bool install() {
