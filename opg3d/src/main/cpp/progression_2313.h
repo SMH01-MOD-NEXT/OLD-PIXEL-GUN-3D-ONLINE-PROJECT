@@ -9,6 +9,7 @@
 #include "il2cpp.h"
 #include "live_content_2313.h"
 #include "log.h"
+#include "pixel_pass_2313.h"
 #include "weapon_modules_2313.h"
 
 // Offline progression for the exact supplied 23.1.3 ARM64 libil2cpp.so:
@@ -40,7 +41,7 @@ constexpr uint64_t kWarmupFrames = 60;
 constexpr const char* kGlobalNs = "";
 constexpr const char* kProgressNs = "Progress";
 constexpr const char* kServiceClass = "东丝丂丄业丕且丙丑";
-constexpr const char* kServiceInstance = "丞丏业丐丒与业丗与";
+constexpr const char* kServiceInstance = "丞丏业丐丒与业";
 constexpr const char* kAddCurrency = "丄丝丄丙且丝丟上丒";
 constexpr const char* kWalletHolderClass = "与丅丟丈丕上东丟丁";
 constexpr const char* kWalletInstance = "万丒丗丅丆丗丗下三";
@@ -306,6 +307,10 @@ inline void menu_update_hook(void* self, void* method) {
     // Same slot again, read-only: the content gate reports which live
     // content the offline ExpOpenSystem table still keeps closed.
     live_content_2313::pump_from_main_menu();
+    // Same slot, at most once per launch: hands the stock on-device config
+    // cache a real PixelPass season, which is what makes the lobby pass
+    // button and its tiers exist at all offline.
+    pixel_pass_2313::pump_from_main_menu();
 }
 
 inline bool install() {
