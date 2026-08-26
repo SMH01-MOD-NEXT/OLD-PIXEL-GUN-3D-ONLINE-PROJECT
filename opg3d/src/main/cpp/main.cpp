@@ -146,7 +146,9 @@ void* init_thread(void*) {
     const bool live_content    = live_content_2313::install_hooks(base);
     const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     const bool hidden_items    = hidden_items_2313::install_hooks(base);
-    const bool pixel_pass      = pixel_pass_2313::install_hooks();
+    // The base is required: every managed method the pass path calls is
+    // identity-checked against its expected RVA before use.
+    const bool pixel_pass      = pixel_pass_2313::install_hooks(base);
     const bool local_identity   = identity_2313::install_hooks();
     const bool assets_payload   = assets_data_2313::install_hooks(base);
     const bool net_stall        = net_stall_guard_2313::install_hooks();
@@ -172,9 +174,9 @@ void* init_thread(void*) {
              "pass, the lotteries and card roulette, the chests and the task "
              "and event content are reachable again instead of being hidden "
              "by the empty offline ExpOpenSystem table, a real PixelPass "
-             "season whose tiers award weapon skins and graffiti is written "
-             "into the game's own config cache, which is what makes the "
-             "lobby pass button exist at all offline, every weapon "
+             "season whose tiers award weapon skins and graffiti is built on "
+             "device and handed to the game's own pass manager, which is what "
+             "makes the lobby pass button exist at all offline, every weapon "
              "and armor module is unlocked at level 10, every hidden weapon, "
              "wear item and gadget the build ships is granted through the "
              "stock item inventory, the player id is "

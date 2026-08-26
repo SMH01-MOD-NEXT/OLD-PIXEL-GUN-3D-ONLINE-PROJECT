@@ -12,104 +12,103 @@
 
 // Offline PixelPass season for the exact supplied 23.1.3 ARM64 libil2cpp.so.
 //
-// Why there was no battle pass at all
-// -----------------------------------
-// PGCompany.PixelPassLobbyView (TypeDefIndex 12069) owns the lobby entry
-// point. It keeps a whole set of states behind separate containers --
-// _lockContainer (0x70), _unLockContainer (0x78), _comingSoonContainer
-// (0x80), _needLevelContainer (0x88), _tutorialContainer (0xA0) -- but all of
-// them live under a single _holder (0x48), and the view switches that holder
-// off wholesale when the pass service (三丄三丂丈七业丁丞, held at +0x110) has no
-// season. So with no season there is no button at all, not even a
-// coming-soon state.
+// What the device finally proved
+// -----------------------------
+// The instrumented build answered the question completely. From a 33 s capture
+// with the lobby up:
 //
-// The season is pure configuration. PGCompany.PixelPass.丐丑业丒丈丅丐专丅
-// (TypeDefIndex 13225) is tagged [不丙三且丅上丞丙丏(123, 1, True)] together with
-// [JsonObject(1)] and carries the entire pass: Common ("c"), Pages ("p"),
-// Levels ("l"), tasks and offers. ConfigId 123 is PixelPass.
+//   pixelpass: the pass manager answered gate C = true while the season is absent
+//   pixelpass: the pass manager answered gate A = false while the season is absent
+//   pixelpass: the pass manager answered gate B = false while the season is absent
+//   pixelpass: PixelPassLobbyView.OnEnable ran (holder=1 lock=1 unlock=1
+//              coming-soon=1 need-level=1 button=1 view service=null;
+//              manager=alive manager service=null season=absent)
+//   pixelpass: pass manager alive (service=null season=absent); lobby view
+//              OnEnable ran 1 time(s); gates opened by this port A=0 B=0 C=0
 //
-// Four attempts, and what each device log actually proved
-// ------------------------------------------------------
-// Attempt 1 granted cosmetics natively and never created a season at all.
+// Nothing is missing from the scene and nothing is broken in the view. Every
+// state container and the lobby button itself are present, the manager
+// singleton is alive, and the view's OnEnable does run. Exactly one object is
+// missing: the season. And because the pass service takes the season in its
+// constructor, a null season means a null service, which is what makes the
+// view switch its whole _holder off -- no button, not even a coming-soon
+// state.
 //
-// Attempt 2 created a season, but wrote it into the on-device cache from the
-// MainMenuController.Update slot owned by progression_2313 -- and that hook
-// was never installed, because progression_2313 bound a Progress service
-// getter name that does not exist in 23.1.3 metadata and bailed out before
-// reaching its hook installation. The first device log showed exactly that:
-// "东丝丂丄业丕且丙丑::丞丏业丐丒与业/0 not found in metadata", "nothing was hooked",
-// progression=0. The seeder never ran a single time.
+// The conditional gate override deliberately stayed off (A=0 B=0 C=0). With a
+// null season, opening a gate would have sent the view straight into
+// dereferencing it: a broken menu instead of a missing button.
 //
-// Attempt 3 fixed that dependency and moved the season onto the config
-// pipeline's own read path. The 89 second log that followed proved the repair
-// worked -- progression reports from the menu pump, MAIN MENU REACHED, the
-// content gate opens 21/21 features, zero E/OPG3D -- and that the pass was
-// still absent, with the pixelpass tag printing exactly one line: its own
-// "armed". The season was never even authored, so the hooked loader was never
-// entered with ConfigId 123.
+// How the season is built now
+// ---------------------------
+// PGCompany.PixelPass.丐丑业丒丈丅丐专丅 (TypeDefIndex 13225) is [JsonObject] and
+// every field carries an explicit [JsonProperty] name:
 //
-// Attempt 4 covered all three read entry points of the cache class and added
-// per-(entry point, ConfigId) tracing plus an early report. That build
-// answered the question and closed this whole line of attack:
+//   "c"   Common               "p"   Pages          "l"   Levels
+//   "t"   Tasks                "prt" _premiumTaskIndexes
+//   "tb"  TasksBase            "at"  TasksForAds
+//   "r"   GameRewards          "of"  Offers
+//
+// That is precisely the JSON this module has been authoring since attempt 2
+// and never had anywhere to send. So the stock serialiser can build it:
+// Newtonsoft.Json.JsonConvert.DeserializeObject(string, Type) at 0x40BC82C
+// materialises the entire object graph, including every List<T> instantiation
+// and the salted-int converter on SeasonId, Level, NumPage, Exp and IsFree --
+// none of which native code in this port could construct by hand, because
+// there is no generic-instantiation helper here.
+//
+// The chain, every step verified against the dump before it was written:
+//
+//   DeserializeObject(json, typeof(丐丑业丒丈丅丐专丅))     0x40BC82C
+//     -> il2cpp_object_new(三丄三丂丈七业丁丞)
+//     -> 三丄三丂丈七业丁丞..ctor(season)                  0x18F0594
+//     -> manager 丝世东丛丗下丑丟丞(service)                0x1A08114
+//     -> PixelPassLobbyView 丗且丈丁丕丕丘一丞 (+0x110)
+//
+// Overload safety is not optional here. DeserializeObject has four
+// two-argument overloads and il2cpp_class_get_method_from_name cannot tell
+// them apart, so binding by name and argument count alone could return
+// (string, JsonSerializerSettings) and produce a type-confused call passing a
+// Type where settings are expected. Every target on this path therefore goes
+// through bind_exact(), which refuses it unless the resolved pointer equals
+// base + the expected RVA. That is also why install_hooks() now takes the
+// module base.
+//
+// Why the config cache is only instrumentation
+// --------------------------------------------
+// An earlier build hooked all three read entry points of the stock cache class
+// PGCompany.丅丝业七三丈丝丑丏 (TypeDefIndex 11078) plus its write path, and traced
+// every (entry point, ConfigId) pair. The device answered:
 //
 //   pixelpass: the stock config cache asked the inner loader for config id 102
 //   pixelpass: the stock config cache asked the primary loader for config id 102
 //   pixelpass: 120 menu frame(s) in, the stock config cache was read 2 time(s)
-//              in total; config 123 reads=0 served locally=0 stock payload
-//              won=0 skin ids=0
+//              in total; config 123 reads=0 ...
 //
-// ConfigId 102 is MessagePackTest. Over a whole session, with the lobby up,
-// the stock binary config cache is consulted exactly twice -- both times for a
-// serialiser self-test -- and never once for PixelPass. The save probe never
-// fired either, so the game does not persist configs through this class on
-// this build at all.
+// ConfigId 102 is MessagePackTest. Over a whole session the cache is consulted
+// exactly twice, both times for a serialiser self-test, and never once for
+// PixelPass; the save probe never fired at all. Those hooks are kept because
+// they cost nothing, they produced this evidence, and they will serve the
+// season correctly if some build ever does route 123 through the cache -- but
+// they are not the mechanism.
 //
-// That is conclusive: no amount of coverage on
-// PGCompany.丅丝业七三丈丝丑丏 can deliver a season, because the game never asks
-// it for one. The three loader hooks below are kept -- they cost nothing, they
-// produced this evidence, and they will serve the season correctly if a build
-// ever does route 123 through the cache -- but they are no longer the
-// mechanism this port relies on.
+// Also ruled out: BalanceController.世丄丅丏丌专上世丄(string, byte[], 丐丛丏丒丘东三专一,
+// ConfigId) at 0x471CB40 would drive the game's own parse/validate/raise path,
+// but BalanceController exposes no static instance accessor anywhere in its
+// metadata, so the instance cannot be reached from native code.
 //
-// Where the pass is actually read from
-// ------------------------------------
-// PGCompany.PixelPass.万丈丏丈丙丑万万丙 (TypeDefIndex 13248) is the manager the
-// lobby view talks to:
+// Remaining risk, stated plainly
+// ------------------------------
+// The season is validated by
+// DataSystem.DataValidation.FluentValidators.丅丑世丈世七丈丂丁, an
+// AbstractValidator<丐丑业丒丈丅丐专丅> (TypeDefIndex 7760, ctor 0x2D484D0), with
+// sibling validators for the Common (7762) and Page (7764) DTOs. Those rules
+// live in constructor bodies, which a metadata dump does not contain. A
+// managed exception cannot be caught from native frames, so the construction
+// is attempted exactly once -- the attempt flag is set *before* the first
+// managed call, never after -- and every step logs immediately before and
+// after itself, so a rejection names the step instead of going quiet.
 //
-//   internal static 万丈丏丈丙丑万万丙 下丌丑丁下丟丛丘上()   // 0x1A07F4C
-//   internal 丐丑业丒丈丅丐专丅 丒不丏一丂丈丙东丟()          // 0x1A08038  season
-//   internal 三丄三丂丈七业丁丞 上丄丟三丏三丒丄东()          // 0x1A0810C  service
-//   internal bool 丈丁上一丟丈丗七业()                    // 0x1A0811C  gate
-//   internal bool 且丗丛不东万三业丄()                    // 0x1A0815C  gate
-//   internal bool 专丒丂丂丕业丛丐丂()                    // 0x1A08460  gate
-//
-// This build binds and reports all of that, hooks the three gates so the log
-// names which one closes the button, and hooks
-// PixelPassLobbyView.OnEnable (0x28F4C68) so the log says whether the view
-// runs at all and what state it found.
-//
-// The gate override is conditional on purpose. Forcing a gate open while the
-// manager has no season sends the view straight into dereferencing it, which
-// trades a missing button for a broken menu. So the override only fires when
-// the season getter returns non-null -- and in that case it fixes the button
-// outright.
-//
-// Ruled out this round: BalanceController.世丄丅丏丌专上世丄(string, byte[],
-// 丐丛丏丒丘东三专一, ConfigId) at 0x471CB40 would push bytes through the game's
-// own apply path, event raise included. But BalanceController has no static
-// instance accessor anywhere in its metadata, so the instance cannot be
-// reached from native code and the call cannot be made.
-//
-// Still open, and the reason this build instruments instead of fixing blind:
-// supplying a season object requires a managed 丐丑业丒丈丅丐专丅. The build does
-// ship JsonConvert.DeserializeObject<T>(string), but only as a generic
-// definition with RVA -1 plus an <object> shared instantiation, and the
-// current il2cpp.h surface cannot inflate a generic MethodInfo for a specific
-// T. The state wrapper PGCompany.PixelPass.万东一丌丒丁丗三七 does expose a real
-// setter, 与丕丘丘丑丑丛七丆(丐丑业丒丈丅丐专丅) at 0x18F646C, so once an instance of
-// the DTO exists there is somewhere to put it.
-//
-// Two properties of the build make the hand-authored JSON below safe:
+// Two properties of the build make the hand-authored JSON safe:
 //
 //   * Rilisoft.丅丏丏丛丕丁丟上丞, the salted int used for SeasonId, tier Level,
 //     NumPage, Exp and IsFree, is tagged
@@ -125,20 +124,13 @@
 //     the (OfferItemType, string id, int amount) constructor at 0x24B39D8. A
 //     reward is therefore "<type>:<id>:<amount>", e.g. "1170:<skin id>:1".
 //
-// One risk stays explicitly unproven. The season is validated by
-// DataSystem.DataValidation.FluentValidators.丅丑世丈世七丈丂丁, an
-// AbstractValidator<丐丑业丒丈丅丐专丅> (TypeDefIndex 7760, ctor 0x2D484D0), with
-// sibling validators for the Common (7762) and Page (7764) DTOs. Those rules
-// live in constructor bodies, which a metadata dump does not contain, so a
-// deliberately minimal season could parse and still be rejected.
-//
 // Only ids the build itself reports are written for skins: they come from
 // Rilisoft.与世且一丁丆丈丄丈.丛上丌丏丟丒东丂且(), which is backed by the local
 // WeaponSkins resource and is therefore populated with no network at all.
 //
-// Everything is fail-closed: if a metadata target is missing, if the skin
-// catalogue is still empty, or if the payload cannot be marshalled, the stock
-// result is returned untouched and the next read tries again.
+// Everything is fail-closed: if a metadata target is missing, if an RVA does
+// not match, if the skin catalogue is still empty, or if any managed step
+// returns null, the module reports it and leaves the game exactly as it was.
 namespace pixel_pass_2313 {
 namespace detail {
 
@@ -150,13 +142,14 @@ constexpr const char* kPgNs = "PGCompany";
 constexpr const char* kPassNs = "PGCompany.PixelPass";
 constexpr const char* kRilisoftNs = "Rilisoft";
 constexpr const char* kSystemNs = "System";
+constexpr const char* kJsonNs = "Newtonsoft.Json";
 
 constexpr const char* kStorageClass = "丅丝业七三丈丝丑丏";
 constexpr const char* kStorageInstance = "下丌丑丁下丟丛丘上";
 
 // The three read entry points of the stock cache, plus the write path. The
-// device has now shown that the game asks this class for ConfigId 102 only,
-// so these are diagnostics and a safety net rather than the delivery route.
+// device has shown the game only ever asks this class for ConfigId 102, so
+// these are diagnostics and a safety net rather than the delivery route.
 constexpr const char* kStorageLoad = "东丗与丏丟丛丂三丞";       // /3, RVA 0x249D670
 constexpr const char* kStorageLoadAlt = "与丌下丑丝丁丄丏丛";    // /3, RVA 0x249E064
 constexpr const char* kStorageLoadInner = "丅专东与上丆不丏丐";  // /4, RVA 0x249DACC
@@ -167,9 +160,15 @@ constexpr const char* kManagerClass = "万丈丏丈丙丑万万丙";       // 13
 constexpr const char* kManagerInstance = "下丌丑丁下丟丛丘上";    // static /0, 0x1A07F4C
 constexpr const char* kManagerSeason = "丒不丏一丂丈丙东丟";      // /0, 0x1A08038
 constexpr const char* kManagerService = "上丄丟三丏三丒丄东";     // /0, 0x1A0810C
+constexpr const char* kManagerSetService = "丝世东丛丗下丑丟丞";  // /1, 0x1A08114
 constexpr const char* kManagerGateA = "丈丁上一丟丈丗七业";       // bool /0, 0x1A0811C
 constexpr const char* kManagerGateB = "且丗丛不东万三业丄";       // bool /0, 0x1A0815C
 constexpr const char* kManagerGateC = "专丒丂丂丕业丛丐丂";       // bool /0, 0x1A08460
+
+// The season DTO and the pass service that wraps it.
+constexpr const char* kSeasonClass = "丐丑业丒丈丅丐专丅";        // 13225
+constexpr const char* kServiceClass = "三丄三丂丈七业丁丞";       // 13268
+constexpr const char* kCtor = ".ctor";                       // /1, 0x18F0594
 
 // The lobby view itself. Its serialised field names are not obfuscated.
 constexpr const char* kLobbyViewClass = "PixelPassLobbyView";  // 12069
@@ -185,8 +184,23 @@ constexpr const char* kViewService = "丗且丈丁丕丕丘一丞";         // 0
 constexpr const char* kConvertClass = "Convert";
 constexpr const char* kFromBase64 = "FromBase64String";
 
+constexpr const char* kJsonConvertClass = "JsonConvert";       // 18246
+constexpr const char* kDeserializeObject = "DeserializeObject";  // /2, 0x40BC82C
+
 constexpr const char* kSkinCatalogueClass = "与世且一丁丆丈丄丈";
 constexpr const char* kSkinIdList = "丛上丌丏丟丒东丂且";
+
+// ------------------------------------------------------------------- RVAs
+//
+// Every managed target this module *calls* (as opposed to hooks) is verified
+// against these before use. Two reasons: DeserializeObject has four
+// two-argument overloads that metadata lookup cannot distinguish, and a
+// different libil2cpp.so must disarm the season path instead of jumping to an
+// arbitrary address.
+constexpr uintptr_t kRvaDeserializeStringType = 0x40BC82Cu;
+constexpr uintptr_t kRvaServiceCtor = 0x18F0594u;
+constexpr uintptr_t kRvaManagerSetService = 0x1A08114u;
+constexpr uintptr_t kRvaManagerSeason = 0x1A08038u;
 
 // ---------------------------------------------------------------- constants
 
@@ -237,10 +251,10 @@ constexpr uint64_t kReportPeriodFrames = 1800u;
 constexpr size_t kMaxNotedPairs = 64u;
 constexpr size_t kMaxNoteLines = 24u;
 
-// Opening a gate while the manager has no season would send the lobby view
-// into dereferencing it, turning a missing button into a broken menu. So the
-// override is allowed only when the season getter returns non-null. If a
-// season does exist and a gate is merely shut, this is the whole fix.
+// Kept as a backstop. With a real season and service in place before any gate
+// is asked, the stock gates should answer true on their own; if one still does
+// not, this opens it -- but only while a season actually exists, because the
+// view dereferences it immediately afterwards.
 constexpr bool kForceGatesWhenSeasonExists = true;
 
 constexpr const char* kSeasonName = "OPG3D Offline Season";
@@ -267,6 +281,11 @@ using InstanceVoidFn = void (*)(void* self, void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using InstanceIndexFn = void* (*)(void* self, int32_t index, void* method);
 using FromBase64Fn = void* (*)(void* text, void* method);
+// object JsonConvert.DeserializeObject(string, Type) -- static, so no `this`.
+using DeserializeFn = void* (*)(void* json, void* type, void* method);
+// 三丄三丂丈七业丁丞..ctor(丐丑业丒丈丅丐专丅) and the manager's service setter: both
+// instance methods taking one managed reference.
+using InstanceArgVoidFn = void (*)(void* self, void* arg, void* method);
 // bool 东丗与丏丟丛丂三丞(ConfigId, out byte[], out string) and its identically
 // shaped sibling 与丌下丑丝丁丄丏丛 -- instance methods, so `this` first and
 // MethodInfo* last; both `out` parameters arrive as pointers.
@@ -289,6 +308,8 @@ struct Managed {
     }
 };
 
+inline uintptr_t g_base = 0u;
+
 inline bool bind(Managed& out, const char* namespaze, const char* klass,
                  const char* method, int args_count) {
     out.info = il2cpp::find_method_info(namespaze, klass, method, args_count);
@@ -301,6 +322,36 @@ inline bool bind(Managed& out, const char* namespaze, const char* klass,
     if (out.ptr == nullptr) {
         LOGE("23.1.3-pixelpass: %s::%s/%d has no method pointer", klass, method,
              args_count);
+        return false;
+    }
+    return true;
+}
+
+// Same as bind(), plus an identity check against the expected RVA. Used for
+// every method this module *calls* on the season path.
+//
+// This is what keeps the DeserializeObject binding honest: that name has four
+// two-argument overloads, and il2cpp_class_get_method_from_name returns
+// whichever the metadata lists first. Accepting the wrong one would mean
+// passing a Type object where a JsonSerializerSettings is expected.
+inline bool bind_exact(Managed& out, const char* namespaze, const char* klass,
+                       const char* method, int args_count,
+                       uintptr_t expected_rva) {
+    if (g_base == 0u) {
+        LOGE("23.1.3-pixelpass: no module base, so %s::%s/%d cannot be "
+             "identified; refusing to call it",
+             klass, method, args_count);
+        return false;
+    }
+    if (!bind(out, namespaze, klass, method, args_count)) return false;
+
+    const uintptr_t actual = reinterpret_cast<uintptr_t>(out.ptr) - g_base;
+    if (actual != expected_rva) {
+        LOGE("23.1.3-pixelpass: %s::%s/%d resolved to RVA 0x%" PRIxPTR
+             " but this build expects 0x%" PRIxPTR
+             "; refusing it (wrong overload or wrong libil2cpp.so)",
+             klass, method, args_count, actual, expected_rva);
+        out = Managed{};
         return false;
     }
     return true;
@@ -327,16 +378,22 @@ inline size_t g_skin_count = 0u;
 inline std::vector<uint64_t> g_noted_pairs;
 inline size_t g_note_lines = 0u;
 inline size_t g_save_lines = 0u;
-// The season is built once and kept as base64 text. A managed byte[] is NOT
-// cached: without a GC handle a stored managed pointer can be moved or
-// collected, so the array is re-created from this text on every read instead.
+// The authored season, kept as text. Managed pointers are NOT cached: without
+// a GC handle a stored managed pointer can go stale, so anything managed is
+// either handed straight to the game or read back from it on demand.
+inline std::string g_season_json;
 inline std::string g_season_base64;
 
-// --- pass manager and lobby view -------------------------------------------
+// --- pass manager, lobby view, season construction -------------------------
 
 inline Managed g_mgr_instance{};
 inline Managed g_mgr_season{};
 inline Managed g_mgr_service{};
+inline Managed g_mgr_set_service{};
+inline Managed g_deserialize{};
+inline Managed g_service_ctor{};
+inline void* g_season_klass = nullptr;
+inline void* g_service_klass = nullptr;
 inline InstanceBoolFn g_gate_a_orig = nullptr;
 inline InstanceBoolFn g_gate_b_orig = nullptr;
 inline InstanceBoolFn g_gate_c_orig = nullptr;
@@ -351,6 +408,9 @@ inline void* g_view_button_field = nullptr;
 inline void* g_view_service_field = nullptr;
 
 inline bool g_manager_armed = false;
+inline bool g_season_path_ready = false;
+inline bool g_install_attempted = false;
+inline bool g_install_succeeded = false;
 inline bool g_gate_logged[3] = {false, false, false};
 inline bool g_gate_forced_logged[3] = {false, false, false};
 inline uint64_t g_gate_forced[3] = {0u, 0u, 0u};
@@ -457,7 +517,13 @@ inline void append_reward(std::string& json, int32_t type,
 // purpose: an omitted property keeps its default, whereas a guessed one can
 // fail the whole season parse and put the lobby back to having no pass.
 //
-// Verified against Common (TypeDefIndex 13224) and the tier DTO (13234):
+// The key names are not guesses -- they are the [JsonProperty] names on the
+// season DTO (TypeDefIndex 13225) and on Common (13224) and the tier DTO
+// (13234):
+//   "c"  Common             "p"  Pages     "l"  Levels    "t"  Tasks
+//   "prt" _premiumTaskIndexes         "tb" TasksBase
+//   "at" TasksForAds        "r"  GameRewards          "of" Offers
+// and inside them:
 //   "i"  SeasonId          salted int  -> number
 //   "sn" SeasonName        string
 //   "s"  StartDate         DateTime    -> ISO-8601 string
@@ -595,12 +661,12 @@ inline std::string build_season(const std::vector<std::string>& skins) {
     return json;
 }
 
-// The payload has to reach managed code as a byte[]. The IL2CPP wrapper this
-// port owns has no array allocator, and System.Text.Encoding.GetBytes has two
-// single-argument overloads (char[] and string) that metadata lookup by name
-// and argument count cannot tell apart -- picking the wrong one would hand a
-// string to a char[] parameter. System.Convert.FromBase64String has exactly
-// one overload, so the JSON is base64-encoded here and decoded by the runtime.
+// Base64 is only needed by the config-cache safety net, which has to hand the
+// runtime a byte[] and has no array allocator to build one with:
+// System.Convert.FromBase64String has exactly one overload, whereas
+// Encoding.GetBytes has two single-argument ones that metadata lookup cannot
+// tell apart. The manager path does not use this -- it passes the raw JSON
+// string straight to Newtonsoft.
 inline std::string base64(const std::string& raw) {
     static const char* kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -649,15 +715,15 @@ inline int64_t array_length(void* array) {
 }
 
 // Builds the season text once. Returns false while the local skin catalogue
-// is still empty, so the next config read simply tries again.
+// is still empty, so the next attempt simply tries again.
 inline bool ensure_season_text() {
-    if (!g_season_base64.empty()) return true;
+    if (!g_season_json.empty()) return true;
     if (g_exhausted) return false;
 
     if (g_build_attempts >= kMaxBuildAttempts) {
         g_exhausted = true;
         LOGE("23.1.3-pixelpass: the local weapon skin catalogue stayed empty "
-             "for %" PRId32 " config reads; no season will be served",
+             "for %" PRId32 " attempts; no season will be built",
              g_build_attempts);
         return false;
     }
@@ -667,12 +733,12 @@ inline bool ensure_season_text() {
     collect_skin_ids(skins);
     if (skins.empty()) return false;
 
-    const std::string json = build_season(skins);
-    g_season_base64 = base64(json);
+    g_season_json = build_season(skins);
+    g_season_base64 = base64(g_season_json);
     g_skin_count = skins.size();
     LOGI("23.1.3-pixelpass: season authored (%zu json bytes, %" PRId32
          " tiers, %zu skin ids, graffiti tiers %" PRId32 ")",
-         json.size(), kTierCount, g_skin_count,
+         g_season_json.size(), kTierCount, g_skin_count,
          kIncludeGraffiti ? kGraffitiTiers : 0);
     return true;
 }
@@ -709,6 +775,114 @@ inline void* manager_service(void* manager) {
     if (manager == nullptr || !g_mgr_service) return nullptr;
     return reinterpret_cast<InstanceObjFn>(g_mgr_service.ptr)(manager,
                                                               g_mgr_service.info);
+}
+
+// ------------------------------------------------- season object construction
+
+// Turns the authored JSON into a real managed season DTO using the game's own
+// Newtonsoft. Doing this by hand is not an option: the DTO graph is full of
+// List<T> instantiations and converter-backed salted ints, and this port has
+// no generic-instantiation helper to build any of that.
+inline void* build_season_object() {
+    if (!g_season_path_ready) return nullptr;
+    if (!ensure_season_text()) return nullptr;
+    if (il2cpp::string_new == nullptr || il2cpp::class_get_type == nullptr ||
+        il2cpp::type_get_object == nullptr) {
+        LOGE("23.1.3-pixelpass: the runtime lacks the allocation or reflection "
+             "exports needed to build a season");
+        return nullptr;
+    }
+
+    void* json = il2cpp::string_new(g_season_json.c_str());
+    if (json == nullptr) {
+        LOGE("23.1.3-pixelpass: the season JSON could not be marshalled");
+        return nullptr;
+    }
+
+    const void* season_type = il2cpp::class_get_type(g_season_klass);
+    void* type_object =
+        (season_type != nullptr) ? il2cpp::type_get_object(season_type) : nullptr;
+    if (type_object == nullptr) {
+        LOGE("23.1.3-pixelpass: the season type object could not be obtained");
+        return nullptr;
+    }
+
+    LOGI("23.1.3-pixelpass: parsing the season with the game's own "
+         "Newtonsoft (%zu json bytes, %" PRId32 " tiers, %zu skin ids)",
+         g_season_json.size(), kTierCount, g_skin_count);
+    void* season = reinterpret_cast<DeserializeFn>(g_deserialize.ptr)(
+        json, type_object, g_deserialize.info);
+    if (season == nullptr) {
+        LOGE("23.1.3-pixelpass: the serialiser returned no season; the payload "
+             "shape was rejected");
+        return nullptr;
+    }
+    LOGI("23.1.3-pixelpass: the season parsed cleanly");
+    return season;
+}
+
+// Builds the season, wraps it in a pass service and hands that to the manager.
+//
+// Attempted exactly once. The flag is set before the first managed call, never
+// after: a managed exception cannot be caught from native frames, so a payload
+// the validator rejects must not be retried on the next frame.
+inline bool install_season(void* manager) {
+    if (g_install_attempted) return g_install_succeeded;
+    if (manager == nullptr) return false;
+
+    // Already populated by the game itself: leave it completely alone.
+    if (manager_service(manager) != nullptr) {
+        g_install_attempted = true;
+        g_install_succeeded = true;
+        LOGI("23.1.3-pixelpass: the pass manager already holds a service; "
+             "nothing was injected");
+        return true;
+    }
+
+    if (!g_season_path_ready) {
+        g_install_attempted = true;
+        LOGE("23.1.3-pixelpass: the season construction path is not armed on "
+             "this build; the lobby stays without a pass");
+        return false;
+    }
+
+    g_install_attempted = true;
+
+    void* season = build_season_object();
+    if (season == nullptr) return false;
+
+    LOGI("23.1.3-pixelpass: allocating the pass service");
+    void* service = il2cpp::object_new(g_service_klass);
+    if (service == nullptr) {
+        LOGE("23.1.3-pixelpass: the pass service could not be allocated");
+        return false;
+    }
+
+    // il2cpp_object_new does not run constructors, so this is the `newobj`
+    // second half. It must happen before the object is published anywhere.
+    LOGI("23.1.3-pixelpass: running the pass service constructor");
+    reinterpret_cast<InstanceArgVoidFn>(g_service_ctor.ptr)(
+        service, season, g_service_ctor.info);
+
+    LOGI("23.1.3-pixelpass: handing the pass service to the manager");
+    reinterpret_cast<InstanceArgVoidFn>(g_mgr_set_service.ptr)(
+        manager, service, g_mgr_set_service.info);
+
+    void* stored_service = manager_service(manager);
+    void* stored_season = manager_season(manager);
+    g_install_succeeded = (stored_service != nullptr);
+
+    if (g_install_succeeded) {
+        LOGI("23.1.3-pixelpass: the pass manager now holds a service and its "
+             "season reads back %s; %" PRId32 " tiers over %" PRId32
+             " page(s) are live",
+             stored_season != nullptr ? "present" : "absent", kTierCount,
+             (kTierCount + kTiersPerPage - 1) / kTiersPerPage);
+    } else {
+        LOGE("23.1.3-pixelpass: the service was constructed but the manager did "
+             "not keep it");
+    }
+    return g_install_succeeded;
 }
 
 // ---------------------------------------------------------- the gate hooks
@@ -768,16 +942,28 @@ inline bool gate_c_hook(void* self, void* method) {
 
 // ------------------------------------------------------ the lobby view hook
 
-// Read-only. Reports, once, whether the view runs at all and what it found:
-// this is what separates "the button is hidden" from "the view never even
-// reaches the lobby".
+// The season is installed here, before the original runs, so the view
+// initialises against a populated manager instead of the null it used to find.
+// The view's own service field is written too, because the view may have
+// cached it in Awake, before this hook ever ran.
 inline void view_enable_hook(void* self, void* method) {
+    void* manager = manager_instance();
+    if (manager != nullptr) install_season(manager);
+
+    if (g_install_succeeded && g_view_service_field != nullptr &&
+        il2cpp::field_set_value != nullptr &&
+        read_object_field(self, g_view_service_field) == nullptr) {
+        void* service = manager_service(manager);
+        if (service != nullptr) {
+            il2cpp::field_set_value(self, g_view_service_field, &service);
+        }
+    }
+
     if (g_view_enable_orig != nullptr) g_view_enable_orig(self, method);
     ++g_view_enables;
     if (g_view_logged) return;
     g_view_logged = true;
 
-    void* manager = manager_instance();
     LOGI("23.1.3-pixelpass: PixelPassLobbyView.OnEnable ran (holder=%d "
          "lock=%d unlock=%d coming-soon=%d need-level=%d button=%d "
          "view service=%s; manager=%s manager service=%s season=%s)",
@@ -846,8 +1032,7 @@ inline bool handle_load(int32_t config_id, void** payload, void** error,
         g_logged_first_serve = true;
         LOGI("23.1.3-pixelpass: config %" PRId32 " was empty in the stock "
              "on-device cache; served the local season (%" PRId64 " bytes) "
-             "through %s -- the lobby pass button and its tiers exist from "
-             "here on",
+             "through %s",
              kConfigPixelPass, array_length(season), where);
     }
     return true;
@@ -883,9 +1068,7 @@ inline bool storage_load_inner_hook(void* self, int32_t config_id, void* path,
     return handle_load(config_id, payload, error, stock, "the inner loader", 2);
 }
 
-// Read-only: the write path is never altered, it is only reported. If the game
-// ever persists ConfigId 123 itself, that payload is real content and the
-// loaders above will hand it back in preference to the local season.
+// Read-only: the write path is never altered, it is only reported.
 inline bool storage_save_hook(void* self, int32_t config_id, void* payload,
                               void** error, void* method) {
     const bool stock =
@@ -906,61 +1089,101 @@ inline bool storage_save_hook(void* self, int32_t config_id, void* payload,
 inline void pump() {
     if (!g_installed) return;
     ++g_frames;
+
+    // Backstop: if the lobby view was enabled before this module was ready,
+    // the season still gets installed from here.
+    if (!g_install_attempted && g_season_path_ready) {
+        void* manager = manager_instance();
+        if (manager != nullptr) install_season(manager);
+    }
+
     const bool due = (g_frames == kFirstReportFrame) ||
                      ((g_frames % kReportPeriodFrames) == 0u);
     if (!due) return;
 
-    LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in, the stock config "
-         "cache was read %" PRIu64 " time(s) in total; config %" PRId32
-         " reads=%" PRIu64 " served locally=%" PRIu64
-         " stock payload won=%" PRIu64 " skin ids=%zu",
-         g_frames, g_reads_total, kConfigPixelPass, g_queries, g_served,
-         g_stock_wins, g_skin_count);
-
     if (!g_manager_armed) {
-        LOGI("23.1.3-pixelpass: the pass manager could not be bound, so only "
-             "the config cache is instrumented on this build");
+        LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in; the pass manager "
+             "could not be bound, so only the config cache is instrumented "
+             "(cache reads=%" PRIu64 ")",
+             g_frames, g_reads_total);
         return;
     }
 
     void* manager = manager_instance();
     if (manager == nullptr) {
-        LOGI("23.1.3-pixelpass: the pass manager singleton is still null while "
-             "the lobby is up, so nothing about the pass has been constructed "
-             "yet; the lobby view cannot show a button in this state");
+        LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in, the pass manager "
+             "singleton is still null, so nothing about the pass has been "
+             "constructed yet",
+             g_frames);
         return;
     }
 
-    LOGI("23.1.3-pixelpass: pass manager alive (service=%s season=%s); lobby "
-         "view OnEnable ran %" PRIu64 " time(s); gates opened by this port "
-         "A=%" PRIu64 " B=%" PRIu64 " C=%" PRIu64,
-         manager_service(manager) != nullptr ? "set" : "null",
+    LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in; pass manager alive "
+         "(service=%s season=%s), season injected=%d, lobby view OnEnable ran "
+         "%" PRIu64 " time(s), gates opened by this port A=%" PRIu64
+         " B=%" PRIu64 " C=%" PRIu64 "; cache reads=%" PRIu64
+         " (config %" PRId32 " reads=%" PRIu64 ")",
+         g_frames, manager_service(manager) != nullptr ? "set" : "null",
          manager_season(manager) != nullptr ? "present" : "absent",
-         g_view_enables, g_gate_forced[0], g_gate_forced[1], g_gate_forced[2]);
+         g_install_succeeded ? 1 : 0, g_view_enables, g_gate_forced[0],
+         g_gate_forced[1], g_gate_forced[2], g_reads_total, kConfigPixelPass,
+         g_queries);
 
     if (g_view_enables == 0u) {
         LOGI("23.1.3-pixelpass: PixelPassLobbyView.OnEnable has not run once, "
-             "so the pass view is not present in this lobby at all -- the "
-             "button is missing because nothing creates it, not because a gate "
-             "hides it");
+             "so the pass view is not present in this lobby at all");
     }
 }
 
 // ------------------------------------------------------------ installation
 
-// Binds the pass manager and hooks its gates plus the lobby view. Best effort:
-// the config cache instrumentation stays useful on its own, so a failure here
-// is reported and does not disarm the module.
+// Binds everything needed to build a season and hand it over. Every method
+// called on this path is identity-checked against its expected RVA first.
+inline bool install_season_path() {
+    if (il2cpp::object_new == nullptr || il2cpp::class_get_type == nullptr ||
+        il2cpp::type_get_object == nullptr) {
+        LOGE("23.1.3-pixelpass: this runtime does not export the allocation or "
+             "reflection entry points, so no season can be constructed");
+        return false;
+    }
+
+    g_season_klass = il2cpp::find_class(kPassNs, kSeasonClass);
+    g_service_klass = il2cpp::find_class(kPassNs, kServiceClass);
+    if (g_season_klass == nullptr || g_service_klass == nullptr) {
+        LOGE("23.1.3-pixelpass: the season DTO or the pass service class is "
+             "missing from metadata");
+        return false;
+    }
+
+    bool ok = true;
+    ok &= bind_exact(g_deserialize, kJsonNs, kJsonConvertClass,
+                     kDeserializeObject, 2, kRvaDeserializeStringType);
+    ok &= bind_exact(g_service_ctor, kPassNs, kServiceClass, kCtor, 1,
+                     kRvaServiceCtor);
+    ok &= bind_exact(g_mgr_set_service, kPassNs, kManagerClass,
+                     kManagerSetService, 1, kRvaManagerSetService);
+    if (!ok) {
+        LOGE("23.1.3-pixelpass: the season construction path did not verify "
+             "against this build; nothing will be injected");
+        return false;
+    }
+    return true;
+}
+
+// Binds the pass manager and hooks its gates plus the lobby view.
 inline bool install_manager() {
     bool resolved = true;
     resolved &= bind(g_mgr_instance, kPassNs, kManagerClass, kManagerInstance, 0);
-    resolved &= bind(g_mgr_season, kPassNs, kManagerClass, kManagerSeason, 0);
+    resolved &= bind_exact(g_mgr_season, kPassNs, kManagerClass, kManagerSeason,
+                           0, kRvaManagerSeason);
     resolved &= bind(g_mgr_service, kPassNs, kManagerClass, kManagerService, 0);
     if (!resolved) {
         LOGE("23.1.3-pixelpass: the pass manager does not match the expected "
              "23.1.3 metadata; its gates were not touched");
         return false;
     }
+
+    g_season_path_ready = install_season_path();
 
     const bool gate_a =
         hook::install({kPassNs, kManagerClass, kManagerGateA, 0},
@@ -995,28 +1218,30 @@ inline bool install_manager() {
                       reinterpret_cast<void**>(&g_view_enable_orig), false);
 
     g_manager_armed = true;
-    LOGI("23.1.3-pixelpass: pass manager instrumented (gates A=%d B=%d C=%d, "
-         "lobby view OnEnable=%d); a shut gate is opened only when a season "
-         "actually exists, because the view dereferences it straight after",
-         gate_a ? 1 : 0, gate_b ? 1 : 0, gate_c ? 1 : 0, view ? 1 : 0);
+    LOGI("23.1.3-pixelpass: pass manager armed (gates A=%d B=%d C=%d, lobby "
+         "view OnEnable=%d, season construction=%d); the season is built and "
+         "handed over from the view's own OnEnable",
+         gate_a ? 1 : 0, gate_b ? 1 : 0, gate_c ? 1 : 0, view ? 1 : 0,
+         g_season_path_ready ? 1 : 0);
     return true;
 }
 
-inline bool install() {
+inline bool install(uintptr_t base) {
     if (g_installed) return true;
+    g_base = base;
 
     bool resolved = true;
     resolved &= bind(g_from_base64, kSystemNs, kConvertClass, kFromBase64, 1);
     resolved &= bind(g_skin_ids, kRilisoftNs, kSkinCatalogueClass, kSkinIdList, 0);
     if (!resolved) {
         LOGE("23.1.3-pixelpass: metadata does not match the expected 23.1.3 "
-             "build; no season will be served");
+             "build; no season will be built");
         return false;
     }
 
     // Kept as a safety net and as the source of the ConfigId trace. The device
-    // has shown the game only ever asks this cache for ConfigId 102, so this
-    // is no longer required for the module to be useful.
+    // has shown the game only ever asks this cache for ConfigId 102, so none of
+    // these is required for the module to work.
     const bool primary =
         hook::install({kPgNs, kStorageClass, kStorageLoad, 3},
                       reinterpret_cast<void*>(&storage_load_hook),
@@ -1039,26 +1264,29 @@ inline bool install() {
     g_installed = true;
     LOGI("23.1.3-pixelpass: armed (config id %" PRId32 ", %" PRId32
          " tiers, %" PRId32 " per page; cache probes primary=%d secondary=%d "
-         "inner=%d save=%d, manager=%d); the config cache is instrumentation "
-         "only on this build -- the device proved the game never asks it for "
-         "the pass",
+         "inner=%d save=%d, manager=%d, season construction=%d); the season is "
+         "constructed on device and handed to the game's own pass manager, "
+         "because the device proved the config cache is never asked for it",
          kConfigPixelPass, kTierCount, kTiersPerPage, primary ? 1 : 0,
-         alt ? 1 : 0, inner ? 1 : 0, save ? 1 : 0, g_manager_armed ? 1 : 0);
+         alt ? 1 : 0, inner ? 1 : 0, save ? 1 : 0, g_manager_armed ? 1 : 0,
+         g_season_path_ready ? 1 : 0);
     return true;
 }
 
 } // namespace detail
 
-// Instruments the PixelPass delivery path: the stock config cache (all three
-// read entry points plus the write path, as a probe and a safety net) and the
-// pass manager the lobby view actually reads, whose gates are opened when a
-// season exists.
-inline bool install_hooks() { return detail::install(); }
+// Builds the offline PixelPass season and gives the game's own pass manager a
+// real service built from it, which is what makes the lobby button exist. The
+// stock config cache is also instrumented, as a probe and a safety net.
+//
+// `base` is the loaded libil2cpp.so base address: every managed method this
+// module calls is identity-checked against its expected RVA before use, which
+// is what keeps the ambiguous JsonConvert.DeserializeObject overload honest.
+inline bool install_hooks(uintptr_t base) { return detail::install(base); }
 
-// Read-only counters, driven from the main-menu Update slot. Reports early,
-// because the facts that decide the next step -- is the manager alive, does it
-// hold a season, does the lobby view run at all -- have to survive a short
-// capture.
+// Read-only counters plus a backstop for installing the season if the lobby
+// view was enabled before this module was ready. Driven from the main-menu
+// Update slot.
 inline void pump_from_main_menu() { detail::pump(); }
 
 } // namespace pixel_pass_2313
