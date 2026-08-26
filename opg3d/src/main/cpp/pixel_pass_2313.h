@@ -106,11 +106,18 @@
 //     -> manager 丝世东丛丗下丑丟丞(service)                    0x1A08114
 //     -> PixelPassLobbyView 丗且丈丁丕丕丘一丞 (+0x110)
 //
-// Construction runs from inside the view's own OnEnable, before the original,
-// so the view initialises against a populated manager instead of the null it
-// used to find. The view's field is written too, because the view may have
-// cached it in Awake, before this hook ever ran. The pump keeps a backstop for
-// the case where the view was enabled before the module was ready.
+// Construction is driven from the manager's own gates. They are the earliest
+// point at which the game asks about the pass -- on device they are answered
+// ~3.6 s in, from AppsMenu.Start on the loading screen -- and a shut gate is
+// precisely what removes the lobby entry. The gate hook builds the season, hands
+// it over and then re-reads it, so the same call can already answer true.
+//
+// Waiting for the view instead deadlocks: gate A answers false, so the lobby
+// never creates the pass entry, so PixelPassLobbyView.OnEnable never runs, so no
+// season is ever built, so gate A keeps answering false. The OnEnable hook is
+// kept as a second entry point because it also writes the view's cached service
+// field, which the view may have read in Awake before this hook ran, and pump()
+// retries on menu frames for the case where nothing was buildable yet.
 //
 // Also ruled out: BalanceController.世丄丅丏丌专上世丄(string, byte[], 丐丛丏丒丘东三专一,
 // ConfigId) at 0x471CB40 would drive the game's own parse/validate/raise path,
@@ -272,7 +279,14 @@ constexpr int64_t kMinRealPayload = 3;
 
 // Rebuild attempts before the module stops trying (the skin catalogue may
 // legitimately be empty on the first few reads).
-constexpr int32_t kMaxBuildAttempts = 32;
+// Retry budget for building the season. Deliberately generous: the first
+// attempt now happens on the loading screen, where the local weapon skin
+// catalogue the tier rewards are drawn from is still empty, so the budget has to
+// outlive that. An attempt is a managed list read, and they stop the moment one
+// succeeds or the managed parse is entered.
+constexpr int32_t kMaxBuildAttempts = 240;
+// Menu frames between two backstop install attempts from pump().
+constexpr uint64_t kInstallRetryFrames = 15u;
 
 // The first report has to land inside a short capture: the facts that matter
 // are all visible within a few seconds of the lobby appearing.
@@ -487,8 +501,20 @@ inline bool g_manager_armed = false;
 inline bool g_season_path_ready = false;
 inline bool g_route_deserialize = false;
 inline bool g_route_populate = false;
-inline bool g_install_attempted = false;
+// The real point of no return: set immediately before the first managed parse
+// call. A managed exception cannot be caught from native frames, so a payload
+// the season validator rejects must never be handed over a second time.
+//
+// This used to be one flag set *before* build_season_object(), which also
+// swallowed every transient miss -- an empty skin catalogue on the loading
+// screen was enough to disable the module for the whole session and made the
+// kMaxBuildAttempts loop dead code.
+inline bool g_managed_parse_started = false;
+// A terminal refusal that retrying cannot cure: the construction path did not
+// verify against this libil2cpp.so.
+inline bool g_install_disarmed = false;
 inline bool g_install_succeeded = false;
+inline uint64_t g_install_misses = 0u;
 inline bool g_gate_logged[3] = {false, false, false};
 inline bool g_gate_forced_logged[3] = {false, false, false};
 inline uint64_t g_gate_forced[3] = {0u, 0u, 0u};
@@ -496,6 +522,18 @@ inline uint64_t g_view_enables = 0u;
 inline bool g_view_logged = false;
 // Guards against a gate hook re-entering itself through the season getter.
 inline bool g_in_season_query = false;
+// Guards against a season install driven from a gate re-entering that same gate
+// through the pass service constructor or the manager's service setter.
+inline bool g_in_gate_install = false;
+
+// True once the outcome is decided and another attempt is pointless: the
+// service is in place, or managed construction has already been entered once,
+// or the path does not verify on this build. Everything else -- most
+// importantly a weapon skin catalogue that has not loaded yet -- is a transient
+// miss and must stay retryable.
+inline bool install_settled() {
+    return g_install_succeeded || g_managed_parse_started || g_install_disarmed;
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -890,6 +928,11 @@ inline void* build_season_object() {
             LOGI("23.1.3-pixelpass: parsing the season with the game's own "
                  "Newtonsoft (%zu json bytes, %" PRId32 " tiers, %zu skin ids)",
                  g_season_json.size(), kTierCount, g_skin_count);
+            // Point of no return. From here a managed frame runs and the season
+            // validator may throw, which native code cannot catch, so this must
+            // never be attempted twice. Everything above this line is a
+            // retryable pre-flight check and deliberately does NOT latch.
+            g_managed_parse_started = true;
             void* season = reinterpret_cast<DeserializeFn>(g_deserialize.ptr)(
                 json, type_object, g_deserialize.info);
             if (season != nullptr) {
@@ -905,6 +948,8 @@ inline void* build_season_object() {
         LOGI("23.1.3-pixelpass: allocating a season and populating it (%zu "
              "json bytes, %" PRId32 " tiers, %zu skin ids)",
              g_season_json.size(), kTierCount, g_skin_count);
+        // Same point of no return as the typed route above.
+        g_managed_parse_started = true;
         void* season = il2cpp::object_new(g_season_klass);
         if (season == nullptr) {
             LOGE("23.1.3-pixelpass: the season could not be allocated");
@@ -930,12 +975,16 @@ inline void* build_season_object() {
 // after: a managed exception cannot be caught from native frames, so a payload
 // the validator rejects must not be retried on the next frame.
 inline bool install_season(void* manager) {
-    if (g_install_attempted) return g_install_succeeded;
+    if (g_install_succeeded) return true;
+    // Only a *decided* outcome blocks another attempt. This used to be a single
+    // g_install_attempted latch set before any work happened, which meant the
+    // earliest caller -- on the loading screen, before the game has loaded
+    // anything the season needs -- permanently disabled the pass.
+    if (g_managed_parse_started || g_install_disarmed) return false;
     if (manager == nullptr) return false;
 
     // Already populated by the game itself: leave it completely alone.
     if (manager_service(manager) != nullptr) {
-        g_install_attempted = true;
         g_install_succeeded = true;
         LOGI("23.1.3-pixelpass: the pass manager already holds a service; "
              "nothing was injected");
@@ -943,16 +992,28 @@ inline bool install_season(void* manager) {
     }
 
     if (!g_season_path_ready) {
-        g_install_attempted = true;
+        g_install_disarmed = true;
         LOGE("23.1.3-pixelpass: the season construction path is not armed on "
              "this build; the lobby stays without a pass");
         return false;
     }
 
-    g_install_attempted = true;
-
     void* season = build_season_object();
-    if (season == nullptr) return false;
+    if (season == nullptr) {
+        // Unless the parse latch was set, no managed frame ran and this is a
+        // transient miss: on the loading screen the local weapon skin catalogue
+        // is simply not populated yet. Retry from the next gate query or menu
+        // frame rather than giving up on the pass for the whole session.
+        if (!g_managed_parse_started) {
+            ++g_install_misses;
+            if (g_install_misses == 1u) {
+                LOGI("23.1.3-pixelpass: no season could be built yet (the local "
+                     "weapon skin catalogue is still empty); this is retried, "
+                     "not fatal");
+            }
+        }
+        return false;
+    }
 
     LOGI("23.1.3-pixelpass: allocating the pass service");
     void* service = il2cpp::object_new(g_service_klass);
@@ -1010,6 +1071,29 @@ inline const char* gate_label(int slot) {
 // reported once. The override is only allowed to open a gate when a season
 // actually exists, because the view dereferences it immediately afterwards.
 inline bool handle_gate(void* self, int slot, bool stock) {
+    // The gates are the earliest moment the game asks about the pass. On the
+    // reported capture they are answered ~3.6 s in, from AppsMenu.Start on the
+    // loading screen, long before PixelPassLobbyView.OnEnable or the main-menu
+    // pump can run. Only observing them deadlocks: gate A answers false, so the
+    // lobby never creates the pass entry, so OnEnable never fires, so no season
+    // is ever built, so gate A keeps answering false. Build it from here.
+    //
+    // `self` is the pass manager instance, which is exactly what install_season
+    // wants, so no static-instance lookup is needed.
+    if (!g_in_gate_install && !install_settled() && g_season_path_ready) {
+        static bool s_gate_install_logged = false;
+        g_in_gate_install = true;
+        if (!s_gate_install_logged) {
+            s_gate_install_logged = true;
+            LOGI("23.1.3-pixelpass: %s was asked before a season existed; "
+                 "building one now",
+                 gate_label(slot));
+        }
+        install_season(self);
+        g_in_gate_install = false;
+    }
+
+    // Read after the install attempt, so this very call can answer true.
     void* season = manager_season(self);
 
     if (!g_gate_logged[slot]) {
@@ -1201,9 +1285,13 @@ inline void pump() {
     if (!g_installed) return;
     ++g_frames;
 
-    // Backstop: if the lobby view was enabled before this module was ready,
-    // the season still gets installed from here.
-    if (!g_install_attempted && g_season_path_ready) {
+    // Backstop for anything the gates did not cover, and the retry channel for
+    // a season that simply was not buildable yet. Throttled, because the budget
+    // is bounded by kMaxBuildAttempts and one attempt per frame would spend all
+    // of it in well under a second of menu time -- long before the local weapon
+    // skin catalogue is guaranteed to be populated.
+    if (!install_settled() && g_season_path_ready &&
+        (g_frames % kInstallRetryFrames) == 0u) {
         void* manager = manager_instance();
         if (manager != nullptr) install_season(manager);
     }
@@ -1229,14 +1317,27 @@ inline void pump() {
         return;
     }
 
+    // Spelled out, because these four states need completely different fixes
+    // and the previous "injected=0" could not tell them apart.
+    const char* install_state =
+        g_install_succeeded
+            ? "done"
+            : (g_install_disarmed
+                   ? "disarmed, the construction path did not verify"
+                   : (g_managed_parse_started
+                          ? "the managed parse ran once and yielded no usable "
+                            "season, so it is not repeated"
+                          : "still waiting for a buildable season"));
+
     LOGI("23.1.3-pixelpass: %" PRIu64 " menu frame(s) in; pass manager alive "
-         "(service=%s season=%s), season injected=%d, lobby view OnEnable ran "
+         "(service=%s season=%s), season install=%s (%" PRIu64
+         " transient miss(es)), lobby view OnEnable ran "
          "%" PRIu64 " time(s), gates opened by this port A=%" PRIu64
          " B=%" PRIu64 " C=%" PRIu64 "; cache reads=%" PRIu64
          " (config %" PRId32 " reads=%" PRIu64 ")",
          g_frames, manager_service(manager) != nullptr ? "set" : "null",
          manager_season(manager) != nullptr ? "present" : "absent",
-         g_install_succeeded ? 1 : 0, g_view_enables, g_gate_forced[0],
+         install_state, g_install_misses, g_view_enables, g_gate_forced[0],
          g_gate_forced[1], g_gate_forced[2], g_reads_total, kConfigPixelPass,
          g_queries);
 
@@ -1357,8 +1458,9 @@ inline bool install_manager() {
 
     g_manager_armed = true;
     LOGI("23.1.3-pixelpass: pass manager armed (gates A=%d B=%d C=%d, lobby "
-         "view OnEnable=%d, season construction=%d); the season is built and "
-         "handed over from the view's own OnEnable",
+         "view OnEnable=%d, season construction=%d); the season is built from "
+         "the first gate query that finds none, because the gates are answered "
+         "on the loading screen and a shut gate is what removes the lobby entry",
          gate_a ? 1 : 0, gate_b ? 1 : 0, gate_c ? 1 : 0, view ? 1 : 0,
          g_season_path_ready ? 1 : 0);
     return true;

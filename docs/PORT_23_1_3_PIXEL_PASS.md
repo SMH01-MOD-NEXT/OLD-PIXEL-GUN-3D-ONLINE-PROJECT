@@ -45,7 +45,7 @@ elsewhere: `feature.pixelpass` is opened by `live_content_2313`, which hooks
 `世丁丒专东专丛一且::一丈丞丞万丐与丏业/1`. An open flag with no season still yields no
 button, which is why both modules are needed.
 
-## Three attempts, and what each one got wrong
+## Four attempts, and what each one got wrong
 
 **1. Grant cosmetics natively.** No season was ever created, so the lobby had
 nothing to lay out. Wrong layer.
@@ -81,7 +81,51 @@ would have bitten immediately afterwards. The tier `IsFree` field (`"f"`) is
 `[JsonConverter(typeof(七不不丐专世丝丄上))]`), **not** a `bool`. It was being emitted
 as `true`, which that converter cannot read.
 
-**3. Serve the season from the cache read path.** Current design, below.
+**3. Serve the season from the cache read path.** The device then proved the
+cache is never asked for `ConfigId 123` at all, so this route was retired in
+favour of handing a constructed season straight to the pass manager, built from
+`PixelPassLobbyView.OnEnable`.
+
+**4. Build the season from the view's `OnEnable`.** Armed perfectly and still
+produced no button. Two defects, and they masked each other:
+
+*Ordering deadlock.* `handle_gate()` was a pure observer: it read the season,
+logged it, and returned the stock verdict. Nothing built anything. But the
+gates are answered on the **loading screen**, ~3.6 s in, from `AppsMenu.Start`:
+
+```
+#000181 (t+4132ms) pixelpass: the pass manager answered gate C = true  while the season is absent
+#000182                       swt: AppsMenu.Start state=3 result=1
+#000197 (t+4986ms) pixelpass: the pass manager answered gate A = false while the season is absent
+```
+
+Gate A answers `false`, so the lobby never creates the pass entry, so
+`PixelPassLobbyView.OnEnable` never runs — it appears **nowhere** in the
+capture — so `install_season()` is never called, so gate A keeps answering
+`false`. A closed loop. `kForceGatesWhenSeasonExists` could not break it either,
+because it is gated on a season that does not exist yet.
+
+*The one-shot latch was set before the work.* `install_season()` did:
+
+```cpp
+g_install_attempted = true;          // <- latched here
+void* season = build_season_object();
+if (season == nullptr) return false; // <- never retried
+```
+
+`build_season_object()` returns `nullptr` for reasons that are purely
+**transient** and happen before any managed call: `ensure_season_text()` fails
+while the local `Rilisoft.与世且一丁丆丈丄丈.丛上丌丏丟丒东丂且()` weapon-skin catalogue is
+still empty — exactly its state at t+4 s — or `il2cpp::string_new` is null.
+With the latch already set, `install_season()` could never be entered again,
+which also made the `kMaxBuildAttempts` retry loop dead code.
+
+The two had to be fixed together: repairing only the ordering would have made
+the gate the earliest caller, at the moment the catalogue is *guaranteed* to be
+empty, and poisoned the module harder.
+
+**Current design, below:** the gates build the season, and only entering managed
+construction is treated as irreversible.
 
 ## Current design
 
@@ -198,21 +242,61 @@ on every read.
 ## Fail-closed behaviour
 
 If a metadata target is missing, if the skin catalogue is still empty, or if
-the payload cannot be marshalled, the stock result is returned untouched and
-the next read tries again. The catalogue is retried up to 32 times before the
-module gives up and says so.
+the payload cannot be marshalled, the stock result is returned untouched and the
+next gate query or menu frame tries again.
+
+The distinction that matters is **what counts as irreversible**. Only two things
+do:
+
+* `g_managed_parse_started` — set immediately before the first managed call
+  (`DeserializeObject`, or `object_new` + `PopulateObject`). Past that line a
+  managed frame has run and the season validator may have thrown, which native
+  code cannot catch, so the same payload must never be handed over twice.
+* `g_install_disarmed` — the construction path did not verify against this
+  `libil2cpp.so`. Retrying cannot help.
+
+Everything before that first managed call is a **pre-flight check** and stays
+retryable: an empty weapon-skin catalogue, a null `string_new`. This is the
+difference between the old and the new code, and it is what makes the retry
+budget real rather than decorative.
+
+The budget is `kMaxBuildAttempts = 240` (raised from 32), and `pump()` spends it
+at one attempt per `kInstallRetryFrames = 15` menu frames. One per frame would
+have burned all 240 in about four seconds — long before the catalogue is
+guaranteed to be populated.
 
 ## Expected log
 
+The build tag is now `lobby gate v6 + ... + pixel pass v2 (gate-driven
+season)`. If `#000005 init:` still says `lobby gate v5`, the old `.so` is
+running and nothing below applies.
+
 ```
-23.1.3-pixelpass: armed on the config cache read path (config id 123, 50 tiers, 10 per page); the season is served on demand and nothing is persisted
+23.1.3-pixelpass: pass manager armed (gates A=1 B=1 C=1, lobby view OnEnable=1, season construction=1); the season is built from the first gate query that finds none
+23.1.3-pixelpass: gate A was asked before a season existed; building one now
+23.1.3-pixelpass: no season could be built yet (the local weapon skin catalogue is still empty); this is retried, not fatal
 23.1.3-pixelpass: season authored (N json bytes, 50 tiers, M skin ids, graffiti tiers 10)
-23.1.3-pixelpass: config 123 was empty in the stock on-device cache; served the local season (N bytes) -- the lobby pass button and its tiers exist from here on
+23.1.3-pixelpass: the pass manager now holds a service and reports its season; 50 tiers over 5 page(s) are live
+23.1.3-pixelpass: the season exists but gate A was shut; opening it so the lobby pass button can appear
 ```
 
-A periodic counter line follows roughly once a minute while the main menu is
-alive. `progression=1` in the `init:` summary is a prerequisite for that
-counter only — the season itself no longer depends on it.
+The middle line is expected and harmless — the first gate query happens on the
+loading screen, before the skin catalogue exists. It should be followed by
+`season authored` within a few menu frames.
+
+The periodic counter now names the install state explicitly, so a capture is
+self-diagnosing:
+
+| Counter says | Meaning | Next step |
+| --- | --- | --- |
+| `season install=done` | Working. | Nothing. |
+| `still waiting for a buildable season` | The skin catalogue never filled. | Chase `collect_skin_ids`, or set `kIncludeGraffiti = false` / widen the budget. |
+| `the managed parse ran once and yielded no usable season` | The season was built and the managed validator rejected it. | The payload shape is wrong — check `f` (`IsFree`) is a number and the `丅丑世丈世七丈丂丁` rules. |
+| `disarmed, the construction path did not verify` | Metadata/RVA mismatch. | Re-check the RVAs against `analys2313/dump2313.cs`. |
+
+`progression=1` in the `init:` summary is no longer a prerequisite at all: the
+gates drive construction themselves, so a failure in `progression_2313` can no
+longer take the battle pass down with it.
 
 ## Known gaps
 
