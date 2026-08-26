@@ -33,8 +33,39 @@ inline void*       (*class_get_field_from_name)(void* klass, const char* name) =
 inline void*       (*class_get_nested_types)(void* klass, void** iter) = nullptr;
 inline const char* (*class_get_name)(void* klass) = nullptr;
 
+// Method walk over one class, same iterator contract as class_get_nested_types.
+//
+// This exists because il2cpp_class_get_method_from_name(klass, name, argc)
+// cannot distinguish overloads that share an argument count: it returns
+// whichever one metadata happens to list first. That is not a theoretical
+// worry -- on this build Newtonsoft's JsonConvert has four two-argument
+// DeserializeObject overloads, and asking for "DeserializeObject"/2 returns
+// (string, JsonSerializerSettings) when (string, Type) was wanted. Walking the
+// method list and matching on the method pointer is the only way to name an
+// overload unambiguously from native code. See find_method_by_address.
+inline void*       (*class_get_methods)(void* klass, void** iter) = nullptr;
+
 inline void*       (*object_get_class)(void* object) = nullptr;
 inline void        (*field_get_value)(void* object, void* field, void* value) = nullptr;
+
+// Managed allocation and reflection Type lookup.
+//
+// These three are bound outside the required set (see resolve()), because only
+// the PixelPass season path needs them: a layout without them still installs
+// every other hook instead of failing the whole library.
+//
+// il2cpp_object_new allocates a zeroed instance and does NOT run any
+// constructor -- the .ctor has to be invoked separately, exactly the way the
+// `newobj` IL instruction does it. Calling a managed .ctor on an object that
+// was never allocated by the runtime would corrupt the heap, so these two
+// always travel together.
+//
+// class_get_type + type_get_object turn an Il2CppClass* into the managed
+// System.Type object that reflection-shaped APIs such as
+// JsonConvert.DeserializeObject(string, Type) expect.
+inline void*       (*object_new)(void* klass) = nullptr;
+inline const void* (*class_get_type)(void* klass) = nullptr;
+inline void*       (*type_get_object)(const void* type) = nullptr;
 
 // In the old embedding IL2CPP API the third argument of
 // il2cpp_field_set_value has an asymmetric ABI: for value types it is a
@@ -99,6 +130,25 @@ void* find_nested_class(void* outer, const char* name);
 
 void* find_method_info(const char* namespaze, const char* klass,
                        const char* method, int args_count);
+
+// Returns the MethodInfo of `klass` whose compiled entry point is exactly
+// `address`, or nullptr.
+//
+// Use this instead of find_method_info() whenever the wanted method shares its
+// name and argument count with a sibling overload. A method pointer is unique,
+// so this identifies an overload exactly, and it hands back the MethodInfo
+// that belongs to that pointer rather than one that merely looks compatible.
+//
+// `address` is normally the loaded module base plus the RVA read from a
+// metadata dump, which also makes the lookup a build check: on a different
+// libil2cpp.so no method sits at that address and the call fails closed.
+//
+// Requires il2cpp_class_get_methods, which is bound optionally, so callers
+// must handle nullptr and keep a fallback.
+void* find_method_by_address(void* klass, void* address);
+void* find_method_by_address(const char* namespaze, const char* klass,
+                             void* address);
+
 void* method_pointer(void* method_info);
 void* find_field(const char* namespaze, const char* klass, const char* field);
 

@@ -28,6 +28,7 @@
 #include "photon_2313.h"
 #include "photon_default_plugin_2313.h"
 #include "photon_trace_2313.h"
+#include "pixel_pass_2313.h"
 #include "post_match_2313.h"
 #include "progression_2313.h"
 #include "rank_ui_2313.h"
@@ -145,6 +146,9 @@ void* init_thread(void*) {
     const bool live_content    = live_content_2313::install_hooks(base);
     const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
     const bool hidden_items    = hidden_items_2313::install_hooks(base);
+    // The base is required: every managed method the pass path calls is
+    // identity-checked against its expected RVA before use.
+    const bool pixel_pass      = pixel_pass_2313::install_hooks(base);
     const bool local_identity   = identity_2313::install_hooks();
     const bool assets_payload   = assets_data_2313::install_hooks(base);
     const bool net_stall        = net_stall_guard_2313::install_hooks();
@@ -158,7 +162,8 @@ void* init_thread(void*) {
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && live_content && weapon_modules && hidden_items &&
         local_identity && assets_payload && net_stall && post_match &&
-        online_state && battle_ui && rank_ui && bots_trace && backend_emu) {
+        online_state && battle_ui && rank_ui && bots_trace && backend_emu &&
+        pixel_pass) {
         LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
              "retired update/network modals are disabled, the 90%% "
              "InitializeSwitcher stall is bypassed, EU/Default plugin route "
@@ -168,7 +173,10 @@ void* init_thread(void*) {
              "lobby craft catalogue is granted locally, the PixelPass battle "
              "pass, the lotteries and card roulette, the chests and the task "
              "and event content are reachable again instead of being hidden "
-             "by the empty offline ExpOpenSystem table, every weapon "
+             "by the empty offline ExpOpenSystem table, a real PixelPass "
+             "season whose tiers award weapon skins and graffiti is built on "
+             "device and handed to the game's own pass manager, which is what "
+             "makes the lobby pass button exist at all offline, every weapon "
              "and armor module is unlocked at level 10, every hidden weapon, "
              "wear item and gadget the build ships is granted through the "
              "stock item inventory, the player id is "
@@ -189,7 +197,7 @@ void* init_thread(void*) {
              "local-backend=%d photon=%d plugin=%d photon-trace=%d "
              "progression=%d crafting=%d lobby-catalog=%d live-content=%d "
              "modules=%d "
-             "hidden-items=%d "
+             "hidden-items=%d pixel-pass=%d "
              "identity=%d assets-data=%d net-stall=%d "
              "post-match=%d online-state=%d battle-ui=%d rank-ui=%d "
              "bots=%d backend-emu=%d",
@@ -200,7 +208,7 @@ void* init_thread(void*) {
              photon_trace ? 1 : 0, progression ? 1 : 0,
              crafting ? 1 : 0, lobby_catalog ? 1 : 0, live_content ? 1 : 0,
              weapon_modules ? 1 : 0,
-             hidden_items ? 1 : 0,
+             hidden_items ? 1 : 0, pixel_pass ? 1 : 0,
              local_identity ? 1 : 0, assets_payload ? 1 : 0,
              net_stall ? 1 : 0, post_match ? 1 : 0,
              online_state ? 1 : 0, battle_ui ? 1 : 0, rank_ui ? 1 : 0,

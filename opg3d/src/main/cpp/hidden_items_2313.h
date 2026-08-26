@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v5, wear included
+// 23.1.3 (ARM64) hidden weapon, wear and gadget unlock - v6, completion memory
 //
 // v1 granted every definition the build ships, one full stock inventory
 // transaction at a time, and locked the main menu up for minutes on the first
@@ -45,17 +45,61 @@
 // mistake the weapon filter made, so kGrantEveryWear now grants every wear
 // definition the build ships, catalogue or not.
 //
-// Cost of that decision: wear is a wider catalogue than weapons (five types,
-// much of it seasonal), so the bulk pass grows from roughly 800 transactions
-// to a few thousand. At the 15-40 ms per transaction v4 measured, that is on
-// the order of ten seconds of reduced frame rate on the main menu rather than
-// the few seconds v4 needed. The progress log reports the real figure instead
-// of this estimate.
+// -----------------------------------------------------------------------------
+// v6: the inventory is complete, so stop working on it
+// -----------------------------------------------------------------------------
+//
+// v5 shipped and the arsenal did fill up. What it also did, on every launch
+// and on every pass, was this:
+//
+//   hidden-items: pass 1 complete (seen=1401 already owned=1330 wanted=8
+//                 granted=0 left to the shop=63 failed=8) in 791 ms
+//   hidden-items: grant did not register weapon 'Revolver' (count 0 -> 0,
+//                 48623 us)
+//
+// and seven more like it, for Machingun, AK47, DoubleShotgun, AlienGun, m16_2,
+// Uzi2 and Badcode_gun.
+//
+// Those eight weapons are in the player's arsenal and usable. So the premise
+// the sweep is built on -- that 丙丛业丐丐七丛不丂() is the ownership oracle -- is
+// not true for all of them. They are default weapons: the build hands them to
+// every profile without writing an inventory record, so the owned count reads
+// 0 forever, the grant transaction runs, the count still reads 0, and the
+// sweep calls that a failure. It costs a real ~48 ms stock transaction each
+// time, on every pass, to change nothing.
+//
+// v6 stops guessing and starts remembering. A definition whose grant
+// transaction completes without raising the owned count is recorded once, in
+// g_implicit_owned, and is never attempted again: it is reported as owned
+// (which it is, from the player's point of view) instead of as a failure.
+//
+// Two more pieces of the same idea, because re-checking a finished inventory
+// was most of the remaining cost:
+//
+//  - Per-type completion. A type walked end to end without a single
+//    successful grant is marked done in g_type_done[] and later passes skip
+//    it wholesale -- no list fetch, no per-definition owned check.
+//  - The find-by-id probe runs once per session rather than once per pass.
+//    (It is how the harpoon was identified; the device now answers that
+//    question -- 'HarpoonGun_1' exists and reads owned 1 -- so the probe has
+//    served its purpose and only needs to confirm it once.)
+//
+// Taken together, a complete inventory now disarms the sweep on the first
+// pass and says so, instead of re-running a full walk a minute later.
+//
+// The safety net is deliberately left alone: g_consecutive_failures still
+// counts these non-registering grants, because a genuine layout mismatch
+// would show up as *every* grant failing, and any definition that really is
+// owned resets the counter. On a healthy profile 1330 owned definitions reset
+// it constantly, so the net only trips when something is actually wrong.
+//
+// Cost of the v5 decision, unchanged: wear is a wider catalogue than weapons
+// (five types, much of it seasonal), so the bulk pass is a few thousand
+// transactions rather than roughly 800. The progress log reports the real
+// figure instead of an estimate.
 //
 // One thing gets cheaper per definition: a type that is granted whole needs no
-// catalogue lookup at all, because the answer cannot change the decision. In
-// v4 every wear definition paid for an is_offered() call whose only effect was
-// to skip it.
+// catalogue lookup at all, because the answer cannot change the decision.
 //
 // Gadgets keep the catalogue filter and skins stay opt-in (kIncludeSkins):
 // neither was asked for, and both are a one-line flip if that changes.
@@ -83,21 +127,13 @@
 // code. It can, however, be *borrowed*: several shipped methods return
 // List<丑一丘与丁丄专专专> (for instance Progress.东丝丂丄业丕且丙丑::专与丁丞丂丁丐与丝(enum) at
 // 0x1B4B0E0), and List<T>.GetRange(0, 0) on any of them yields a fresh, empty,
-// correctly typed list that we own outright. That is the next step; it needs a
-// device to validate the borrow source, so v4 deliberately shipped the pacing
-// fix first, on code paths already known to work on the target hardware. v5
-// keeps that decision, and widening the sweep to wear makes the batch call more
-// valuable rather than less: it multiplies the number of transactions without
-// changing what any one of them costs.
+// correctly typed list that we own outright. That remains the next step for
+// the *first* launch on a fresh profile; v6 makes it much less urgent, because
+// on an already-complete inventory there is now nothing to batch.
 //
 // Also kept: a targeted find-by-id probe 与丒丅丝丕丕丒丟丆(OfferItemType, string) at
 // 0x3060088 reaches definitions the per-type enumeration may not list, and the
-// gadget definitions are dumped to logcat once. 23.1.3 metadata contains no
-// harpoon item id: Harpoon only exists as member 2 of the movement-gadget kind
-// enum 专丟且东丐三丟丕业 and as weapon config fields (harpoonImpulse,
-// harpoonMaxDistance, isHarpoonProjectile, [...(Harpoon)] public bool harpoon),
-// so the real id can only come off the device. The dump makes that a one-line
-// change once we see it.
+// gadget definitions are dumped to logcat once.
 //
 // Unchanged safety model: fail closed. Nothing is patched, no game memory is
 // written, only stock public calls are made, RVA-taken pointers are used only
@@ -119,6 +155,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "il2cpp.h"
 #include "log.h"
@@ -172,6 +209,13 @@ constexpr uint64_t kRecheckFrames = 3600;
 // mismatch degrades to a no-op instead of a per-frame spin.
 constexpr int32_t kMaxConsecutiveFailures = 24;
 
+// Definitions whose grant transaction completes without raising the owned
+// count. These are items the build hands to every profile without writing an
+// inventory record (Revolver, AK47 and the rest of the starting arsenal), so
+// they are remembered once and never attempted again. The bound is generous:
+// the device reported eight.
+constexpr int32_t kMaxImplicitOwned = 128;
+
 // Sanity bound for a single managed list.
 constexpr int32_t kMaxListEntries = 8192;
 
@@ -216,7 +260,8 @@ constexpr int32_t kFallbackMinDefinitions = 64;
 
 // One-shot dump of every gadget definition id to logcat. This is how the
 // harpoon gets identified: 23.1.3 metadata has no harpoon item id, so the ids
-// have to be read off a running device (adb logcat -s OPG3D).
+// have to be read off a running device (adb logcat -s OPG3D, or just logcat on
+// a rooted device).
 constexpr bool kDumpGadgetIds = true;
 constexpr int32_t kDumpLimit = 96;
 
@@ -233,7 +278,8 @@ constexpr int32_t kAlwaysGrantCount =
 
 // Ids probed directly through the registry find-by-id entry point, for
 // definitions the per-type enumeration may not list. Cheap: a lookup is not a
-// transaction.
+// transaction. The device has since answered the harpoon question --
+// 'HarpoonGun_1' resolves and reads owned 1 -- so this now only confirms.
 constexpr const char* kProbeIds[] = {
     "Harpoon", "HarpoonGun", "Harpoon_1", "HarpoonGun_1", "harpoon",
 };
@@ -486,6 +532,20 @@ inline bool g_grant_everything = kGrantEverything;
 inline bool g_armed = false;
 inline bool g_installed = false;
 
+// v6 completion memory. These deliberately survive begin_pass(): the whole
+// point is that a later pass must not redo work an earlier one proved futile.
+//
+// g_implicit_owned holds definition names whose grant transaction completed
+// without raising the owned count -- items the build provides without an
+// inventory record. g_type_done marks item types walked end to end without a
+// single successful grant. g_probe_done retires the find-by-id probe after one
+// full round.
+inline std::vector<std::string> g_implicit_owned{};
+inline bool g_type_done[kSweptTypeCount] = {};
+inline bool g_probe_done = false;
+inline int32_t g_implicit_skipped = 0;
+inline int32_t g_implicit_found = 0;
+
 // ------------------------------------------------------------- diagnostics
 
 inline uint64_t now_us() {
@@ -535,6 +595,44 @@ inline bool is_always_granted(const std::string& name) {
         if (contains_ci(name, kAlwaysGrantIds[i])) return true;
     }
     return false;
+}
+
+// ------------------------------------------------- v6 completion memory
+
+// Has this definition already proven that the stock grant cannot register it?
+inline bool is_implicitly_owned(const std::string& name) {
+    if (name.empty()) return false;
+    for (const std::string& seen : g_implicit_owned) {
+        if (seen == name) return true;
+    }
+    return false;
+}
+
+// Record a definition the build owns implicitly, so it is never attempted
+// again. Logged once, as information rather than as a failure: from the
+// player's point of view the item is present and usable.
+inline void remember_implicitly_owned(const std::string& name, int32_t type,
+                                      uint64_t cost_us) {
+    ++g_implicit_found;
+    if (name.empty() ||
+        static_cast<int32_t>(g_implicit_owned.size()) >= kMaxImplicitOwned) {
+        return;
+    }
+    g_implicit_owned.push_back(name);
+    LOGI("23.1.3-hidden-items: the build owns %s '%s' without an inventory"
+         " record (grant left the count at 0 after %" PRIu64 " us); it is"
+         " already usable in game, so it will not be attempted again",
+         type_label(type), display_name(name), cost_us);
+}
+
+// True once every swept type has been walked without finding anything to
+// grant, i.e. the inventory is complete and there is no work left at all.
+inline bool every_type_complete() {
+    for (int32_t i = 0; i < kSweptTypeCount; ++i) {
+        if (!is_target_type(kSweptTypes[i])) continue;
+        if (!g_type_done[i]) return false;
+    }
+    return true;
 }
 
 // ------------------------------------------------------------ item helpers
@@ -659,6 +757,10 @@ inline void note_grant_cost(uint64_t cost_us) {
 
 // Runs the stock grant for one definition that is known to be missing, then
 // re-reads the owned count to verify it registered.
+//
+// A grant that runs cleanly and still leaves the count at 0 is not a defect:
+// it is a definition the build hands out without an inventory record. v6
+// records it so no later pass pays for it again.
 inline bool grant_missing(void* registry, void* key, int32_t type,
                           const std::string& name) {
     if (key == nullptr || g_registry_grant == nullptr) {
@@ -678,11 +780,12 @@ inline bool grant_missing(void* registry, void* key, int32_t type,
 
     const int32_t after = owned_count(registry, key);
     if (after < 1) {
-        ++g_failed;
+        // The transaction itself succeeded, so this is not counted as a
+        // failure. The consecutive counter still moves, because a genuine
+        // layout mismatch shows up as *every* grant landing here, and any
+        // definition that really is owned resets it.
         ++g_consecutive_failures;
-        LOGW("23.1.3-hidden-items: grant did not register %s '%s' (count 0 ->"
-             " %" PRId32 ", %" PRIu64 " us)",
-             type_label(type), display_name(name), after, cost);
+        remember_implicitly_owned(name, type, cost);
         return false;
     }
 
@@ -725,7 +828,9 @@ inline bool progress_ready() {
 }
 
 inline void begin_pass() {
-    g_stage = (g_pass == 0) ? Stage::Probe : Stage::Sweep;
+    // The probe is a one-shot: after a full round it has said everything it
+    // can, so later passes go straight to the sweep.
+    g_stage = (g_pass == 0 && !g_probe_done) ? Stage::Probe : Stage::Sweep;
     g_slot = 0;
     g_cursor = 0;
     g_seen = 0;
@@ -734,6 +839,7 @@ inline void begin_pass() {
     g_offered_skipped = 0;
     g_candidates = 0;
     g_failed = 0;
+    g_implicit_skipped = 0;
     g_type_seen = 0;
     g_type_granted = 0;
     g_type_owned = 0;
@@ -745,12 +851,13 @@ inline void finish_pass() {
     const uint64_t elapsed =
         g_sweep_started_us == 0u ? 0u : (now_us() - g_sweep_started_us);
     LOGI("23.1.3-hidden-items: pass %" PRId32 " complete (seen=%" PRId32
-         " already owned=%" PRId32 " wanted=%" PRId32 " granted=%" PRId32
-         " left to the shop=%" PRId32 " failed=%" PRId32 ") in %" PRIu64
+         " already owned=%" PRId32 " owned without a record=%" PRId32
+         " wanted=%" PRId32 " granted=%" PRId32 " left to the shop=%" PRId32
+         " failed=%" PRId32 ") in %" PRIu64
          " ms wall clock, %" PRIu64 " ms inside transactions, worst grant %"
          PRIu64 " us, %" PRId32 " stalls",
-         g_pass, g_seen, g_already_owned, g_candidates, g_granted,
-         g_offered_skipped, g_failed, elapsed / 1000ull,
+         g_pass, g_seen, g_already_owned, g_implicit_skipped, g_candidates,
+         g_granted, g_offered_skipped, g_failed, elapsed / 1000ull,
          g_total_grant_us / 1000ull, g_worst_grant_us, g_stalled_grants);
 
     // Safety net: if not a single definition was selected even though the
@@ -763,16 +870,23 @@ inline void finish_pass() {
              " selected for a grant; retrying with the full inventory sweep",
              g_seen);
         g_grant_everything = true;
+        // The selection rule just changed, so the per-type completion memory
+        // no longer describes the work that is left.
+        for (int32_t i = 0; i < kSweptTypeCount; ++i) g_type_done[i] = false;
         g_stage = Stage::Idle;
         g_next_sweep = g_frames + kRecheckFrames;
         return;
     }
 
+    const bool all_types_done = every_type_complete();
     const bool nothing_left = (g_granted == 0 && g_seen > 0);
-    if (nothing_left || g_pass >= kMaxPasses) {
-        LOGI("23.1.3-hidden-items: weapon, wear and gadget inventory complete"
-             " (%" PRId32 " granted in total, %" PRId32 " already owned)",
-             g_total_granted, g_already_owned);
+    if (all_types_done || nothing_left || g_pass >= kMaxPasses) {
+        LOGI("23.1.3-hidden-items: weapon, wear and gadget inventory is"
+             " complete (%" PRId32 " granted in total, %" PRId32
+             " already owned, %" PRId32 " owned by the build without an"
+             " inventory record); the sweep is disarmed and will not re-run"
+             " this session",
+             g_total_granted, g_already_owned, g_implicit_found);
         g_armed = false;
         return;
     }
@@ -782,11 +896,18 @@ inline void finish_pass() {
 }
 
 inline void advance_slot() {
+    // A type walked end to end with nothing to grant is finished for good.
+    // Later passes skip it without fetching its list at all.
+    if (g_type_seen > 0 && g_type_granted == 0) {
+        g_type_done[g_slot] = true;
+    }
+
     if (g_type_seen > 0) {
         LOGI("23.1.3-hidden-items: %s: %" PRId32 " definitions, %" PRId32
-             " already owned, %" PRId32 " wanted, %" PRId32 " granted",
+             " already owned, %" PRId32 " wanted, %" PRId32 " granted%s",
              type_label(kSweptTypes[g_slot]), g_type_seen, g_type_owned,
-             g_type_hidden, g_type_granted);
+             g_type_hidden, g_type_granted,
+             g_type_done[g_slot] ? " (complete, not re-checked again)" : "");
     }
     g_type_seen = 0;
     g_type_granted = 0;
@@ -802,11 +923,19 @@ inline void advance_slot() {
 }
 
 // One type per frame: ask the registry directly for the ids that the per-type
-// enumeration may not list (the harpoon is the reason this exists).
+// enumeration may not list (the harpoon is the reason this exists). Runs once
+// per session, not once per pass.
 inline void run_probe() {
+    if (g_probe_done) {
+        g_stage = Stage::Sweep;
+        g_slot = 0;
+        return;
+    }
+
     void* registry = registry_instance();
     if (registry == nullptr || g_find_by_id == nullptr ||
         il2cpp::string_new == nullptr) {
+        g_probe_done = true;
         g_stage = Stage::Sweep;
         g_slot = 0;
         return;
@@ -826,7 +955,8 @@ inline void run_probe() {
             LOGI("23.1.3-hidden-items: probe found %s id '%s' (name '%s', owned"
                  " %" PRId32 ")",
                  type_label(type), kProbeIds[i], display_name(name), owned);
-            if (owned == 0 && g_probe_grants < kMaxProbeGrants) {
+            if (owned == 0 && !is_implicitly_owned(name) &&
+                g_probe_grants < kMaxProbeGrants) {
                 ++g_probe_grants;
                 ++g_candidates;
                 grant_missing(registry, key, type, name);
@@ -837,6 +967,7 @@ inline void run_probe() {
     ++g_slot;
     if (g_slot >= kSweptTypeCount) {
         g_slot = 0;
+        g_probe_done = true;
         g_stage = Stage::Sweep;
     }
 }
@@ -863,7 +994,9 @@ inline void run_sweep() {
     if (registry == nullptr) return;
 
     const int32_t type = kSweptTypes[g_slot];
-    if (!is_target_type(type) || g_items_of_type == nullptr) {
+    // A finished type costs nothing now: no list fetch, no owned checks.
+    if (!is_target_type(type) || g_items_of_type == nullptr ||
+        g_type_done[g_slot]) {
         advance_slot();
         return;
     }
@@ -903,7 +1036,12 @@ inline void run_sweep() {
         const std::string name = need_name ? item_name(item) : std::string();
         const int32_t offered =
             (need_name && (dump_type || !whole_type)) ? is_offered(item) : -1;
-        const bool grant_it = (owned == 0) && wants_grant(type, offered, name);
+
+        // Already proven to be owned without an inventory record: never pay
+        // for it a second time.
+        const bool implicit = (owned == 0) && is_implicitly_owned(name);
+        const bool grant_it =
+            (owned == 0) && !implicit && wants_grant(type, offered, name);
 
         // A grant is the only expensive step, so it waits for its budget. The
         // cursor stays put, and this definition is retried on a later frame.
@@ -930,6 +1068,13 @@ inline void run_sweep() {
             g_consecutive_failures = 0;
             continue;
         }
+        if (implicit) {
+            // Present and usable in game, so it counts as owned.
+            ++g_already_owned;
+            ++g_type_owned;
+            ++g_implicit_skipped;
+            continue;
+        }
         if (owned < 0) {
             ++g_failed;
             ++g_consecutive_failures;
@@ -953,8 +1098,8 @@ inline void run_sweep() {
     }
 
     if (g_consecutive_failures >= kMaxConsecutiveFailures) {
-        LOGW("23.1.3-hidden-items: %" PRId32 " consecutive failures; disarming"
-             " (granted=%" PRId32 " total)",
+        LOGW("23.1.3-hidden-items: %" PRId32 " consecutive grants left the"
+             " owned count unchanged; disarming (granted=%" PRId32 " total)",
              g_consecutive_failures, g_total_granted);
         g_armed = false;
         return;
@@ -1040,7 +1185,9 @@ inline bool install(uintptr_t il2cpp_base) {
          " inventory, starting at menu frame %" PRIu64 " (bulk budget %" PRIu64
          " us and max %" PRId32 " transactions per frame, steady state %"
          PRIu64 " us and %" PRId32 ", backoff only above %" PRIu64
-         " us, skins %s)",
+         " us, skins %s); a definition the build owns without an inventory"
+         " record is remembered and never re-attempted, and a type with"
+         " nothing left to grant is not walked again",
          grant_scope_label(), kWarmupFrames, kBurstBudgetUs,
          kBurstGrantsPerFrame, kGrantBudgetUs, kGrantsPerFrameCap,
          kGrantStallUs, kIncludeSkins ? "included" : "excluded");
