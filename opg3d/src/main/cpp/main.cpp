@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include "anomaly_trace_2313.h"
 #include "assets_data_2313.h"
 #include "backend_emu_2313.h"
 #include "backend_local_2313.h"
@@ -60,6 +61,7 @@ constexpr bool version_traces = true;
 constexpr bool startup_guards = true;
 constexpr bool switcher_trace = true;
 constexpr bool loading_stall_watchdog = true;
+constexpr bool anomaly_chain_trace = true;
 constexpr bool obb_provisioner = true;
 } // namespace startup
 
@@ -265,6 +267,10 @@ void* init_thread(void*) {
         "network", "forced online state",
         feature_config::network::force_online_state,
         []() { return online_state_2313::install_hooks(); });
+    const bool anomaly_trace = install_component(
+        "startup", "anomaly comparison trace",
+        feature_config::startup::anomaly_chain_trace,
+        []() { return anomaly_trace_2313::install_hooks(); });
 
     const bool progression = install_component(
         "progression", "core/currency/xp",
@@ -315,7 +321,7 @@ void* init_thread(void*) {
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && live_content && weapon_modules && hidden_items &&
         local_identity && assets_payload && net_stall && post_match &&
-        online_state && battle_ui && rank_ui && bots_trace && backend_emu &&
+        online_state && anomaly_trace && battle_ui && rank_ui && bots_trace && backend_emu &&
         pixel_pass) {
         LOGI("init: all enabled 23.1.3 components installed; "
              "disabled components were intentionally skipped");
@@ -327,7 +333,7 @@ void* init_thread(void*) {
              "modules=%d "
              "hidden-items=%d pixel-pass=%d "
              "identity=%d assets-data=%d net-stall=%d "
-             "post-match=%d online-state=%d battle-ui=%d rank-ui=%d "
+             "post-match=%d online-state=%d anomaly-trace=%d battle-ui=%d rank-ui=%d "
              "bots=%d backend-emu=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
@@ -339,7 +345,8 @@ void* init_thread(void*) {
              hidden_items ? 1 : 0, pixel_pass ? 1 : 0,
              local_identity ? 1 : 0, assets_payload ? 1 : 0,
              net_stall ? 1 : 0, post_match ? 1 : 0,
-             online_state ? 1 : 0, battle_ui ? 1 : 0, rank_ui ? 1 : 0,
+             online_state ? 1 : 0, anomaly_trace ? 1 : 0,
+             battle_ui ? 1 : 0, rank_ui ? 1 : 0,
              bots_trace ? 1 : 0, backend_emu ? 1 : 0);
     }
 
