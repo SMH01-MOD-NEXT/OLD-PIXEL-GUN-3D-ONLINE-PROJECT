@@ -104,7 +104,7 @@ Supporting observations:
 | Force the local-session gate (0x2B71728) | Only while one local auth transaction is active. This is the stock "a local session already exists" branch, so the retired ping/login/transport branches are never selected. |
 | Hook the iterator factory (0x3DC3EE0) | The iterator created by the stock dispatcher is captured for introspection instead of being scheduled by this module. |
 | Publish explicitly | Once the coroutine ends (or after the frame budget), set session-ready `true` (0x3DC0A04) and `AuthSceneState = FullySynchronized` (0x3DC0968) through the controller's own static setters. |
-| Bounded fallbacks | 60 frames: hand-schedule the coroutine if the dispatcher never created it. 900 frames: invoke the stock post-auth continuation (0x3DC2CC4, version banner + SceneLoader) once. 3600 frames: existing fail-closed timeout. |
+| Bounded recovery | 60 frames: hand-schedule the coroutine if the dispatcher never created it. Continue through the stock post-auth hand-off only after the iterator finishes its offline/storage finalization. A stalled iterator remains fail-closed. |
 
 ## 5. What the next capture should contain
 
@@ -163,3 +163,17 @@ skips the whole InfoWindow tail, and invokes the stock post-auth scene
 continuation once. The dispatcher remap remains as defense for other callers.
 Repeated writes of an unchanged auth state are no longer logged, removing the
 per-frame `0/3` diagnostic flood without changing game state.
+
+## Writable-session correction (August 27, 2026)
+
+The first direct-presenter bypass entered the menu immediately after setting
+`session-ready` and `FullySynchronized`. That skipped the remaining stock
+completion iterator, whose tail performs `<settings>.setOffline(false)` and the
+Storager commit/subscribe/save sequence. The visible result was a
+feature-limited offline session whose changes did not persist.
+
+The presenter hook now suppresses only the TechnicalWorks InfoWindow. It does
+not publish readiness, end the auth transaction, or invoke SceneLoader. The
+TechnicalWorks dispatcher guard only remaps the retired enum. Menu continuation
+is allowed only after the stock completion iterator reaches its finished state;
+there is no deadline fallback that can bypass offline/storage finalization.

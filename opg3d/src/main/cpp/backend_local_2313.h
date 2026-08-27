@@ -114,8 +114,7 @@ inline constexpr const char* kMaintenancePresenterMethod =
 // Frame budget of one local auth transaction, in Update ticks.
 inline constexpr uint32_t kScheduleGraceFrames = 60u;    // dispatcher grace
 inline constexpr uint32_t kSettleFrames = 30u;           // after MoveNext ends
-inline constexpr uint32_t kPublishDeadlineFrames = 300u; // publish regardless
-inline constexpr uint32_t kContinuationFrames = 900u;    // stock scene hand-off
+inline constexpr uint32_t kFinalizeWarningFrames = 300u; // warn, never bypass
 inline constexpr uint32_t kTimeoutFrames = 3600u;        // fail closed
 
 // Roslyn iterator fields, resolved by metadata name.
@@ -402,7 +401,10 @@ bool publish_if_ready() {
     const bool ready = session_ready_flag();
     const bool healthy = ready &&
                          (state == kFullySynchronized || state == kEmpty);
-    if (!healthy) return false;
+    // Do not expose the menu while the stock completion iterator is still
+    // running. Its tail clears offline mode and commits/subscribes Storager;
+    // skipping that tail produces a read-only, feature-limited session.
+    if (!healthy || !completion_finished()) return false;
 
     const bool first = !g_runtime_ready.exchange(true, std::memory_order_acq_rel);
     g_local_transaction.store(false, std::memory_order_release);
@@ -511,8 +513,9 @@ bool hook_completion_blocker(void* self, const MethodInfo* method) {
 
 // The device log proved that remapping the dispatcher argument alone is not
 // enough: this caller continues after the dispatcher returns and directly
-// creates the maintenance InfoWindow. Suppress that complete presentation path
-// and perform the normal post-auth hand-off instead.
+// creates the maintenance InfoWindow. Suppress only that presentation. Do not
+// publish or change scenes here: the stock completion iterator must finish its
+// offline=false and Storager commit/save tail first.
 void hook_maintenance_presenter(void* self, const MethodInfo* method) {
     if (!g_suppress_technical_works) {
         if (g_maintenance_presenter != nullptr) {
@@ -520,36 +523,11 @@ void hook_maintenance_presenter(void* self, const MethodInfo* method) {
         }
         return;
     }
-    // Update can retry this presenter every frame while the retired-backend
-    // condition remains true. Once the local hand-off was published, do no
-    // more writes and produce no repeated diagnostics.
-    if (g_technical_works_suppressed.load(std::memory_order_acquire) &&
-        g_runtime_ready.load(std::memory_order_acquire)) {
-        return;
-    }
-
     if (!g_technical_works_suppressed.exchange(true,
                                                 std::memory_order_relaxed)) {
-        LOGW("23.1.3-local-backend: suppressed the direct TechnicalWorks "
-             "presenter before it created InfoWindowController UI");
+        LOGW("23.1.3-local-backend: suppressed only the direct TechnicalWorks "
+             "InfoWindow; waiting for stock storage/session finalization");
     }
-    if (g_set_session_ready != nullptr && g_mi_set_session_ready != nullptr) {
-        g_set_session_ready(true, g_mi_set_session_ready);
-    }
-    if (g_set_state != nullptr && g_mi_set_state != nullptr) {
-        g_set_state(kFullySynchronized, g_mi_set_state);
-    }
-    g_published.store(true, std::memory_order_release);
-    g_runtime_ready.store(true, std::memory_order_release);
-
-    if (!g_continuation_done.exchange(true, std::memory_order_acq_rel) &&
-        g_scene_continuation != nullptr &&
-        g_mi_scene_continuation != nullptr) {
-        LOGI("23.1.3-local-backend: maintenance path replaced with the stock "
-             "post-auth scene continuation");
-        g_scene_continuation(self, g_mi_scene_continuation);
-    }
-    g_local_transaction.store(false, std::memory_order_release);
 }
 
 // Guard direct dispatcher calls as a second line of defense. The dedicated
@@ -561,15 +539,9 @@ void hook_state_dispatcher(void* self, int32_t state, const MethodInfo* method) 
             LOGW("23.1.3-local-backend: suppressed TechnicalWorks before its "
                  "maintenance UI was created; continuing as FullySynchronized");
         }
-        if (g_set_session_ready != nullptr &&
-            g_mi_set_session_ready != nullptr) {
-            g_set_session_ready(true, g_mi_set_session_ready);
-        }
-        if (g_set_state != nullptr && g_mi_set_state != nullptr) {
-            g_set_state(kFullySynchronized, g_mi_set_state);
-        }
-        g_runtime_ready.store(true, std::memory_order_release);
-        g_local_transaction.store(false, std::memory_order_release);
+        // Remap the retired verdict, but leave readiness and transaction
+        // lifetime to the stock completion iterator. That iterator is what
+        // clears offline mode and finalizes writable storage.
         state = kFullySynchronized;
     }
     if (g_state_dispatcher != nullptr) g_state_dispatcher(self, state, method);
@@ -591,6 +563,9 @@ void* hook_completion_factory(void* self, const MethodInfo* method) {
     }
     return iterator;
 }
+
+void continue_after_finalization(void* self, uint32_t frames,
+                                 const char* reason);
 
 void hook_auth_start(void* self, const MethodInfo* method) {
     if (g_auth_start == nullptr) {
@@ -654,13 +629,29 @@ void hook_auth_start(void* self, const MethodInfo* method) {
         LOGW("23.1.3-local-backend: the stock Start did not schedule a "
              "completion coroutine yet; Update will retry");
     }
-    (void)publish_if_ready();
+    if (publish_if_ready()) {
+        continue_after_finalization(
+            self, 0u, "stock Start completed storage finalization synchronously");
+    }
+}
+
+void continue_after_finalization(void* self, uint32_t frames,
+                                 const char* reason) {
+    if (g_continuation_done.exchange(true, std::memory_order_acq_rel)) return;
+    if (g_scene_continuation != nullptr && g_mi_scene_continuation != nullptr) {
+        LOGI("23.1.3-local-backend: stock completion finalized writable "
+             "storage/session after %u frame(s); continuing to the menu (%s)",
+             frames, reason);
+        g_scene_continuation(self, g_mi_scene_continuation);
+    } else {
+        LOGE("23.1.3-local-backend: stock completion finalized the session, "
+             "but the post-auth continuation is unavailable");
+    }
 }
 
 void hook_auth_update(void* self, const MethodInfo* method) {
     if (g_auth_update != nullptr) g_auth_update(self, method);
     if (!g_local_transaction.load(std::memory_order_acquire)) return;
-    if (publish_if_ready()) return;
 
     const uint32_t frames =
         g_transaction_frames.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -669,38 +660,31 @@ void hook_auth_update(void* self, const MethodInfo* method) {
     trace_transition("completion advanced to", frames);
     trace_iterator("completion", frames);
 
+    if (publish_if_ready()) {
+        continue_after_finalization(self, frames, "stock state was already ready");
+        return;
+    }
+
     // Step 1: the dispatcher should have scheduled the coroutine by now.
     if (frames == kScheduleGraceFrames &&
         g_completion_object.load(std::memory_order_acquire) == nullptr) {
         (void)schedule_completion(self, frames);
     }
 
-    // Step 2: publish once the machine has finished, or when it overruns its
-    // budget. The coroutine of this build never publishes the state itself.
+    // Step 2: publish only after the stock machine has finished. Never use a
+    // frame deadline to enter the menu: that previously skipped offline=false
+    // and Storager finalization, producing a non-persistent offline session.
     const bool finished = completion_finished();
-    if ((finished && frames >= kSettleFrames) ||
-        frames >= kPublishDeadlineFrames) {
-        const char* why =
-            finished ? "the completion coroutine ended without a state write"
-                     : "the completion coroutine overran its frame budget";
-        if (publish_local_session(why, frames)) return;
-    }
-
-    // Step 3: the session is published but the scene is still up, so run the
-    // stock post-auth continuation (version banner check + SceneLoader) once.
-    if (frames >= kContinuationFrames &&
-        g_published.load(std::memory_order_acquire) &&
-        !g_continuation_done.exchange(true, std::memory_order_acq_rel)) {
-        if (g_scene_continuation != nullptr &&
-            g_mi_scene_continuation != nullptr) {
-            LOGW("23.1.3-local-backend: the auth scene is still alive %u "
-                 "frame(s) after the session was published; invoking the stock "
-                 "post-auth continuation once", frames);
-            g_scene_continuation(self, g_mi_scene_continuation);
-        } else {
-            LOGE("23.1.3-local-backend: the stock post-auth continuation was "
-                 "not resolved; the scene hand-off is left to the game");
+    if (finished && frames >= kSettleFrames) {
+        const char* why = "the completion coroutine finalized writable storage";
+        if (publish_local_session(why, frames)) {
+            continue_after_finalization(self, frames, why);
+            return;
         }
+    } else if (!finished && frames == kFinalizeWarningFrames) {
+        LOGW("23.1.3-local-backend: completion exceeded %u frames; refusing "
+             "to enter the menu before offline/storage finalization",
+             frames);
     }
 
     if (frames == kChainReportFrames) {
