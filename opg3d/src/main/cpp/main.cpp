@@ -45,6 +45,82 @@ constexpr useconds_t kWaitStepUs = 10 * 1000;
 constexpr int kStableChecks = 25;
 constexpr useconds_t kSettleUs = 100 * 1000;
 
+// ============================================================================
+// FEATURE CONFIGURATION
+// Change only true/false values in this block to isolate a component. Disabled
+// components are treated as intentionally skipped, not as initialization
+// failures. Keep dependency notes in mind when disabling a driver component.
+// ============================================================================
+namespace feature_config {
+
+// Startup and diagnostics.
+namespace startup {
+constexpr bool signature_compatibility = true;
+constexpr bool version_traces = true;
+constexpr bool startup_guards = true;
+constexpr bool switcher_trace = true;
+constexpr bool loading_stall_watchdog = true;
+constexpr bool obb_provisioner = true;
+} // namespace startup
+
+// Local backend and multiplayer/network behavior.
+namespace network {
+constexpr bool local_backend = true;
+constexpr bool backend_emulator = true;
+constexpr bool photon_online = true;
+constexpr bool photon_default_plugin = true;
+constexpr bool photon_trace = true;
+constexpr bool network_stall_guard = true;
+constexpr bool force_online_state = true;
+} // namespace network
+
+// Progression, economy and inventory.
+namespace progression {
+constexpr bool component = true;
+constexpr bool currency = true;
+constexpr bool xp = true;
+constexpr bool fast_level_road = true;
+// These pumps use progression's MainMenuController.Update hook as their driver.
+constexpr bool inventory_pumps = true;
+constexpr bool crafting = true;
+constexpr bool lobby_catalog = true;
+constexpr bool live_content = true;
+constexpr bool live_content_diagnostics = true;
+constexpr bool weapon_modules = true;
+constexpr bool hidden_items = true;
+constexpr bool pixel_pass = true;
+constexpr bool pixel_pass_diagnostics = true;
+} // namespace progression
+
+// Player identity and bundled data.
+namespace player_content {
+constexpr bool local_identity = true;
+constexpr bool assets_data = true;
+} // namespace player_content
+
+// Battle presentation and gameplay adjustments.
+namespace gameplay {
+constexpr bool battle_ui = true;
+constexpr bool rank_ui = true;
+constexpr bool post_match = true;
+constexpr bool high_tier_bots = true;
+} // namespace gameplay
+
+} // namespace feature_config
+
+template <typename Installer>
+bool install_component(const char* category, const char* name, bool enabled,
+                       Installer installer) {
+    if (!enabled) {
+        LOGI("config: [%s] %s disabled", category, name);
+        return true;
+    }
+    const bool installed = installer();
+    LOGI("config: [%s] %s %s", category, name,
+         installed ? "enabled" : "failed");
+    return installed;
+}
+
 size_t assembly_count(void* domain) {
     if (domain == nullptr || il2cpp::domain_get_assemblies == nullptr) return 0u;
     size_t count = 0u;
@@ -69,8 +145,10 @@ void* init_thread(void*) {
     }
     LOGI("init: [1/6] %s found, base=0x%" PRIxPTR, kIl2Cpp, base);
 
-    const bool signature_compat =
-        version_2313::install_early_signature_patch(base);
+    const bool signature_compat = install_component(
+        "startup", "signature compatibility",
+        feature_config::startup::signature_compatibility,
+        [base]() { return version_2313::install_early_signature_patch(base); });
     if (!signature_compat) {
         LOGE("init: exact 23.1.3 APK re-sign compatibility was not installed; "
              "startup remains fail-closed");
@@ -131,32 +209,102 @@ void* init_thread(void*) {
     }
     LOGI("init: [6/6] Assembly-CSharp.dll ready; installing 23.1.3 hooks");
 
-    const bool version_traces  = version_2313::install_runtime_hooks();
-    const bool startup_guards  = startup_guards_2313::install_hooks();
-    const bool switcher_trace  = startup_trace_2313::install_hooks();
-    const bool stall_watchdog  = loading_stall_guard_2313::start_watchdog();
-    const bool local_backend   = backend_local_2313::install_hooks();
-    const bool backend_emu     = backend_emu_2313::install_hooks();
-    const bool photon_online   = photon_2313::install_hooks();
-    const bool default_plugin  = photon_default_plugin_2313::install_hooks();
-    const bool photon_trace    = photon_trace_2313::install_hooks();
-    const bool progression     = progression_2313::install_hooks(base);
-    const bool crafting        = crafting_2313::install_hooks();
-    const bool lobby_catalog   = lobby_catalog_2313::install_hooks();
-    const bool live_content    = live_content_2313::install_hooks(base);
-    const bool weapon_modules  = weapon_modules_2313::install_hooks(base);
-    const bool hidden_items    = hidden_items_2313::install_hooks(base);
-    // The base is required: every managed method the pass path calls is
-    // identity-checked against its expected RVA before use.
-    const bool pixel_pass      = pixel_pass_2313::install_hooks(base);
-    const bool local_identity   = identity_2313::install_hooks();
-    const bool assets_payload   = assets_data_2313::install_hooks(base);
-    const bool net_stall        = net_stall_guard_2313::install_hooks();
-    const bool online_state     = online_state_2313::install_hooks();
-    const bool battle_ui        = battle_ui_2313::install_hooks(base);
-    const bool rank_ui          = rank_ui_2313::install_hooks();
-    const bool post_match       = post_match_2313::install_hooks(base);
-    const bool bots_trace       = bots_trace_2313::install_hooks();
+    const progression_2313::Options progression_options{
+        feature_config::progression::currency,
+        feature_config::progression::xp,
+        feature_config::progression::fast_level_road,
+        feature_config::progression::inventory_pumps,
+        feature_config::progression::live_content_diagnostics,
+        feature_config::progression::pixel_pass_diagnostics,
+    };
+
+    const bool version_traces = install_component(
+        "startup", "version traces", feature_config::startup::version_traces,
+        []() { return version_2313::install_runtime_hooks(); });
+    const bool startup_guards = install_component(
+        "startup", "startup guards", feature_config::startup::startup_guards,
+        []() { return startup_guards_2313::install_hooks(); });
+    const bool switcher_trace = install_component(
+        "startup", "switcher trace", feature_config::startup::switcher_trace,
+        []() { return startup_trace_2313::install_hooks(); });
+    const bool stall_watchdog = install_component(
+        "startup", "loading stall watchdog",
+        feature_config::startup::loading_stall_watchdog,
+        []() { return loading_stall_guard_2313::start_watchdog(); });
+
+    const bool local_backend = install_component(
+        "network", "local backend", feature_config::network::local_backend,
+        []() { return backend_local_2313::install_hooks(); });
+    const bool backend_emu = install_component(
+        "network", "backend emulator", feature_config::network::backend_emulator,
+        []() { return backend_emu_2313::install_hooks(); });
+    const bool photon_online = install_component(
+        "network", "Photon online", feature_config::network::photon_online,
+        []() { return photon_2313::install_hooks(); });
+    const bool default_plugin = install_component(
+        "network", "Photon default plugin",
+        feature_config::network::photon_default_plugin,
+        []() { return photon_default_plugin_2313::install_hooks(); });
+    const bool photon_trace = install_component(
+        "network", "Photon trace", feature_config::network::photon_trace,
+        []() { return photon_trace_2313::install_hooks(); });
+    const bool net_stall = install_component(
+        "network", "network stall guard",
+        feature_config::network::network_stall_guard,
+        []() { return net_stall_guard_2313::install_hooks(); });
+    const bool online_state = install_component(
+        "network", "forced online state",
+        feature_config::network::force_online_state,
+        []() { return online_state_2313::install_hooks(); });
+
+    const bool progression = install_component(
+        "progression", "core/currency/xp",
+        feature_config::progression::component,
+        [base, &progression_options]() {
+            return progression_2313::install_hooks(base, progression_options);
+        });
+    const bool crafting = install_component(
+        "progression", "crafting", feature_config::progression::crafting,
+        []() { return crafting_2313::install_hooks(); });
+    const bool lobby_catalog = install_component(
+        "progression", "lobby catalog",
+        feature_config::progression::lobby_catalog,
+        []() { return lobby_catalog_2313::install_hooks(); });
+    const bool live_content = install_component(
+        "progression", "live content", feature_config::progression::live_content,
+        [base]() { return live_content_2313::install_hooks(base); });
+    const bool weapon_modules = install_component(
+        "progression", "weapon modules",
+        feature_config::progression::weapon_modules,
+        [base]() { return weapon_modules_2313::install_hooks(base); });
+    const bool hidden_items = install_component(
+        "progression", "hidden items", feature_config::progression::hidden_items,
+        [base]() { return hidden_items_2313::install_hooks(base); });
+    const bool pixel_pass = install_component(
+        "progression", "Pixel Pass", feature_config::progression::pixel_pass,
+        [base]() { return pixel_pass_2313::install_hooks(base); });
+
+    const bool local_identity = install_component(
+        "player-content", "local identity",
+        feature_config::player_content::local_identity,
+        []() { return identity_2313::install_hooks(); });
+    const bool assets_payload = install_component(
+        "player-content", "assets/data payload",
+        feature_config::player_content::assets_data,
+        [base]() { return assets_data_2313::install_hooks(base); });
+
+    const bool battle_ui = install_component(
+        "gameplay", "battle UI", feature_config::gameplay::battle_ui,
+        [base]() { return battle_ui_2313::install_hooks(base); });
+    const bool rank_ui = install_component(
+        "gameplay", "rank UI", feature_config::gameplay::rank_ui,
+        []() { return rank_ui_2313::install_hooks(); });
+    const bool post_match = install_component(
+        "gameplay", "post match", feature_config::gameplay::post_match,
+        [base]() { return post_match_2313::install_hooks(base); });
+    const bool bots_trace = install_component(
+        "gameplay", "high-tier bots", feature_config::gameplay::high_tier_bots,
+        []() { return bots_trace_2313::install_hooks(); });
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&
@@ -164,33 +312,8 @@ void* init_thread(void*) {
         local_identity && assets_payload && net_stall && post_match &&
         online_state && battle_ui && rank_ui && bots_trace && backend_emu &&
         pixel_pass) {
-        LOGI("init: 23.1.3 ARM64 local session + Photon Cloud port armed \u2014 "
-             "retired update/network modals are disabled, the 90%% "
-             "InitializeSwitcher stall is bypassed, EU/Default plugin route "
-             "is active, Switcher heartbeat tracing is on, offline currency "
-             "and level progression are granted from the main menu, weapon "
-             "and clan crafting run off a local clock and local stock, the "
-             "lobby craft catalogue is granted locally, the PixelPass battle "
-             "pass, the lotteries and card roulette, the chests and the task "
-             "and event content are reachable again instead of being hidden "
-             "by the empty offline ExpOpenSystem table, a real PixelPass "
-             "season whose tiers award weapon skins and graffiti is built on "
-             "device and handed to the game's own pass manager, which is what "
-             "makes the lobby pass button exist at all offline, every weapon "
-             "and armor module is unlocked at level 10, every hidden weapon, "
-             "wear item and gadget the build ships is granted through the "
-             "stock item inventory, the player id is "
-             "minted on device with no backend round-trip, and an in-APK "
-             "assets/data payload is unpacked into the game's own resource "
-             "root, the repeated blocking backend name lookup no longer "
-             "stalls the game thread, and the frozen end-of-match "
-             "victory screen is revived with visible NGUI presentation and a "
-             "guaranteed exit, every retired offline verdict now reports a "
-             "live connection, the in-battle Armory and rank label are "
-             "restored, and multiplayer "
-             "bots use the high-rank weapon tier, and the retired backend "
-             "services run inside this library and are shared with every "
-             "device on the local network");
+        LOGI("init: all enabled 23.1.3 components installed; "
+             "disabled components were intentionally skipped");
     } else {
         LOGE("init: 23.1.3 port incomplete: signature=%d traces=%d "
              "startup-guards=%d switcher-trace=%d stall-watchdog=%d "
@@ -223,7 +346,9 @@ void* init_thread(void*) {
 } // namespace
 
 __attribute__((constructor)) static void on_load() {
-    obb_provisioner::provision();
+    if (feature_config::startup::obb_provisioner) {
+        obb_provisioner::provision();
+    }
     pthread_t thread;
     if (pthread_create(&thread, nullptr, init_thread, nullptr) == 0) {
         pthread_detach(thread);
@@ -233,6 +358,8 @@ __attribute__((constructor)) static void on_load() {
 }
 
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
-    obb_provisioner::provision();
+    if (feature_config::startup::obb_provisioner) {
+        obb_provisioner::provision();
+    }
     return JNI_VERSION_1_6;
 }

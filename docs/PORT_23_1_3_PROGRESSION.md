@@ -349,25 +349,23 @@ bootstrap uses.
 
 ## Runtime order and exclusions
 
-`progression_2313::install_hooks()` runs last in `main.cpp`, after
-`photon_trace_2313`, so it only ever runs on a runtime that already passed the
-root-domain publication gate in `il2cpp_runtime_2313::wait_for_domain()` and
-the `Assembly-CSharp.dll` readiness loop.
+`progression_2313::install_hooks(base, options)` is configured in `main.cpp`
+after runtime and `Assembly-CSharp.dll` readiness. Its feature options come
+from the central `feature_config::progression` block.
 
 Grants are driven from `MainMenuController::Update()`, which is inherently
 self-gating: it only ticks once the player is in the main menu, on the Unity
-main thread, with the wallet already constructed. There is no polling thread
-and no timing guess.
+main thread, with the wallet already constructed. There is no polling thread.
 
 - warm-up: 60 frames before the first managed call
-- currency: every 120 frames (the stock add path also writes the save)
-- experience: **never** (`kGrantExperience = false`). When switched on: every
-  5 frames until `maxLevel`, then a single top-up.
+- currency: controlled by `progression::currency`; every 120 frames when on
+- XP-to-65: controlled by `progression::xp`; checked every 5 frames when on
+- fast level-road animation: controlled by `progression::fast_level_road`
+- item and diagnostic pumps: independently controlled by their central flags
 
-Install order inside the module is deliberate: resolve everything → bind
-`sharedController` (only when the pump is on) → **shield** → key-capture hook
-→ main-menu tick. Any failure at any step aborts before a single value is
-written.
+Install order inside the module remains fail-closed: resolve required metadata,
+bind level state, install the save shield, then install enabled presentation
+and main-menu hooks. Any required-hook failure aborts before a value is written.
 
 ## Device validation checklist
 
@@ -449,3 +447,12 @@ or higher. The internal one-shot latch is deliberately not used as proof,
 because it also settles after bounded failures; only the live level confirms
 that the stock grant path completed. Each inventory module's own warmup counter
 starts after this gate opens, so no item transaction can precede confirmation.
+
+
+## Central feature switches (August 27, 2026)
+
+`main.cpp` now passes a `progression_2313::Options` value into the module. The
+central `feature_config::progression` block independently controls currency,
+the XP-to-65 grant, fast level-road animation, inventory pumps, and diagnostic
+pumps without requiring edits inside this header. See
+`docs/CONFIGURATION_23_1_3.md` for the complete category map and dependencies.

@@ -26,6 +26,19 @@
 // methods additionally take `this` first. The old ARM32 leading
 // static-context argument does NOT exist here.
 namespace progression_2313 {
+
+// Compile-time feature switches supplied by main.cpp. Keeping the switches in
+// one visible configuration block makes bisecting runtime problems possible
+// without editing this implementation file.
+struct Options {
+    bool grant_currency;
+    bool grant_xp;
+    bool fast_level_road;
+    bool drive_inventory_pumps;
+    bool drive_live_content_pump;
+    bool drive_pixel_pass_pump;
+};
+
 namespace detail {
 
 static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
@@ -49,7 +62,6 @@ constexpr int32_t kLevelCap = 65;
 //     ALREADY at 65. The grant below exits before touching anything in that
 //     case, whatever the experience counter says, so the only presentation it
 //     can cause is the ordinary level-up window on the way up.
-constexpr bool kGrantLevel = true;
 // Grant rounds are bounded. Every round recomputes the deficit from the live
 // level, so a short landing is corrected instead of guessed at, and the whole
 // thing stops for good the moment the level reads 65.
@@ -161,6 +173,7 @@ inline void* g_progress_road_enable_orig = nullptr;
 inline bool g_progress_road_logged = false;
 inline bool g_inventory_gate_open_logged = false;
 inline bool g_inventory_gate_wait_logged = false;
+inline Options g_options{true, true, true, true, true, true};
 inline bool g_installed = false;
 inline bool g_keys_ready = false;
 inline bool g_level_grant_done = false;
@@ -368,7 +381,7 @@ inline bool experience_to_cap(int32_t level, int32_t remainder,
 // nothing, which is what keeps the max-level overload -- and with it the
 // veteran chest -- permanently out of reach.
 inline void grant_level_to_cap() {
-    if (!kGrantLevel || g_level_grant_done) return;
+    if (!g_options.grant_xp || g_level_grant_done) return;
     if (!g_level || !g_experience || !g_add_experience || !g_level_threshold) {
         g_level_grant_done = true;
         return;
@@ -446,15 +459,19 @@ inline void maybe_grant() {
         LOGI("23.1.3-progression: armed; coin key='%s' gem key='%s' "
              "level=%" PRId32 " exp=%" PRId32 " (level grant %s)",
              g_coin_key.c_str(), g_gem_key.c_str(), level, experience,
-             kGrantLevel ? "on" : "off");
+             g_options.grant_xp ? "on" : "off");
     }
 
-    if ((g_frames % kCurrencyIntervalFrames) == 0u) top_up_currency();
+    if (g_options.grant_currency &&
+        (g_frames % kCurrencyIntervalFrames) == 0u) {
+        top_up_currency();
+    }
     // Level only, and only while the profile reads below the cap. Once
     // grant_level_to_cap() has settled it never calls into the stock
     // add-experience routine again, so nothing here can offer the veteran
     // chest on a loop the way the old experience pump did.
-    if (!g_level_grant_done && (g_frames % kLevelIntervalFrames) == 0u) {
+    if (g_options.grant_xp && !g_level_grant_done &&
+        (g_frames % kLevelIntervalFrames) == 0u) {
         grant_level_to_cap();
     }
 }
@@ -488,7 +505,7 @@ inline void menu_update_hook(void* self, void* method) {
     // becomes true after a bounded failure, while the live getter is the
     // authoritative confirmation that the stock level-up path completed.
     const int32_t confirmed_level = current_level();
-    if (confirmed_level >= kLevelCap) {
+    if (g_options.drive_inventory_pumps && confirmed_level >= kLevelCap) {
         if (!g_inventory_gate_open_logged) {
             g_inventory_gate_open_logged = true;
             LOGI("23.1.3-progression: level %" PRId32
@@ -502,7 +519,8 @@ inline void menu_update_hook(void* self, void* method) {
         // counters start only now, so no inventory transaction can precede the
         // confirmed level.
         hidden_items_2313::pump_from_main_menu();
-    } else if (!g_inventory_gate_wait_logged && confirmed_level >= 0) {
+    } else if (g_options.drive_inventory_pumps &&
+               !g_inventory_gate_wait_logged && confirmed_level >= 0) {
         g_inventory_gate_wait_logged = true;
         LOGI("23.1.3-progression: level %" PRId32
              " is not yet 65; weapon and item inventory grants remain paused",
@@ -510,15 +528,20 @@ inline void menu_update_hook(void* self, void* method) {
     }
     // Same slot again, read-only: the content gate reports which live
     // content the offline ExpOpenSystem table still keeps closed.
-    live_content_2313::pump_from_main_menu();
+    if (g_options.drive_live_content_pump) {
+        live_content_2313::pump_from_main_menu();
+    }
     // Read-only counters for the PixelPass season. The season itself is NOT
     // driven from here any more: it is served from the config-cache read
     // path inside pixel_pass_2313, so a failure in this module can no longer
     // take the battle pass down with it.
-    pixel_pass_2313::pump_from_main_menu();
+    if (g_options.drive_pixel_pass_pump) {
+        pixel_pass_2313::pump_from_main_menu();
+    }
 }
 
-inline bool install(uintptr_t base) {
+inline bool install(uintptr_t base, const Options& options) {
+    g_options = options;
     if (g_installed) return true;
 
     bool resolved = true;
@@ -534,7 +557,7 @@ inline bool install(uintptr_t base) {
     // off none of them is resolved, so a metadata change on that path can no
     // longer take down the MainMenuController.Update slot every other pump in
     // this port depends on.
-    if (kGrantLevel) {
+    if (g_options.grant_xp) {
         resolved &= bind(g_add_experience, kGlobalNs, kExperienceClass,
                          kAddExperience, 3);
         resolved &= bind(g_level_threshold, kGlobalNs, kLevelTableClass,
@@ -546,7 +569,7 @@ inline bool install(uintptr_t base) {
         return false;
     }
 
-    if (kGrantLevel) {
+    if (g_options.grant_xp) {
         g_shared_field =
             il2cpp::find_field(kGlobalNs, kExperienceClass, kSharedController);
         if (g_shared_field == nullptr) {
@@ -583,18 +606,21 @@ inline bool install(uintptr_t base) {
         return false;
     }
 
-    void* road_info = il2cpp::find_method_info(
-        kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0);
-    void* road_ptr = il2cpp::method_pointer(road_info);
-    const void* expected_road = reinterpret_cast<void*>(
-        base + kRvaProgressRoadOnEnable);
-    if (road_ptr != expected_road ||
-        !hook::install({kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0},
-                       reinterpret_cast<void*>(&progress_road_enable_hook),
-                       &g_progress_road_enable_orig, true)) {
-        LOGE("23.1.3-progression: ProgressRoadView.OnEnable did not match RVA 0x%" PRIxPTR,
-             kRvaProgressRoadOnEnable);
-        return false;
+    if (g_options.fast_level_road) {
+        void* road_info = il2cpp::find_method_info(
+            kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0);
+        void* road_ptr = il2cpp::method_pointer(road_info);
+        const void* expected_road = reinterpret_cast<void*>(
+            base + kRvaProgressRoadOnEnable);
+        if (road_ptr != expected_road ||
+            !hook::install(
+                {kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0},
+                reinterpret_cast<void*>(&progress_road_enable_hook),
+                &g_progress_road_enable_orig, true)) {
+            LOGE("23.1.3-progression: ProgressRoadView.OnEnable did not match "
+                 "RVA 0x%" PRIxPTR, kRvaProgressRoadOnEnable);
+            return false;
+        }
     }
 
     if (!hook::install({kGlobalNs, kMenuClass, kMenuUpdate, 0},
@@ -608,7 +634,7 @@ inline bool install(uintptr_t base) {
     LOGI("23.1.3-progression: installed (currency target %" PRId32
          ", level cap %" PRId32 ", level grant %s)",
          kCurrencyTarget, kLevelCap,
-         kGrantLevel
+         g_options.grant_xp
              ? "on; the deficit up to the cap is granted once, and only while "
                "the profile reads below it"
              : "off; the level is left exactly as the profile has it");
@@ -617,6 +643,8 @@ inline bool install(uintptr_t base) {
 
 } // namespace detail
 
-inline bool install_hooks(uintptr_t base) { return detail::install(base); }
+inline bool install_hooks(uintptr_t base, const Options& options) {
+    return detail::install(base, options);
+}
 
 } // namespace progression_2313
