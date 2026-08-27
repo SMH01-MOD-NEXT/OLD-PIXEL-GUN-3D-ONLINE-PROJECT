@@ -32,25 +32,28 @@ static_assert(sizeof(void*) == 8, "PG3D 23.1.3 target must be arm64-v8a");
 
 constexpr int32_t kCurrencyTarget = 999999999;
 constexpr int32_t kLevelCap = 65;
-constexpr int32_t kExpGrantPerTick = 9999999;
-constexpr int32_t kExperienceTarget = 900000000;
-// Master switch for the experience pump. It is OFF, and that is deliberate.
+// Master switch for the one-shot level grant. The level is not faked in a
+// getter and it is not pumped: it is granted the same way the game grants it,
+// once per process, and the amount is computed from the game's own table.
 //
-// At maxLevel the stock add-experience entry point (0x01C7AC28) tail-branches
-// into the overload at 0x01C7B374, which reads the stored experience
-// (0x01C79AB0), persists `stored + amount` through the Progress service
-// (0x01B4FD5C) and then builds an experience presentation payload
-// (ctor 0x01C7BD6C, parked at ExperienceController+0x50) and raises the
-// presentation event for it. Past the cap that presentation is the veteran
-// loot box -- 业丅不上丑丙一丅丈.VeteranLootBox = 11, BannerWindowType.VeteranChest
-// = 5 -- so every single grant offers another veteran chest, and a pump that
-// keeps re-topping the counter makes that window reappear forever.
-//
-// Both the level and the experience counter live in the persisted profile, so
-// with the pump off an already-capped profile stays capped: level 65 (which
-// is what the stock PixelPass unlock predicate and the live-content gate
-// read) is not rolled back by disabling this. Currency top-up is unaffected.
-constexpr bool kGrantExperience = false;
+//   * 世丐丙丆业一丄丙丒() (0x01C79A50) and 丕三丙上丏与下与丟() (0x01C79AB0) read the
+//     level and the experience remainder out of the persisted profile, so a
+//     level written through the stock routine is still there after a restart.
+//   * Draining experience is refused by construction (see add_experience):
+//     a negative amount runs the stock level-up loop with a shrinking
+//     accumulator and takes real levels away with it, which is exactly what
+//     wiped level 65 before.
+//   * The veteran chest cannot come back from this. That window is the
+//     max-level presentation raised by the overload 丏三万丕丂业专丌丏
+//     (0x01C7B374), and the entry point only reaches it when the profile is
+//     ALREADY at 65. The grant below exits before touching anything in that
+//     case, whatever the experience counter says, so the only presentation it
+//     can cause is the ordinary level-up window on the way up.
+constexpr bool kGrantLevel = true;
+// Grant rounds are bounded. Every round recomputes the deficit from the live
+// level, so a short landing is corrected instead of guessed at, and the whole
+// thing stops for good the moment the level reads 65.
+constexpr int32_t kMaxLevelGrantRounds = 4;
 constexpr uint64_t kLevelIntervalFrames = 5;
 constexpr uint64_t kCurrencyIntervalFrames = 120;
 constexpr uint64_t kWarmupFrames = 60;
@@ -76,6 +79,17 @@ constexpr const char* kLevel = "世丐丙丆业一丄丙丒";
 constexpr const char* kExperience = "丕三丙上丏与下与丟";
 constexpr const char* kAddExperience = "东丙丑万且专丞世丂";
 constexpr const char* kSharedController = "sharedController";
+// Per-level experience threshold table the stock level-up loop consults:
+// ExperienceController.丘一不丒丐东不世丗 (static field +0x48) is a 丂丘丅世丏世东丗丄
+// wrapper around a salted-int array, and 丕与丏丅丆丕专万丟(int level)
+// (RVA 0x03BFB9D8) decodes entry `level` of it.
+constexpr const char* kLevelTableClass = "丂丘丅世丏世东丗丄";
+constexpr const char* kLevelTableField = "丘一不丒丐东不世丗";
+constexpr const char* kLevelThreshold = "丕与丏丅丆丕专万丟";
+// Layout the accessor itself proves at 0x03BFB9DC / 0x03BFB9E4: the wrapper
+// keeps its array at +0x10 and il2cpp keeps the array length at +0x18.
+constexpr uintptr_t kTableArrayOffset = 0x10u;
+constexpr uintptr_t kArrayLengthOffset = 0x18u;
 constexpr const char* kBannerClass = "CheatDetectedBanner";
 constexpr const char* kBannerWipe = "丏万且丝上丙丐下丗";
 constexpr const char* kBannerKick = "丈且丁丞丛丅丄七上";
@@ -86,6 +100,7 @@ using StaticObjFn = void* (*)(void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
 using InstanceKeyedIntFn = int32_t (*)(void* self, void* key, void* method);
 using StaticIntFn = int32_t (*)(void* method);
+using InstanceIntArgFn = int32_t (*)(void* self, int32_t arg, void* method);
 using InstanceVoidFn = void (*)(void* self, void* method);
 using AddCurrencyFn = void (*)(void* self, void* key, int32_t amount,
                                int32_t accrual, bool indicate, bool silent,
@@ -126,13 +141,17 @@ inline Managed g_gems{};
 inline Managed g_level{};
 inline Managed g_experience{};
 inline Managed g_add_experience{};
+inline Managed g_level_threshold{};
 inline void* g_shared_field = nullptr;
+inline void* g_level_table_field = nullptr;
 inline void* g_wallet_keyed_orig = nullptr;
 inline void* g_menu_update_orig = nullptr;
 inline void* g_banner_wipe_orig = nullptr;
 inline void* g_banner_kick_orig = nullptr;
 inline bool g_installed = false;
 inline bool g_keys_ready = false;
+inline bool g_level_grant_done = false;
+inline int32_t g_level_grant_rounds = 0;
 inline uint64_t g_frames = 0u;
 inline std::string g_coin_key;
 inline std::string g_gem_key;
@@ -240,58 +259,159 @@ inline int32_t current_experience() {
 }
 
 inline void add_experience(int32_t amount) {
-    if (amount <= 0) return;
+    // Zero is allowed on purpose: it still drives the stock level-up loop
+    // over a remainder that already covers the thresholds. Negative amounts
+    // are refused, because the same loop then runs with a shrinking
+    // accumulator and takes earned levels away -- the drain that cost this
+    // profile its level 65.
+    if (amount < 0) return;
     void* controller = shared_controller();
     if (controller == nullptr) return;
     reinterpret_cast<AddExperienceFn>(g_add_experience.ptr)(
         controller, amount, 0, nullptr, g_add_experience.info);
 }
 
-// Level ramp *and* the experience counter itself.
+// Level grant: exactly the experience the profile still needs to walk from
+// the level it has now up to 65, requested in one go from the stock routine.
 //
-// Below maxLevel the stock add-experience routine (0x01C7AC28) treats the
-// stored experience as a per-level remainder: it subtracts the level
-// threshold on every level-up and then, at 0x01C7AFF4, executes
+// Below the cap the stock add-experience entry point 东丙丑万且专丞世丂
+// (0x01C7AC28) treats the stored experience as a per-level remainder. Its
+// loop (0x01C7ADF4 .. 0x01C7AF20) runs, per iteration:
 //
-//     bl   0x01C79A50        ; 世丐丙丆业一丄丙丒()  -> level
-//     cmp  w0, #0x41         ; maxLevel (65)
-//     csel w26, w26, wzr, lt ; level < 65 ? remainder : 0
+//     bl   0x01C79A50        ; level; > 0x40 (64) -> leave the loop
+//     ldr  x28, [x8, #0x48]  ; ExperienceController.丘一不丒丐东不世丗
+//     bl   0x03BFB9D8        ; 丕与丏丅丆丕专万丟(level) -> threshold
+//     cmp  w26, w0           ; accumulator < threshold -> leave the loop
+//     bl   0x01B4FBD8        ; Progress service: persist level + 1
+//     sub  w26, w26, w28     ; accumulator -= threshold
 //
-// so the very level-up that reaches 65 deliberately persists experience as
-// **zero**. That is why a level-only pump left the profile at level 65 with
-// xp 0.
+// and on the way out 0x01C7B0CC persists what is left of the accumulator
+// through the Progress service (0x01B4FD5C). At 0x01C7AFF4 it also executes
+// `cmp w0,#0x41; csel w26,w26,wzr,lt`, so the level-up that reaches 65 stores
+// the remainder as 0 by design -- that, not a missing grant, is why a capped
+// profile shows xp 0.
 //
-// At maxLevel the same entry point instead tail-branches to the max-level
-// overload 丏三万丕丂业专丌丏 (0x01C7B374), which reads the stored experience,
-// adds the requested amount and persists the sum through the Progress
-// service (0x01B4FD5C) with no level-up bookkeeping and no zeroing. So the
-// counter is filled by continuing to drive the *same* stock routine once the
-// cap is reached, rather than by writing the backing field directly.
-//
-// The top-up is self-limiting: it requests exactly the deficit, so after one
-// successful grant the experience equals kExperienceTarget and no further
-// managed call is made. kExperienceTarget stays well below INT32_MAX because
-// the max-level overload computes `experience + amount` as a signed int and
-// legitimate post-grant gains keep accruing on top of it.
-inline void pump_experience() {
-    // Off by default: see kGrantExperience. The body is kept intact so the
-    // pump can be switched back on without re-deriving any of the above.
-    if (!kGrantExperience) return;
+// Two consequences carry this module:
+//   * the level is a real persisted value written by the game's own service
+//     call, so granting it this way survives a restart; nothing is faked in a
+//     getter and nothing has to be re-granted every session;
+//   * the amount is not a guess -- it is the sum of 丕与丏丅丆丕专万丟(level) for
+//     every level from the current one through 64, minus the remainder the
+//     profile already holds.
+inline void* level_table() {
+    if (g_level_table_field == nullptr ||
+        il2cpp::field_static_get_value == nullptr) {
+        return nullptr;
+    }
+    void* value = nullptr;
+    il2cpp::field_static_get_value(g_level_table_field, &value);
+    return value;
+}
+
+// Experience the stock loop demands to leave `level` behind, read from the
+// game's own table. Returns -1 when the table is not usable yet. The index is
+// range-checked exactly the way the accessor does it at 0x03BFB9E4, so a
+// shorter table can never turn into a managed IndexOutOfRange throw.
+inline int32_t level_threshold(int32_t level) {
+    if (!g_level_threshold || level < 0) return -1;
+
+    void* table = level_table();
+    if (table == nullptr) return -1;
+
+    void* array = *reinterpret_cast<void**>(
+        reinterpret_cast<char*>(table) + kTableArrayOffset);
+    if (array == nullptr) return -1;
+
+    const uint32_t length = *reinterpret_cast<uint32_t*>(
+        reinterpret_cast<char*>(array) + kArrayLengthOffset);
+    if (static_cast<uint32_t>(level) >= length) return -1;
+
+    return reinterpret_cast<InstanceIntArgFn>(g_level_threshold.ptr)(
+        table, level, g_level_threshold.info);
+}
+
+// Sum of the thresholds from `level` up to the cap, minus what the profile
+// already holds. Returns false when any threshold is unreadable, so the caller
+// retries instead of inventing a number.
+inline bool experience_to_cap(int32_t level, int32_t remainder,
+                              int32_t* out_needed) {
+    int64_t total = 0;
+    for (int32_t step = level; step < kLevelCap; ++step) {
+        const int32_t threshold = level_threshold(step);
+        if (threshold <= 0) return false;
+        total += threshold;
+    }
+
+    if (remainder > 0) total -= remainder;
+    if (total < 0) total = 0;
+    if (total > INT32_MAX) return false;
+
+    *out_needed = static_cast<int32_t>(total);
+    return true;
+}
+
+// One-shot, level-driven grant. The experience counter is never a reason to
+// act: if the profile already reads 65 this returns immediately and touches
+// nothing, which is what keeps the max-level overload -- and with it the
+// veteran chest -- permanently out of reach.
+inline void grant_level_to_cap() {
+    if (!kGrantLevel || g_level_grant_done) return;
+    if (!g_level || !g_experience || !g_add_experience || !g_level_threshold) {
+        g_level_grant_done = true;
+        return;
+    }
 
     const int32_t level = current_level();
     if (level < 0) return;
 
-    if (level < kLevelCap) {
-        add_experience(kExpGrantPerTick);
+    if (level >= kLevelCap) {
+        g_level_grant_done = true;
+        LOGI("23.1.3-progression: level %" PRId32 " already meets the cap; "
+             "no experience is granted and none is taken away", level);
         return;
     }
 
-    const int32_t experience = current_experience();
-    if (experience < 0 || experience >= kExperienceTarget) return;
+    if (g_level_grant_rounds >= kMaxLevelGrantRounds) {
+        g_level_grant_done = true;
+        LOGE("23.1.3-progression: level is still %" PRId32 " after %" PRId32
+             " grant round(s); leaving the profile exactly as it is",
+             level, g_level_grant_rounds);
+        return;
+    }
 
-    add_experience(kExperienceTarget - experience);
-    LOGI("23.1.3-progression: max level reached; experience topped up "
-         "%" PRId32 " -> %" PRId32, experience, kExperienceTarget);
+    const int32_t remainder = current_experience();
+    int32_t needed = 0;
+    if (!experience_to_cap(level, remainder, &needed)) {
+        if ((g_frames % 300u) == 0u) {
+            LOGE("23.1.3-progression: level threshold table is not readable "
+                 "yet; level %" PRId32 " left untouched", level);
+        }
+        return;
+    }
+
+    void* controller = shared_controller();
+    if (controller == nullptr) return;
+
+    ++g_level_grant_rounds;
+    LOGI("23.1.3-progression: granting %" PRId32 " experience to carry level "
+         "%" PRId32 " -> %" PRId32 " (stored remainder %" PRId32
+         ", round %" PRId32 ")",
+         needed, level, kLevelCap, remainder, g_level_grant_rounds);
+
+    add_experience(needed);
+
+    const int32_t new_level = current_level();
+    const int32_t new_remainder = current_experience();
+    if (new_level >= kLevelCap) {
+        g_level_grant_done = true;
+        LOGI("23.1.3-progression: level granted and persisted %" PRId32
+             " -> %" PRId32 " (remainder %" PRId32 ")",
+             level, new_level, new_remainder);
+    } else {
+        LOGW("23.1.3-progression: level moved %" PRId32 " -> %" PRId32
+             " (remainder %" PRId32 "); recomputing the deficit next tick",
+             level, new_level, new_remainder);
+    }
 }
 
 inline void maybe_grant() {
@@ -311,16 +431,18 @@ inline void maybe_grant() {
         const int32_t experience =
             reinterpret_cast<StaticIntFn>(g_experience.ptr)(g_experience.info);
         LOGI("23.1.3-progression: armed; coin key='%s' gem key='%s' "
-             "level=%" PRId32 " exp=%" PRId32 " (experience pump %s)",
+             "level=%" PRId32 " exp=%" PRId32 " (level grant %s)",
              g_coin_key.c_str(), g_gem_key.c_str(), level, experience,
-             kGrantExperience ? "on" : "off");
+             kGrantLevel ? "on" : "off");
     }
 
     if ((g_frames % kCurrencyIntervalFrames) == 0u) top_up_currency();
-    // With kGrantExperience off this module never calls into the stock
-    // add-experience routine, so no veteran chest is ever offered by it.
-    if (kGrantExperience && (g_frames % kLevelIntervalFrames) == 0u) {
-        pump_experience();
+    // Level only, and only while the profile reads below the cap. Once
+    // grant_level_to_cap() has settled it never calls into the stock
+    // add-experience routine again, so nothing here can offer the veteran
+    // chest on a loop the way the old experience pump did.
+    if (!g_level_grant_done && (g_frames % kLevelIntervalFrames) == 0u) {
+        grant_level_to_cap();
     }
 }
 
@@ -356,14 +478,16 @@ inline bool install() {
     resolved &= bind(g_gems, kProgressNs, kWalletClass, kGems, 0);
     resolved &= bind(g_level, kGlobalNs, kExperienceClass, kLevel, 0);
     resolved &= bind(g_experience, kGlobalNs, kExperienceClass, kExperience, 0);
-    // The add-experience entry point and the shared controller it needs are
-    // only used by the pump. With the pump off neither is resolved, so this
-    // module cannot write experience even by accident, and a metadata change
-    // on that path can no longer take down the MainMenuController.Update slot
-    // every other pump in this port depends on.
-    if (kGrantExperience) {
+    // The add-experience entry point, the per-level threshold accessor and
+    // the shared controller are only used by the level grant. With the grant
+    // off none of them is resolved, so a metadata change on that path can no
+    // longer take down the MainMenuController.Update slot every other pump in
+    // this port depends on.
+    if (kGrantLevel) {
         resolved &= bind(g_add_experience, kGlobalNs, kExperienceClass,
                          kAddExperience, 3);
+        resolved &= bind(g_level_threshold, kGlobalNs, kLevelTableClass,
+                         kLevelThreshold, 1);
     }
     if (!resolved) {
         LOGE("23.1.3-progression: metadata does not match the expected "
@@ -371,12 +495,19 @@ inline bool install() {
         return false;
     }
 
-    if (kGrantExperience) {
+    if (kGrantLevel) {
         g_shared_field =
             il2cpp::find_field(kGlobalNs, kExperienceClass, kSharedController);
         if (g_shared_field == nullptr) {
             LOGE("23.1.3-progression: ExperienceController.%s not found",
                  kSharedController);
+            return false;
+        }
+        g_level_table_field =
+            il2cpp::find_field(kGlobalNs, kExperienceClass, kLevelTableField);
+        if (g_level_table_field == nullptr) {
+            LOGE("23.1.3-progression: the ExperienceController level "
+                 "threshold table field was not found");
             return false;
         }
     }
@@ -410,12 +541,12 @@ inline bool install() {
 
     g_installed = true;
     LOGI("23.1.3-progression: installed (currency target %" PRId32
-         ", level cap %" PRId32 ", experience pump %s)",
+         ", level cap %" PRId32 ", level grant %s)",
          kCurrencyTarget, kLevelCap,
-         kGrantExperience
-             ? "on"
-             : "off; experience is left exactly as the profile has it, so "
-               "this module never offers the veteran chest");
+         kGrantLevel
+             ? "on; the deficit up to the cap is granted once, and only while "
+               "the profile reads below it"
+             : "off; the level is left exactly as the profile has it");
     return true;
 }
 

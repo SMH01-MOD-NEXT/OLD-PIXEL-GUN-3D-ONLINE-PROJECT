@@ -202,103 +202,130 @@ That overload is materially different:
 There is no level-up bookkeeping and, critically, **no `csel ..., wzr`** — the
 value is stored verbatim.
 
-### Why the pump is off (the veteran chest)
+### Why the level is granted, and why the veteran chest cannot come back
 
-**`kGrantExperience = false` since August 27, 2026.** The module no longer
-grants experience at all; currency and every other module in this port are
-unaffected.
+**`kGrantLevel = true` since August 27, 2026. There is no experience pump and
+no drain.** The module grants the level once per process and touches nothing
+else on that path; currency and every other module in this port are unaffected.
 
-Reported symptom: the veteran chest window kept reappearing in the menu over
-and over. The disassembly of the max-level overload explains it. After the
-persist at `+0x11C` (`bl 0x01B4FD5C`), `0x01C7B374` continues:
+Two device-reported symptoms produced this shape:
 
-| Offset | Instruction | Meaning |
-| --- | --- | --- |
-| `+0x190` | `bl 0x03664E34` / `bl 0x03668F54` | ExpOpenSystem instance + lookup |
-| `+0x1E4` | `bl 0x028D4C28` (7 args) | evaluate the gain against the tier tables |
-| `+0x1F8` | `bl 0x01C79A50` | current level |
-| `+0x23C` | `bl 0x01C7BD6C` | build the presentation payload |
-| `+0x240` | `str x21, [x19, #0x50]!` + `bl 0x01291E78` | park it on the controller |
-| `+0x278` | `blr x9` | raise the presentation event |
+1. **The veteran chest kept reappearing.** That window is the *max-level*
+   presentation. After the persist at `+0x11C` (`bl 0x01B4FD5C`), the max-level
+   overload `丏三万丕丂业专丌丏` (`0x01C7B374`) continues:
 
-So **every** grant past `maxLevel` raises an experience presentation, and past
-the cap that presentation is the veteran loot box: `dump2313.cs` carries
-`业丅不上丑丙一丅丈.VeteranLootBox = 11`, `BannerWindowType.VeteranChest = 5`,
-`丄丆三丅七丞丆专上.VeteranChestOpen = 9` and the whole `VeteranlLootBoxUI` /
-`VeteranLootBoxUI_Listener` family. A repeating top-up therefore offers a
-veteran chest on a loop — and a synthetic counter of `900000000` leaves the
-veteran bar permanently full even between grants.
+   | Offset | Instruction | Meaning |
+   | --- | --- | --- |
+   | `+0x190` | `bl 0x03664E34` / `bl 0x03668F54` | ExpOpenSystem instance + lookup |
+   | `+0x1E4` | `bl 0x028D4C28` (7 args) | evaluate the gain against the tier tables |
+   | `+0x1F8` | `bl 0x01C79A50` | current level |
+   | `+0x23C` | `bl 0x01C7BD6C` | build the presentation payload |
+   | `+0x240` | `str x21, [x19, #0x50]!` + `bl 0x01291E78` | park it on the controller |
+   | `+0x278` | `blr x9` | raise the presentation event |
 
-Disabling the pump costs nothing that was wanted:
+   Every grant made while the profile is **already** at `maxLevel` therefore
+   offers another veteran chest (`业丅不上丑丙一丅丈.VeteranLootBox = 11`,
+   `BannerWindowType.VeteranChest = 5`, `丄丆三丅七丞丆专上.VeteranChestOpen = 9`, plus the
+   whole `VeteranlLootBoxUI` family). The old pump ran every 5 frames, so it
+   offered one on a loop.
+2. **Switching that pump off took level 65 with it.** The level was never
+   granted as a value: it was a by-product of pushing `kExpGrantPerTick`
+   through the stock routine every few frames, so with the pump off the ramp
+   stopped and the profile fell back to whatever level was last persisted. The
+   drain idea (a negative amount through the same overload) is worse still:
+   the level-up loop below runs on a *shrinking* accumulator, so a negative
+   grant walks the level back **down** — which is what left the armory handing
+   out level-65 weapons first and level-30-and-below afterwards. Both the pump
+   and the drain are gone.
 
-- The level and the experience counter both live in the persisted profile, so
-  an already-capped profile stays at level 65. The stock PixelPass unlock
-  predicate (`一丒丄丘不七与丁万` → `0x020DF364`, `playerLevel >= arg`) and the
-  live-content level gate read that same stored level.
-- With the pump off, `东丙丑万且专丞世丂` and `ExperienceController.sharedController`
-  are not resolved at all, so this module cannot write experience even by
-  accident — and a metadata change on that path can no longer take down the
-  `MainMenuController::Update()` slot every other pump depends on.
+### How the level is granted now
 
-If a profile still carries a synthetic `900000000` counter and chests keep
-being offered, the next step is a **one-shot drain** through the same overload
-with a negative amount (`add w25, w25, w29` has no sign check), and only
-against a device log that shows the stored value: the arm line now prints it.
+`grant_level_to_cap()` asks the game how much experience the profile still
+needs and requests exactly that, once. Below the cap the entry point `东丙丑万且专丞世丂`
+(`0x01C7AC28`) treats the stored experience as a per-level remainder and loops
+(`0x01C7ADF4` .. `0x01C7AF20`):
 
-### What the module does when the pump is on
+```
+bl   0x01C79A50        ; level; > 0x40 (64) -> leave the loop
+ldr  x28, [x8, #0x48]  ; ExperienceController.丘一不丒丐东不世丗
+bl   0x03BFB9D8        ; 丕与丏丅丆丕专万丟(level) -> per-level threshold
+cmp  w26, w0           ; accumulator < threshold -> leave the loop
+bl   0x01B4FBD8        ; Progress service: persist level + 1
+sub  w26, w26, w28     ; accumulator -= threshold
+```
 
-`pump_experience()` replaces `raise_level()` and keeps driving the same stock
-entry point past the cap:
+One call can therefore carry the profile from any level up to 65, and every
+level it passes is persisted by the game's own service call. This is a real
+grant, not a getter fake, and it survives an app restart. On the way out
+`0x01C7B0CC` persists the leftover accumulator (`0x01B4FD5C`), and
+`0x01C7AFF4` runs `cmp w0,#0x41; csel w26,w26,wzr,lt`, so the level-up that
+reaches 65 stores the remainder as **0** by design. That, not a missing grant,
+is why a capped profile shows xp 0.
 
-- `level < 65` — grant `kExpGrantPerTick` as before (level ramp).
-- `level == 65` — read the stored experience and grant exactly
-  `kExperienceTarget - experience`, so the routine lands on the target
-  exactly.
+The amount is not a guess:
 
-The grant is therefore **self-limiting**: after one successful top-up the
-deficit is zero and no further managed call is made, which keeps the XP-gain
-notification from firing on a loop. `kExperienceTarget` is `900000000` rather
-than `999999999` because `0x01C7B374` computes `experience + amount` as a
-signed 32-bit int and normal post-grant gains keep accruing on top of the
-synthetic value.
+```
+needed = sum(丕与丏丅丆丕专万丟(L) for L in current_level .. 64) - stored remainder
+```
+
+read from the game's own table. `ExperienceController.丘一不丒丐东不世丗` (static field
+`+0x48`) is a `丂丘丅世丏世东丗丄` wrapper whose salted-int array sits at `+0x10` with the
+il2cpp length at `+0x18`, and `丕与丏丅丆丕专万丟(int)` (`0x03BFB9D8`) decodes one entry.
+`level_threshold()` range-checks the index the same way the accessor does at
+`0x03BFB9E4`, so a shorter table degrades to "not readable yet" instead of a
+managed `IndexOutOfRange` throw.
+
+Guard rails:
+
+- **The trigger is the level, and only the level.** If the level already reads
+  65 the function returns before anything else happens, no matter what the
+  experience counter says. The module therefore never calls in at max level,
+  which puts the max-level overload — the only thing that can offer a veteran
+  chest — out of reach.
+- **No drain, ever.** `add_experience()` refuses negative amounts. Zero is
+  allowed, because a remainder that already covers the thresholds only needs
+  the loop to run.
+- **Bounded rounds.** `kMaxLevelGrantRounds = 4`; every round recomputes the
+  deficit from the live level, and the whole thing latches off as soon as the
+  level reads 65 (or after the last round, with an error line).
+- Below the cap the routine raises the ordinary level-up window, which is the
+  stock presentation for gaining a level, not the veteran chest.
 
 Two alternatives were rejected:
 
-- **Writing the backing field directly.** Experience lives behind the Progress
-  save model (`0x026FCD84` → accessor `0x04D89694`), the same encrypted-holder
-  pattern the wallet uses. Poking it would bypass the persist/notify path and
-  desync the save, exactly the mistake the currency module avoids by going
-  through `0x01B44CC0`.
-- **`万丝丆万丆专且专丌(int,int,int,int)` at `0x01C79F40`.** Disassembly shows it
-  writes the per-level *threshold tables* (`str w19, [x8, #0x20]` indexed by
+- **Writing the level or the experience field directly.** Both live behind the
+  Progress save model (`0x026FCD84` -> accessor `0x04D89694`), the same
+  encrypted-holder pattern the wallet uses. Poking it would bypass the
+  persist/notify path and desync the save, exactly the mistake the currency
+  module avoids by going through `0x01B44CC0`.
+- **`万丝丆万丆专且专丌(int,int,int,int)` at `0x01C79F40`.** Disassembly shows it writes
+  the per-level *threshold tables* (`str w19, [x8, #0x20]` indexed by
   `w20 <= 0x40`), not the player's experience. It is a table initializer, not
   a setter.
 
 ### Expected log
 
-Shipping configuration (pump off):
+Profile below the cap — one grant, then silence:
 
 ```
-23.1.3-progression: installed (currency target 999999999, level cap 65, experience pump off; experience is left exactly as the profile has it, so this module never offers the veteran chest)
-23.1.3-progression: armed; coin key='…' gem key='…' level=65 exp=… (experience pump off)
+23.1.3-progression: installed (currency target 999999999, level cap 65, level grant on; the deficit up to the cap is granted once, and only while the profile reads below it)
+23.1.3-progression: armed; coin key='...' gem key='...' level=30 exp=... (level grant on)
+23.1.3-progression: granting 1234567 experience to carry level 30 -> 65 (stored remainder ..., round 1)
+23.1.3-progression: level granted and persisted 30 -> 65 (remainder 0)
 ```
 
-`max level reached; experience topped up …` must **not** appear any more. If it
-does, the running `.so` predates this change. The `exp=…` value on the arm line
-is the stored counter, and it is the input for the drain decision described
-above.
-
-With the pump switched back on:
+Profile already at the cap — nothing is touched:
 
 ```
-23.1.3-progression: installed (currency target 999999999, level cap 65, experience pump on)
-23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=… (experience pump on)
-23.1.3-progression: max level reached; experience topped up 0 -> 900000000
+23.1.3-progression: armed; coin key='...' gem key='...' level=65 exp=... (level grant on)
+23.1.3-progression: level 65 already meets the cap; no experience is granted and none is taken away
 ```
 
-The top-up line must then appear exactly **once** per session. If it repeats
-every few frames, the Progress service is rejecting the write and the analysis
-above needs revisiting.
+`granting ... experience` must appear **at most once** per session, and never
+when the arm line already reads `level=65`. If `level moved ... recomputing the
+deficit next tick` appears more than once, the threshold table is not what this
+analysis assumes. `max level reached; experience topped up ...` must not appear
+at all any more: that line belonged to the removed pump.
 
 ## Save shield
 
@@ -354,11 +381,14 @@ adb logcat -s OPG3D
    `23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=…`
    — confirm the two captured keys differ and look like real wallet keys.
 4. Coins and gems climb to `999999999` without a `CoinsMessage` toast storm.
-5. Level and the XP counter are left exactly as the profile has them: with
-   `kGrantExperience = false` this module raises no level-up and no veteran
-   chest presentation at all.
-5a. No veteran chest window appears in the menu on its own, and
-   `experience topped up …` must not appear in logcat.
+5. Level: if the arm line reads `level=65`, nothing else may follow on that
+   path — no `granting ...` line, no level-up window, no veteran chest. If it
+   reads anything lower, exactly one
+   `granting ... experience to carry level ... -> 65` line must appear,
+   followed by `level granted and persisted ... -> 65`.
+5a. After an app restart the level still reads 65, because every level the
+   stock loop passed was persisted through the Progress service, and no
+   veteran chest window appears in the menu on its own.
 6. No `CheatDetectedBanner` wipe: `PlayerPrefs` survives an app restart and
    progress is still present.
 7. Online still works — the Photon path is untouched; confirm
@@ -390,6 +420,7 @@ all progression values stock and repairs only that label's active/enabled/alpha
 state after the refresh. `PlayerPanel.UpdateExp()` receives the same fallback
 for the older header widget.
 
-The 900,000,000 experience target is no longer applied at all: the experience
-pump is off, see "Why the pump is off (the veteran chest)". No display-only XP
-clamp was needed to restore the rank label.
+The 900,000,000 experience target is gone: there is no experience pump any
+more, only the one-shot level grant described in "How the level is granted
+now", and the remainder is left wherever the stock level-up loop puts it (0 at
+the cap). No display-only XP clamp was needed to restore the rank label.
