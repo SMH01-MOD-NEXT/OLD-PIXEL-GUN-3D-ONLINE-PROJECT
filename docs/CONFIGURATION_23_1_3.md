@@ -18,7 +18,9 @@ header has to be edited for ordinary component isolation.
   animation, inventory pumps, crafting, catalogue, live-content, modules,
   hidden items, and Pixel Pass.
 - `player_content`: local player identity and the bundled assets/data payload.
-- `gameplay`: battle UI, rank UI, post-match recovery, and high-tier bots.
+- `gameplay`: battle UI, rank UI, post-match recovery, high-tier bots, the
+  battle flow trace, and the respawn repair (`respawn_repair`, see
+  `docs/PORT_23_1_3_RESPAWN_REPAIR.md`).
 
 ## Dependencies
 

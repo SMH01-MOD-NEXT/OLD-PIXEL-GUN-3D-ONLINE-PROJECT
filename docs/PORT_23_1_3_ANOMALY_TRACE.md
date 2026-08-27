@@ -77,3 +77,11 @@ or its gate answers `0`.
 
 The trace can be switched off with `feature_config::gameplay::battle_flow_trace`
 in `main.cpp`.
+
+### Outcome: the respawn divergence point
+
+`log_battle.txt` stopped at `-> killer weapon panel` with no exit line, which
+placed the throw inside `WeaponInfoInRespawnWindow.上上三丝上不丂东东` (`0x4340DE8`).
+The analysis and the fix live in `docs/PORT_23_1_3_RESPAWN_REPAIR.md`; that
+method is now hooked by `respawn_repair_2313.h` instead of this trace, so its
+enter/exit pair is printed with the `23.1.3-respawn-repair` prefix.

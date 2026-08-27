@@ -50,6 +50,11 @@
 //   PlayerData, the reveal node never fires, or its gate answers false. Each
 //   of those four is a distinct line below.
 //
+// The killer weapon panel node (WeaponInfoInRespawnWindow.上上三丝上不丂东东) is no
+// longer hooked here: respawn_repair_2313.h owns that method now, because a
+// single method can only carry one hook, and it logs the same enter/exit pair
+// under the 23.1.3-respawn-repair prefix.
+//
 // Everything here delegates to stock code and returns stock values. No
 // argument, return value, window, panel or player state is modified.
 namespace battle_flow_trace_2313 {
@@ -65,8 +70,6 @@ using WindowGetterFn = void* (*)(void*, const MethodInfo*);
 using OneBoolFn = void (*)(void*, bool, const MethodInfo*);
 using TwoBoolFn = void (*)(void*, bool, bool, const MethodInfo*);
 using OneObjectFn = void (*)(void*, void*, const MethodInfo*);
-using KillerWeaponFn = void (*)(void*, void*, float, float, float,
-                               const MethodInfo*);
 using ProfileRequestFn = void (*)(void*, ManagedString*, int32_t, void*,
                                   int32_t, const MethodInfo*);
 using ProfileOpenFn = void (*)(void*, ManagedString*, void*, int32_t, int32_t,
@@ -76,7 +79,6 @@ inline constexpr const char* kNs = "";
 inline constexpr const char* kPlayer = "Player_move_c";
 inline constexpr const char* kController = "RespawnWindowController";
 inline constexpr const char* kWindow = "RespawnWindow";
-inline constexpr const char* kKillerWeaponView = "WeaponInfoInRespawnWindow";
 inline constexpr const char* kProfileGui = "PlayerProfileGUI";
 inline constexpr const char* kProfileView = "PlayerProfileViewController";
 inline constexpr const char* kStatsView = "PlayerProfileStatsView";
@@ -91,7 +93,6 @@ inline constexpr const char* kWindowUser = u8"丞不一且丟丌世一丅";
 inline constexpr const char* kShowGate = u8"七丞三丒丏丘不丐三";
 inline constexpr const char* kCameraSetup = u8"丂丁世下丆万不丄与";
 inline constexpr const char* kWindowShow = u8"丐丆丙专一丒丗上且";
-inline constexpr const char* kKillerWeaponFill = u8"上上三丝上不丂东东";
 inline constexpr const char* kProfileRequest = u8"丌丛一丏丛一上丌丕";
 inline constexpr const char* kProfileOpen = u8"丐丆丙专一丒丗上且";
 inline constexpr const char* kProfileGate = u8"一且丅丁丂专专丒丁";
@@ -115,7 +116,6 @@ inline TwoBoolFn g_button_active = nullptr;
 inline VoidFn g_window_close = nullptr;
 inline VoidFn g_window_hide = nullptr;
 inline VoidFn g_window_enable = nullptr;
-inline KillerWeaponFn g_killer_weapon = nullptr;
 inline ProfileRequestFn g_profile_request = nullptr;
 inline ProfileOpenFn g_profile_open = nullptr;
 inline BoolGetterFn g_profile_gate = nullptr;
@@ -331,24 +331,6 @@ inline void window_enable_hook(void* self, const MethodInfo* method) {
     LOGI("23.1.3-battle-flow: RespawnWindow.OnEnable returned");
 }
 
-// The killer weapon panel is the first data-driven part of the window and it
-// dereferences the killer info. If the window show line appears and this one
-// does not return, the missing interface is a null killer payload.
-inline void killer_weapon_hook(void* self, void* killer_info, float first,
-                               float second, float third,
-                               const MethodInfo* method) {
-    LOGW("23.1.3-battle-flow: -> killer weapon panel killerInfo=%s"
-         " dps=%.2f/%.2f/%.2f",
-         presence(killer_info), static_cast<double>(first),
-         static_cast<double>(second), static_cast<double>(third));
-    if (g_killer_weapon == nullptr) {
-        LOGE("23.1.3-battle-flow: killer weapon panel has no saved original");
-        return;
-    }
-    g_killer_weapon(self, killer_info, first, second, third, method);
-    LOGW("23.1.3-battle-flow: <- killer weapon panel returned");
-}
-
 // ---------------------------------------------------------------------------
 // Profile / Stats tab
 // ---------------------------------------------------------------------------
@@ -489,9 +471,6 @@ inline bool install_hooks() {
     add({kNs, kWindow, "OnEnable", 0},
         reinterpret_cast<void*>(&window_enable_hook),
         reinterpret_cast<void**>(&g_window_enable), &installed);
-    add({kNs, kKillerWeaponView, kKillerWeaponFill, 4},
-        reinterpret_cast<void*>(&killer_weapon_hook),
-        reinterpret_cast<void**>(&g_killer_weapon), &installed);
 
     // Profile / Stats tab.
     const bool request = add({kNs, kProfileGui, kProfileRequest, 4},
@@ -516,7 +495,7 @@ inline bool install_hooks() {
         reinterpret_cast<void*>(&stats_fill_hook),
         reinterpret_cast<void**>(&g_stats_fill), &installed);
 
-    LOGI("23.1.3-battle-flow: installed %d/18 passive hooks (death=%s"
+    LOGI("23.1.3-battle-flow: installed %d/17 passive hooks (death=%s"
          " window=%s coroutine=%s profile-request=%s gate=%s reveal=%s)",
          installed, death ? "OK" : "FAILED", window ? "OK" : "FAILED",
          coroutine ? "OK" : "FAILED", request ? "OK" : "FAILED",
