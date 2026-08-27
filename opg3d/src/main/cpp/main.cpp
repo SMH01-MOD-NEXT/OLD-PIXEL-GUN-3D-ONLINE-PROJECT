@@ -140,7 +140,7 @@ void* init_thread(void*) {
     const bool photon_online   = photon_2313::install_hooks();
     const bool default_plugin  = photon_default_plugin_2313::install_hooks();
     const bool photon_trace    = photon_trace_2313::install_hooks();
-    const bool progression     = progression_2313::install_hooks();
+    const bool progression     = progression_2313::install_hooks(base);
     const bool crafting        = crafting_2313::install_hooks();
     const bool lobby_catalog   = lobby_catalog_2313::install_hooks();
     const bool live_content    = live_content_2313::install_hooks(base);

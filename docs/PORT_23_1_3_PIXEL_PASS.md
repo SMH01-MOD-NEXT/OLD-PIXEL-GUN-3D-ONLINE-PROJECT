@@ -531,3 +531,14 @@ longer take the battle pass down with it.
 * The hook engine cannot install hooks on generic-shared instantiations
   (`RVA -1`), which is why no generic collection method is hooked anywhere in
   this module — `List<T>` is reached through its own accessors instead.
+
+
+## Active local season verdict (August 27, 2026)
+
+`PixelPassView` separately calls service predicate
+`不丝丒丘三专专一丅/0` (`0x18EF98C`) to choose between the normal pass face and
+`PixelPassSeasonEnd`. Offline state can leave that predicate true even after
+the module installs a fresh local service. The predicate is now
+address-verified and returns false only after the local season installation
+has succeeded; stock behavior remains unchanged before installation or for a
+real cached season.

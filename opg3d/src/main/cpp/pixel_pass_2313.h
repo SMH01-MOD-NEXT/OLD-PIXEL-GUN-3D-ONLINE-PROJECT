@@ -237,6 +237,10 @@ constexpr const char* kServiceUnlocked = "一丒丄丘不七与丁万";   // boo
 //
 // It is what picks between the real pass face and the coming-soon face.
 constexpr const char* kServiceHasContent = "丈丛丛万丗丟丅丛丐";   // bool /0, 0x18EF8CC
+// PixelPassView asks this service predicate before choosing its normal face
+// or PixelPassSeasonEnd. The local season is already guarded by the verified
+// window predicate above, so it must not inherit a stale offline "ended" bit.
+constexpr const char* kServiceSeasonEnded = "不丝丒丘三专专一丅";   // bool /0, 0x18EF98C
 
 // The service's current cell. The lobby view dereferences it with no null
 // check the moment the predicates above answer true, so it has to be non-null
@@ -307,6 +311,7 @@ constexpr uintptr_t kRvaServiceInWindow = 0x18EEC4Cu;
 constexpr uintptr_t kRvaServiceUnlocked = 0x18EEF7Cu;
 // The content check the lobby view asks between those two.
 constexpr uintptr_t kRvaServiceHasContent = 0x18EF8CCu;
+constexpr uintptr_t kRvaServiceSeasonEnded = 0x18EF98Cu;
 // PixelTime.丒万丟且丑上东丂丈/0. Address-verified like the rest: this one is a
 // global-namespace MonoBehaviour, and hooking the wrong clock would misdate
 // every timed system in the build, not just the pass.
@@ -629,6 +634,7 @@ inline StaticLongFn g_clock_orig = nullptr;
 // The view asks it immediately after showing the holder and drops to the
 // lock + coming-soon face when it answers false.
 inline InstanceBoolFn g_svc_content_orig = nullptr;
+inline InstanceBoolFn g_svc_season_ended_orig = nullptr;
 
 // The service's current cell, field 0x68 (丞丞不丈七世丕丘丝 -- nine characters, the
 // same trap as 丞丏业丐丒与业丗与 in the progression module). The view dereferences it
@@ -639,6 +645,7 @@ inline InstanceBoolFn g_svc_content_orig = nullptr;
 inline void* g_service_cell_field = nullptr;
 inline bool g_clock_forced_logged = false;
 inline bool g_content_forced_logged = false;
+inline bool g_season_ended_suppressed_logged = false;
 inline bool g_content_refused_logged = false;
 
 inline void* g_view_holder_field = nullptr;
@@ -1191,6 +1198,23 @@ inline bool svc_content_hook(void* self, void* method) {
              "cell, so reporting the pass content as present");
     }
     return true;
+}
+
+// PixelPassView uses this predicate to switch from the normal pass UI to the
+// dedicated PixelPassSeasonEnd panel. Offline state can keep it true even
+// after a fresh local service is installed. A successfully installed season
+// whose verified window hook reports current is authoritative, so suppress
+// only that stale end-state and leave stock behavior untouched otherwise.
+inline bool svc_season_ended_hook(void* self, void* method) {
+    const bool stock = (g_svc_season_ended_orig != nullptr)
+                           ? g_svc_season_ended_orig(self, method)
+                           : false;
+    if (!stock || !g_install_succeeded) return stock;
+    if (!g_season_ended_suppressed_logged) {
+        g_season_ended_suppressed_logged = true;
+        LOGI("23.1.3-pixelpass: ignored the stale offline season-ended verdict for the installed local season");
+    }
+    return false;
 }
 
 // ------------------------------------------------- season object construction
@@ -1807,6 +1831,13 @@ inline bool install_manager() {
         hook::install({kPassNs, kServiceClass, kServiceHasContent, 0},
                       reinterpret_cast<void*>(&svc_content_hook),
                       reinterpret_cast<void**>(&g_svc_content_orig), false);
+    const bool season_ended =
+        hook_target_verified("the season-ended predicate", kPassNs,
+                             kServiceClass, kServiceSeasonEnded, 0,
+                             kRvaServiceSeasonEnded) &&
+        hook::install({kPassNs, kServiceClass, kServiceSeasonEnded, 0},
+                      reinterpret_cast<void*>(&svc_season_ended_hook),
+                      reinterpret_cast<void**>(&g_svc_season_ended_orig), false);
     const bool clock =
         hook_target_verified("the server clock", kClockNs, kClockClass,
                              kClockNow, 0, kRvaClockNow) &&
@@ -1815,13 +1846,13 @@ inline bool install_manager() {
                       reinterpret_cast<void**>(&g_clock_orig), false);
 
     LOGI("23.1.3-pixelpass: season read-back armed (manager season getter=%d, "
-         "season window=%d, pass unlock=%d, pass content=%d, server clock=%d); "
+         "season window=%d, pass unlock=%d, pass content=%d, season ended=%d, server clock=%d); "
          "the manager's getter reads the static config store by id, so it is "
          "answered from the installed service, and the lobby view's own clock "
          "guard is answered with device time because it hides the entry before "
          "any gate is asked",
          season_read ? 1 : 0, window ? 1 : 0, unlocked ? 1 : 0,
-         content ? 1 : 0, clock ? 1 : 0);
+         content ? 1 : 0, season_ended ? 1 : 0, clock ? 1 : 0);
 
     const bool gate_a =
         hook::install({kPassNs, kManagerClass, kManagerGateA, 0},

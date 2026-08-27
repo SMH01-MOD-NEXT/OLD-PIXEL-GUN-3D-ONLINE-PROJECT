@@ -424,3 +424,16 @@ The 900,000,000 experience target is gone: there is no experience pump any
 more, only the one-shot level grant described in "How the level is granted
 now", and the remainder is left wherever the stock level-up loop puts it (0 at
 the cap). No display-only XP clamp was needed to restore the rank label.
+
+
+## Fast level-road presentation (August 27, 2026)
+
+The one-shot computed grant can cross dozens of levels in one call. The stock
+`ProgressRoadView` then animates every crossed point with serialized timing
+values (`barFillSpeed` `+0x98`, `startAnimationsDelay` `+0x9C`,
+`animationSpeedMultiplier` `+0xA0`, `animationSpeedThreshold` `+0xA4`), which
+can leave the road running for minutes. The address-verified
+`ProgressRoadView.OnEnable` hook (`0x3D3EC84`) now removes the initial delay,
+sets the threshold to zero and applies high local speed values before stock
+initialization. This affects only the level-road presentation; the persisted
+level and XP grant remain unchanged.

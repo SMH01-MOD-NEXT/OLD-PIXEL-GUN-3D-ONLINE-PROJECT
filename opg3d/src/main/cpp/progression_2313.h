@@ -95,6 +95,15 @@ constexpr const char* kBannerWipe = "丏万且丝上丙丐下丗";
 constexpr const char* kBannerKick = "丈且丁丞丛丅丄七上";
 constexpr const char* kMenuClass = "MainMenuController";
 constexpr const char* kMenuUpdate = "Update";
+constexpr const char* kProgressRoadClass = "ProgressRoadView";
+constexpr const char* kProgressRoadOnEnable = "OnEnable";
+constexpr uintptr_t kRvaProgressRoadOnEnable = 0x3D3EC84u;
+constexpr uintptr_t kRoadBarFillSpeedOffset = 0x98u;
+constexpr uintptr_t kRoadStartDelayOffset = 0x9Cu;
+constexpr uintptr_t kRoadSpeedMultiplierOffset = 0xA0u;
+constexpr uintptr_t kRoadSpeedThresholdOffset = 0xA4u;
+constexpr float kFastRoadBarFillSpeed = 1000000.0f;
+constexpr float kFastRoadSpeedMultiplier = 1000.0f;
 
 using StaticObjFn = void* (*)(void* method);
 using InstanceIntFn = int32_t (*)(void* self, void* method);
@@ -148,6 +157,8 @@ inline void* g_wallet_keyed_orig = nullptr;
 inline void* g_menu_update_orig = nullptr;
 inline void* g_banner_wipe_orig = nullptr;
 inline void* g_banner_kick_orig = nullptr;
+inline void* g_progress_road_enable_orig = nullptr;
+inline bool g_progress_road_logged = false;
 inline bool g_installed = false;
 inline bool g_keys_ready = false;
 inline bool g_level_grant_done = false;
@@ -446,6 +457,27 @@ inline void maybe_grant() {
     }
 }
 
+inline void progress_road_enable_hook(void* self, void* method) {
+    // ProgressRoadView serialises four timing controls at +0x98..+0xA4.
+    // The stock animator applies barFillSpeed, then multiplies it when the
+    // remaining progress exceeds animationSpeedThreshold. A one-shot grant
+    // spanning dozens of levels otherwise queues minutes of road animation.
+    if (self != nullptr) {
+        auto* raw = static_cast<uint8_t*>(self);
+        *reinterpret_cast<float*>(raw + kRoadBarFillSpeedOffset) =
+            kFastRoadBarFillSpeed;
+        *reinterpret_cast<float*>(raw + kRoadStartDelayOffset) = 0.0f;
+        *reinterpret_cast<float*>(raw + kRoadSpeedMultiplierOffset) =
+            kFastRoadSpeedMultiplier;
+        *reinterpret_cast<int32_t*>(raw + kRoadSpeedThresholdOffset) = 0;
+        if (!g_progress_road_logged) {
+            g_progress_road_logged = true;
+            LOGI("23.1.3-progression: level road timing compressed to a few seconds");
+        }
+    }
+    reinterpret_cast<InstanceVoidFn>(g_progress_road_enable_orig)(self, method);
+}
+
 inline void menu_update_hook(void* self, void* method) {
     reinterpret_cast<InstanceVoidFn>(g_menu_update_orig)(self, method);
     maybe_grant();
@@ -467,7 +499,7 @@ inline void menu_update_hook(void* self, void* method) {
     pixel_pass_2313::pump_from_main_menu();
 }
 
-inline bool install() {
+inline bool install(uintptr_t base) {
     if (g_installed) return true;
 
     bool resolved = true;
@@ -532,6 +564,20 @@ inline bool install() {
         return false;
     }
 
+    void* road_info = il2cpp::find_method_info(
+        kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0);
+    void* road_ptr = il2cpp::method_pointer(road_info);
+    const void* expected_road = reinterpret_cast<void*>(
+        base + kRvaProgressRoadOnEnable);
+    if (road_ptr != expected_road ||
+        !hook::install({kGlobalNs, kProgressRoadClass, kProgressRoadOnEnable, 0},
+                       reinterpret_cast<void*>(&progress_road_enable_hook),
+                       &g_progress_road_enable_orig, true)) {
+        LOGE("23.1.3-progression: ProgressRoadView.OnEnable did not match RVA 0x%" PRIxPTR,
+             kRvaProgressRoadOnEnable);
+        return false;
+    }
+
     if (!hook::install({kGlobalNs, kMenuClass, kMenuUpdate, 0},
                        reinterpret_cast<void*>(&menu_update_hook),
                        &g_menu_update_orig, true)) {
@@ -552,6 +598,6 @@ inline bool install() {
 
 } // namespace detail
 
-inline bool install_hooks() { return detail::install(); }
+inline bool install_hooks(uintptr_t base) { return detail::install(base); }
 
 } // namespace progression_2313
