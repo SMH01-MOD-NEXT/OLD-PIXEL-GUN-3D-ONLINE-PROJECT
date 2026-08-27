@@ -34,6 +34,23 @@ constexpr int32_t kCurrencyTarget = 999999999;
 constexpr int32_t kLevelCap = 65;
 constexpr int32_t kExpGrantPerTick = 9999999;
 constexpr int32_t kExperienceTarget = 900000000;
+// Master switch for the experience pump. It is OFF, and that is deliberate.
+//
+// At maxLevel the stock add-experience entry point (0x01C7AC28) tail-branches
+// into the overload at 0x01C7B374, which reads the stored experience
+// (0x01C79AB0), persists `stored + amount` through the Progress service
+// (0x01B4FD5C) and then builds an experience presentation payload
+// (ctor 0x01C7BD6C, parked at ExperienceController+0x50) and raises the
+// presentation event for it. Past the cap that presentation is the veteran
+// loot box -- 业丅不上丑丙一丅丈.VeteranLootBox = 11, BannerWindowType.VeteranChest
+// = 5 -- so every single grant offers another veteran chest, and a pump that
+// keeps re-topping the counter makes that window reappear forever.
+//
+// Both the level and the experience counter live in the persisted profile, so
+// with the pump off an already-capped profile stays capped: level 65 (which
+// is what the stock PixelPass unlock predicate and the live-content gate
+// read) is not rolled back by disabling this. Currency top-up is unaffected.
+constexpr bool kGrantExperience = false;
 constexpr uint64_t kLevelIntervalFrames = 5;
 constexpr uint64_t kCurrencyIntervalFrames = 120;
 constexpr uint64_t kWarmupFrames = 60;
@@ -257,6 +274,10 @@ inline void add_experience(int32_t amount) {
 // the max-level overload computes `experience + amount` as a signed int and
 // legitimate post-grant gains keep accruing on top of it.
 inline void pump_experience() {
+    // Off by default: see kGrantExperience. The body is kept intact so the
+    // pump can be switched back on without re-deriving any of the above.
+    if (!kGrantExperience) return;
+
     const int32_t level = current_level();
     if (level < 0) return;
 
@@ -290,12 +311,17 @@ inline void maybe_grant() {
         const int32_t experience =
             reinterpret_cast<StaticIntFn>(g_experience.ptr)(g_experience.info);
         LOGI("23.1.3-progression: armed; coin key='%s' gem key='%s' "
-             "level=%" PRId32 " exp=%" PRId32,
-             g_coin_key.c_str(), g_gem_key.c_str(), level, experience);
+             "level=%" PRId32 " exp=%" PRId32 " (experience pump %s)",
+             g_coin_key.c_str(), g_gem_key.c_str(), level, experience,
+             kGrantExperience ? "on" : "off");
     }
 
     if ((g_frames % kCurrencyIntervalFrames) == 0u) top_up_currency();
-    if ((g_frames % kLevelIntervalFrames) == 0u) pump_experience();
+    // With kGrantExperience off this module never calls into the stock
+    // add-experience routine, so no veteran chest is ever offered by it.
+    if (kGrantExperience && (g_frames % kLevelIntervalFrames) == 0u) {
+        pump_experience();
+    }
 }
 
 inline void menu_update_hook(void* self, void* method) {
@@ -330,20 +356,29 @@ inline bool install() {
     resolved &= bind(g_gems, kProgressNs, kWalletClass, kGems, 0);
     resolved &= bind(g_level, kGlobalNs, kExperienceClass, kLevel, 0);
     resolved &= bind(g_experience, kGlobalNs, kExperienceClass, kExperience, 0);
-    resolved &= bind(g_add_experience, kGlobalNs, kExperienceClass,
-                     kAddExperience, 3);
+    // The add-experience entry point and the shared controller it needs are
+    // only used by the pump. With the pump off neither is resolved, so this
+    // module cannot write experience even by accident, and a metadata change
+    // on that path can no longer take down the MainMenuController.Update slot
+    // every other pump in this port depends on.
+    if (kGrantExperience) {
+        resolved &= bind(g_add_experience, kGlobalNs, kExperienceClass,
+                         kAddExperience, 3);
+    }
     if (!resolved) {
         LOGE("23.1.3-progression: metadata does not match the expected "
              "23.1.3 build; nothing was hooked");
         return false;
     }
 
-    g_shared_field =
-        il2cpp::find_field(kGlobalNs, kExperienceClass, kSharedController);
-    if (g_shared_field == nullptr) {
-        LOGE("23.1.3-progression: ExperienceController.%s not found",
-             kSharedController);
-        return false;
+    if (kGrantExperience) {
+        g_shared_field =
+            il2cpp::find_field(kGlobalNs, kExperienceClass, kSharedController);
+        if (g_shared_field == nullptr) {
+            LOGE("23.1.3-progression: ExperienceController.%s not found",
+                 kSharedController);
+            return false;
+        }
     }
 
     const bool shield_wipe = hook::install(
@@ -375,8 +410,12 @@ inline bool install() {
 
     g_installed = true;
     LOGI("23.1.3-progression: installed (currency target %" PRId32
-         ", level cap %" PRId32 ", experience target %" PRId32 ")",
-         kCurrencyTarget, kLevelCap, kExperienceTarget);
+         ", level cap %" PRId32 ", experience pump %s)",
+         kCurrencyTarget, kLevelCap,
+         kGrantExperience
+             ? "on"
+             : "off; experience is left exactly as the profile has it, so "
+               "this module never offers the veteran chest");
     return true;
 }
 

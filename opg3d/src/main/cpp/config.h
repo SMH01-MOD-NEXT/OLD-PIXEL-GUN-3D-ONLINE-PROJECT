@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OPG3D_BUILD_TAG
-#define OPG3D_BUILD_TAG "23.1.3 ARM64 lobby gate v7 + progression + crafts + weapon/armor modules + local id + assets/data + post-match visibility + forced online + armory/rank repair v4 (bank/shop shelf) + high-tier bots + pixel pass v4 (lobby view clock + content face) + in-library backend emulator v1 (LAN host/join)"
+#define OPG3D_BUILD_TAG "23.1.3 ARM64 lobby gate v7 + progression v2 (no exp pump) + crafts + weapon/armor modules + local id + assets/data + post-match visibility + forced online + armory/rank repair v4 (bank/shop shelf) + high-tier bots + pixel pass v4 (lobby view clock + content face) + in-library backend emulator v1 (LAN host/join)"
 #endif
 
 #define OPG3D_BUILD_STAMP OPG3D_BUILD_TAG " built " __DATE__ " " __TIME__

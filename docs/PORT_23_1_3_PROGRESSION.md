@@ -202,7 +202,50 @@ That overload is materially different:
 There is no level-up bookkeeping and, critically, **no `csel ..., wzr`** — the
 value is stored verbatim.
 
-### What the module does now
+### Why the pump is off (the veteran chest)
+
+**`kGrantExperience = false` since August 27, 2026.** The module no longer
+grants experience at all; currency and every other module in this port are
+unaffected.
+
+Reported symptom: the veteran chest window kept reappearing in the menu over
+and over. The disassembly of the max-level overload explains it. After the
+persist at `+0x11C` (`bl 0x01B4FD5C`), `0x01C7B374` continues:
+
+| Offset | Instruction | Meaning |
+| --- | --- | --- |
+| `+0x190` | `bl 0x03664E34` / `bl 0x03668F54` | ExpOpenSystem instance + lookup |
+| `+0x1E4` | `bl 0x028D4C28` (7 args) | evaluate the gain against the tier tables |
+| `+0x1F8` | `bl 0x01C79A50` | current level |
+| `+0x23C` | `bl 0x01C7BD6C` | build the presentation payload |
+| `+0x240` | `str x21, [x19, #0x50]!` + `bl 0x01291E78` | park it on the controller |
+| `+0x278` | `blr x9` | raise the presentation event |
+
+So **every** grant past `maxLevel` raises an experience presentation, and past
+the cap that presentation is the veteran loot box: `dump2313.cs` carries
+`业丅不上丑丙一丅丈.VeteranLootBox = 11`, `BannerWindowType.VeteranChest = 5`,
+`丄丆三丅七丞丆专上.VeteranChestOpen = 9` and the whole `VeteranlLootBoxUI` /
+`VeteranLootBoxUI_Listener` family. A repeating top-up therefore offers a
+veteran chest on a loop — and a synthetic counter of `900000000` leaves the
+veteran bar permanently full even between grants.
+
+Disabling the pump costs nothing that was wanted:
+
+- The level and the experience counter both live in the persisted profile, so
+  an already-capped profile stays at level 65. The stock PixelPass unlock
+  predicate (`一丒丄丘不七与丁万` → `0x020DF364`, `playerLevel >= arg`) and the
+  live-content level gate read that same stored level.
+- With the pump off, `东丙丑万且专丞世丂` and `ExperienceController.sharedController`
+  are not resolved at all, so this module cannot write experience even by
+  accident — and a metadata change on that path can no longer take down the
+  `MainMenuController::Update()` slot every other pump depends on.
+
+If a profile still carries a synthetic `900000000` counter and chests keep
+being offered, the next step is a **one-shot drain** through the same overload
+with a negative amount (`add w25, w25, w29` has no sign check), and only
+against a device log that shows the stored value: the arm line now prints it.
+
+### What the module does when the pump is on
 
 `pump_experience()` replaces `raise_level()` and keeps driving the same stock
 entry point past the cap:
@@ -233,15 +276,29 @@ Two alternatives were rejected:
 
 ### Expected log
 
+Shipping configuration (pump off):
+
 ```
-23.1.3-progression: installed (currency target 999999999, level cap 65, experience target 900000000)
-23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=…
+23.1.3-progression: installed (currency target 999999999, level cap 65, experience pump off; experience is left exactly as the profile has it, so this module never offers the veteran chest)
+23.1.3-progression: armed; coin key='…' gem key='…' level=65 exp=… (experience pump off)
+```
+
+`max level reached; experience topped up …` must **not** appear any more. If it
+does, the running `.so` predates this change. The `exp=…` value on the arm line
+is the stored counter, and it is the input for the drain decision described
+above.
+
+With the pump switched back on:
+
+```
+23.1.3-progression: installed (currency target 999999999, level cap 65, experience pump on)
+23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=… (experience pump on)
 23.1.3-progression: max level reached; experience topped up 0 -> 900000000
 ```
 
-The top-up line must appear exactly **once** per session. If it repeats every
-few frames, the Progress service is rejecting the write and the analysis above
-needs revisiting.
+The top-up line must then appear exactly **once** per session. If it repeats
+every few frames, the Progress service is rejecting the write and the analysis
+above needs revisiting.
 
 ## Save shield
 
@@ -272,16 +329,18 @@ the `Assembly-CSharp.dll` readiness loop.
 
 Grants are driven from `MainMenuController::Update()`, which is inherently
 self-gating: it only ticks once the player is in the main menu, on the Unity
-main thread, with the wallet and `ExperienceController.sharedController`
-already constructed. There is no polling thread and no timing guess.
+main thread, with the wallet already constructed. There is no polling thread
+and no timing guess.
 
 - warm-up: 60 frames before the first managed call
-- level: every 5 frames until `maxLevel`
 - currency: every 120 frames (the stock add path also writes the save)
+- experience: **never** (`kGrantExperience = false`). When switched on: every
+  5 frames until `maxLevel`, then a single top-up.
 
 Install order inside the module is deliberate: resolve everything → bind
-`sharedController` → **shield** → key-capture hook → main-menu tick. Any
-failure at any step aborts before a single value is written.
+`sharedController` (only when the pump is on) → **shield** → key-capture hook
+→ main-menu tick. Any failure at any step aborts before a single value is
+written.
 
 ## Device validation checklist
 
@@ -295,9 +354,11 @@ adb logcat -s OPG3D
    `23.1.3-progression: armed; coin key='…' gem key='…' level=… exp=…`
    — confirm the two captured keys differ and look like real wallet keys.
 4. Coins and gems climb to `999999999` without a `CoinsMessage` toast storm.
-5. Level climbs to 65 and then stops; the level-up UI fires normally.
-5a. Once level 65 is reached, the XP counter reads `900000000` instead of
-   `0`, and `experience topped up 0 -> 900000000` appears once in logcat.
+5. Level and the XP counter are left exactly as the profile has them: with
+   `kGrantExperience = false` this module raises no level-up and no veteran
+   chest presentation at all.
+5a. No veteran chest window appears in the menu on its own, and
+   `experience topped up …` must not appear in logcat.
 6. No `CheatDetectedBanner` wipe: `PlayerPrefs` survives an app restart and
    progress is still present.
 7. Online still works — the Photon path is untouched; confirm
@@ -329,5 +390,6 @@ all progression values stock and repairs only that label's active/enabled/alpha
 state after the refresh. `PlayerPanel.UpdateExp()` receives the same fallback
 for the older header widget.
 
-The 900,000,000 experience target remains unchanged. No display-only XP clamp
-was needed to restore the rank label.
+The 900,000,000 experience target is no longer applied at all: the experience
+pump is off, see "Why the pump is off (the veteran chest)". No display-only XP
+clamp was needed to restore the rank label.
