@@ -106,6 +106,10 @@ inline constexpr int32_t kTechnicalWorks = 15;
 // later Update tick is too late.
 inline constexpr const char* kStateDispatcherMethod =
     u8"丙丟不丗丑下丌丁专"; // void(AuthSceneState), 0x3DC2458
+// The direct maintenance presenter. It calls the dispatcher with state 15 and
+// then creates InfoWindowController UI regardless of what the dispatcher did.
+inline constexpr const char* kMaintenancePresenterMethod =
+    u8"丂且丒东丗丈丌丄丑"; // void(), 0x3DC4964
 
 // Frame budget of one local auth transaction, in Update ticks.
 inline constexpr uint32_t kScheduleGraceFrames = 60u;    // dispatcher grace
@@ -151,6 +155,7 @@ inline const MethodInfo* g_mi_completion_iterator = nullptr;
 inline StartCoroutineFn g_start_coroutine = nullptr;
 inline const MethodInfo* g_mi_start_coroutine = nullptr;
 inline InstanceBoolFn g_completion_blocker = nullptr;
+inline InstanceVoidFn g_maintenance_presenter = nullptr;
 inline InstanceStateFn g_state_dispatcher = nullptr;
 inline StaticGetBoolFn g_local_session_gate = nullptr;
 inline StaticGetIntFn g_get_state = nullptr;
@@ -504,10 +509,51 @@ bool hook_completion_blocker(void* self, const MethodInfo* method) {
                : true;
 }
 
-// TechnicalWorks is a retired-backend failure state, not a meaningful state
-// for an in-process backend. Intercept it before the stock dispatcher creates
-// the maintenance modal, publish the local session through the game's own
-// setters, and continue along the synchronized route.
+// The device log proved that remapping the dispatcher argument alone is not
+// enough: this caller continues after the dispatcher returns and directly
+// creates the maintenance InfoWindow. Suppress that complete presentation path
+// and perform the normal post-auth hand-off instead.
+void hook_maintenance_presenter(void* self, const MethodInfo* method) {
+    if (!g_suppress_technical_works) {
+        if (g_maintenance_presenter != nullptr) {
+            g_maintenance_presenter(self, method);
+        }
+        return;
+    }
+    // Update can retry this presenter every frame while the retired-backend
+    // condition remains true. Once the local hand-off was published, do no
+    // more writes and produce no repeated diagnostics.
+    if (g_technical_works_suppressed.load(std::memory_order_acquire) &&
+        g_runtime_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (!g_technical_works_suppressed.exchange(true,
+                                                std::memory_order_relaxed)) {
+        LOGW("23.1.3-local-backend: suppressed the direct TechnicalWorks "
+             "presenter before it created InfoWindowController UI");
+    }
+    if (g_set_session_ready != nullptr && g_mi_set_session_ready != nullptr) {
+        g_set_session_ready(true, g_mi_set_session_ready);
+    }
+    if (g_set_state != nullptr && g_mi_set_state != nullptr) {
+        g_set_state(kFullySynchronized, g_mi_set_state);
+    }
+    g_published.store(true, std::memory_order_release);
+    g_runtime_ready.store(true, std::memory_order_release);
+
+    if (!g_continuation_done.exchange(true, std::memory_order_acq_rel) &&
+        g_scene_continuation != nullptr &&
+        g_mi_scene_continuation != nullptr) {
+        LOGI("23.1.3-local-backend: maintenance path replaced with the stock "
+             "post-auth scene continuation");
+        g_scene_continuation(self, g_mi_scene_continuation);
+    }
+    g_local_transaction.store(false, std::memory_order_release);
+}
+
+// Guard direct dispatcher calls as a second line of defense. The dedicated
+// presenter hook above is what prevents the caller's unconditional UI tail.
 void hook_state_dispatcher(void* self, int32_t state, const MethodInfo* method) {
     if (state == kTechnicalWorks && g_suppress_technical_works) {
         if (!g_technical_works_suppressed.exchange(true,
@@ -783,7 +829,11 @@ inline bool install_hooks(bool suppress_technical_works) {
         {"", "AuthSceneController", detail::kCompletionBlockerMethod, 0},
         detail::replacement(&detail::hook_completion_blocker),
         detail::original_slot(&detail::g_completion_blocker), true);
-    const bool dispatcher = blocker && hook::install(
+    const bool presenter = blocker && hook::install(
+        {"", "AuthSceneController", detail::kMaintenancePresenterMethod, 0},
+        detail::replacement(&detail::hook_maintenance_presenter),
+        detail::original_slot(&detail::g_maintenance_presenter), true);
+    const bool dispatcher = presenter && hook::install(
         {"", "AuthSceneController", detail::kStateDispatcherMethod, 1},
         detail::replacement(&detail::hook_state_dispatcher),
         detail::original_slot(&detail::g_state_dispatcher), true);
@@ -800,11 +850,13 @@ inline bool install_hooks(bool suppress_technical_works) {
         {"", "AuthSceneController", "Start", 0},
         detail::replacement(&detail::hook_auth_start),
         detail::original_slot(&detail::g_auth_start), true);
-    if (!factory || !blocker || !dispatcher || !update || !destroy || !start) {
+    if (!factory || !blocker || !presenter || !dispatcher || !update ||
+        !destroy || !start) {
         LOGE("23.1.3-local-backend: hooks incomplete (factory=%d blocker=%d "
-             "dispatcher=%d update=%d destroy=%d start=%d)", factory ? 1 : 0,
-             blocker ? 1 : 0, dispatcher ? 1 : 0, update ? 1 : 0,
-             destroy ? 1 : 0, start ? 1 : 0);
+             "presenter=%d dispatcher=%d update=%d destroy=%d start=%d)",
+             factory ? 1 : 0, blocker ? 1 : 0, presenter ? 1 : 0,
+             dispatcher ? 1 : 0, update ? 1 : 0, destroy ? 1 : 0,
+             start ? 1 : 0);
         return false;
     }
 

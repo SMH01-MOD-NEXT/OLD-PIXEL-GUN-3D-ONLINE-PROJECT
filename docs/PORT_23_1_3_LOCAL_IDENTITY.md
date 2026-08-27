@@ -15,18 +15,23 @@ partially.
 
 ## Implementation
 
-`identity_2313.h` now hooks the actual static CryptoPlayerPrefs facade
-`丒丁专与丏丈丙丈世`:
+`identity_2313.h` hooks both storage layers that receive the plaintext key:
 
-- `七丌丁丝丏丝丐丑丘(string)` — presence check;
-- `丘丞丝丂三丌专丑丒(string,string)` — encrypted write;
-- `下丁丏且丕与下丑丗(string,string)` — encrypted read.
+- the game-facing `Rilisoft.丐不专丛丄一丕丌丆` facade (`HasKey`, one-argument
+  `GetString`, and `SetString`);
+- the lower static CryptoPlayerPrefs facade `丒丁专与丏丈丙丈世` (`HasKey`,
+  defaulted `GetString`, and `SetString`).
+
+The August 27 device log showed AppsMenu calling the Rilisoft facade directly;
+the earlier CryptoPlayerPrefs-only bridge therefore installed cleanly but never
+saw a `main_player_id` access. Both routes are now authoritative.
 
 The persistent backend store is the single source of truth. New local IDs are
-ten digits in the native 23.1.3 `35xxxxxxxx` shape. On the first stock access
-to `main_player_id`, the module writes that value through the unhooked game
-facade and immediately reads it back. This lets the game perform its own key
-hashing, encryption, cache update and PlayerPrefs persistence.
+ten digits in the native 23.1.3 `35xxxxxxxx` shape. Legacy IDs minted by older
+port revisions are migrated once, with the previous value retained in
+`id_player_previous`. On the first stock access to `main_player_id`, the module
+writes through the unhooked Rilisoft facade and immediately reads it back. This
+lets the game perform its normal storage, encryption and persistence work.
 
 All later reads return the same authoritative ID. Empty or foreign writes are
 replaced with it. Identity hooks are installed before both local backend
@@ -39,8 +44,8 @@ encryption-mode settings before the first encrypted write.
 ## Expected logs
 
 ```text
-23.1.3-identity: encrypted identity bridge armed before auth
-23.1.3-backend-store: minted the provisional account id 35xxxxxxxx
-23.1.3-identity: authoritative local id 35xxxxxxxx was written and verified through the stock encrypted identity store
-23.1.3-identity: served authoritative player id 35xxxxxxxx through CryptoPlayerPrefs
+23.1.3-identity: Rilisoft + CryptoPlayerPrefs identity bridges armed before auth
+23.1.3-backend-store: migrating legacy minted id ... to the native 35xxxxxxxx shape
+23.1.3-identity: authoritative local id 35xxxxxxxx was written and verified through the Rilisoft identity store
+23.1.3-identity: served authoritative player id 35xxxxxxxx through Rilisoft storage
 ```

@@ -147,3 +147,19 @@ The local backend now hooks this dispatcher. When the central
 flag and stored state are published through the controller's own setters. All
 other states stay stock. Failure to install this guard is treated as an
 incomplete local-backend hook set.
+
+## Direct maintenance presenter follow-up (August 27, 2026)
+
+The device log proved the dispatcher remap was reached, but the maintenance
+window was still created immediately afterwards. A64 inspection explains why:
+`AuthSceneController.丂且丒东丗丈丌丄丑()` (`0x3DC4964`) calls the dispatcher
+with state 15 at `0x3DC49D0`, then continues unconditionally into the
+`InfoWindowController` presentation tail. Changing the dispatcher argument
+cannot cancel that caller's remaining instructions.
+
+The local backend now hooks the presenter itself. With
+`network::suppress_technical_works` enabled, it publishes the local session,
+skips the whole InfoWindow tail, and invokes the stock post-auth scene
+continuation once. The dispatcher remap remains as defense for other callers.
+Repeated writes of an unchanged auth state are no longer logged, removing the
+per-frame `0/3` diagnostic flood without changing game state.

@@ -104,5 +104,7 @@ Runtime evidence from a device-identity change proved that following the ID
 presented by the game is insufficient: the game can present no ID at all. The
 PlayerPrefs-only identity module was also known to be ineffective because this
 build encrypts preference keys. `identity_2313.h` now writes the backend
-store's authoritative ID through the game's CryptoPlayerPrefs facade before
-authentication can consume it. See `PORT_23_1_3_LOCAL_IDENTITY.md`.
+store's authoritative ID through both the Rilisoft game-facing storage facade
+and CryptoPlayerPrefs before authentication can consume it. The August 27 log
+proved that AppsMenu uses the former directly. See
+`PORT_23_1_3_LOCAL_IDENTITY.md`.

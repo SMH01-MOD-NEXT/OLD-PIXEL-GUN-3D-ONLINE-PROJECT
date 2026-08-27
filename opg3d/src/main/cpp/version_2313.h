@@ -32,6 +32,7 @@ inline InstanceVoidFn g_main_menu_awake = nullptr;
 inline StaticStateSetterFn g_set_auth_state = nullptr;
 inline std::atomic<bool> g_training_reached{false};
 inline std::atomic<bool> g_main_menu_reached{false};
+inline std::atomic<int32_t> g_last_logged_auth_state{INT32_MIN};
 
 // AppsMenu.<Start>d__.MoveNext(), supplied 23.1.3 AArch64 binary, has
 // two consecutive String.Compare equality gates before it starts the scene
@@ -142,8 +143,12 @@ void* hook_apps_menu_start(void* self, const MethodInfo* method) {
 }
 
 void hook_set_auth_state(int32_t state, const MethodInfo* method) {
-    LOGI("23.1.3-auth: direct state setter -> %d (%s)", state,
-         state_name(state));
+    const int32_t previous =
+        g_last_logged_auth_state.exchange(state, std::memory_order_relaxed);
+    if (state != previous) {
+        LOGI("23.1.3-auth: direct state setter -> %d (%s)", state,
+             state_name(state));
+    }
     if (g_set_auth_state != nullptr) {
         g_set_auth_state(state, method);
     }

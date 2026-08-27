@@ -426,12 +426,21 @@ inline const char* player_id() {
     detail::load_locked();
 
     const std::string stored = detail::get_locked("id_player", "");
-    if (detail::looks_like_id(stored)) {
+    const std::string source =
+        detail::get_locked("id_player_source", "minted");
+    const bool current_minted_shape =
+        stored.size() == 10u && stored[0] == '3' && stored[1] == '5';
+    if (detail::looks_like_id(stored) &&
+        (source != "minted" || current_minted_shape)) {
         std::snprintf(detail::g_id, sizeof(detail::g_id), "%s", stored.c_str());
         LOGI("23.1.3-backend-store: reusing local account id %s (source '%s')",
-             detail::g_id,
-             detail::get_locked("id_player_source", "minted").c_str());
+             detail::g_id, source.c_str());
         return detail::g_id;
+    }
+    if (detail::looks_like_id(stored) && source == "minted") {
+        detail::set_locked("id_player_previous", stored);
+        LOGW("23.1.3-backend-store: migrating legacy minted id %s to the "
+             "native 35xxxxxxxx shape", stored.c_str());
     }
     const uint64_t minted =
         detail::kIdFirst +
