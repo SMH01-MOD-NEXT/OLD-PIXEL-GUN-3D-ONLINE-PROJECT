@@ -132,3 +132,18 @@ the hand-off itself, not the auth state, is the remaining defect.
 - `photon_2313.h` logs the empty `PHOTON_APP_ID` at error severity on the local
   route, where it is expected; `ParseFullSlotConfig: versionDict not contains
   version 23.1.3` is likewise expected offline noise.
+
+## TechnicalWorks suppression (August 27, 2026)
+
+The retired transport can still send the auth machine to
+`AuthSceneState.TechnicalWorks` (`15`). Waiting until the next `Update` to
+repair the stored enum is too late because
+`AuthSceneController.丙丟不丗丑下丌丁专(AuthSceneState)` (`0x3DC2458`) creates the
+maintenance presentation while dispatching that state.
+
+The local backend now hooks this dispatcher. When the central
+`network::suppress_technical_works` switch is enabled, state 15 is replaced by
+`FullySynchronized` before the stock dispatcher sees it. The session-ready
+flag and stored state are published through the controller's own setters. All
+other states stay stock. Failure to install this guard is treated as an
+incomplete local-backend hook set.

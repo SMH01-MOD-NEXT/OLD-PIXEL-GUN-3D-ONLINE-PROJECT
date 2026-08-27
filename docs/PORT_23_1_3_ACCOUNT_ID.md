@@ -96,3 +96,13 @@ convenient.
   runtime, so a plaintext key never exists.
 * Answering the auth endpoint with a locally minted id does not change the id
   the game displays, no matter which field aliases the answer carries.
+
+
+## Superseded ownership model (August 27, 2026)
+
+Runtime evidence from a device-identity change proved that following the ID
+presented by the game is insufficient: the game can present no ID at all. The
+PlayerPrefs-only identity module was also known to be ineffective because this
+build encrypts preference keys. `identity_2313.h` now writes the backend
+store's authoritative ID through the game's CryptoPlayerPrefs facade before
+authentication can consume it. See `PORT_23_1_3_LOCAL_IDENTITY.md`.

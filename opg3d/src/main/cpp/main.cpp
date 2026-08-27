@@ -66,6 +66,7 @@ constexpr bool obb_provisioner = true;
 // Local backend and multiplayer/network behavior.
 namespace network {
 constexpr bool local_backend = true;
+constexpr bool suppress_technical_works = true;
 constexpr bool backend_emulator = true;
 constexpr bool photon_online = true;
 constexpr bool photon_default_plugin = true;
@@ -232,9 +233,17 @@ void* init_thread(void*) {
         feature_config::startup::loading_stall_watchdog,
         []() { return loading_stall_guard_2313::start_watchdog(); });
 
+    const bool local_identity = install_component(
+        "player-content", "local identity",
+        feature_config::player_content::local_identity,
+        []() { return identity_2313::install_hooks(); });
+
     const bool local_backend = install_component(
         "network", "local backend", feature_config::network::local_backend,
-        []() { return backend_local_2313::install_hooks(); });
+        []() {
+            return backend_local_2313::install_hooks(
+                feature_config::network::suppress_technical_works);
+        });
     const bool backend_emu = install_component(
         "network", "backend emulator", feature_config::network::backend_emulator,
         []() { return backend_emu_2313::install_hooks(); });
@@ -284,10 +293,6 @@ void* init_thread(void*) {
         "progression", "Pixel Pass", feature_config::progression::pixel_pass,
         [base]() { return pixel_pass_2313::install_hooks(base); });
 
-    const bool local_identity = install_component(
-        "player-content", "local identity",
-        feature_config::player_content::local_identity,
-        []() { return identity_2313::install_hooks(); });
     const bool assets_payload = install_component(
         "player-content", "assets/data payload",
         feature_config::player_content::assets_data,

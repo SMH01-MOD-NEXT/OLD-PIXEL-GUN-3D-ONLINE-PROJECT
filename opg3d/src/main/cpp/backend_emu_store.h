@@ -58,10 +58,10 @@ constexpr const char* kDirName = "opg3d-backend";
 constexpr const char* kFileName = "state.kv";
 constexpr size_t kMaxStateBytes = 8u * 1024u * 1024u;
 
-// Minting shape: exactly nine digits, never a leading zero - the shape the old
-// account service handed out to a brand new account.
-constexpr uint32_t kIdFirst = 100000000u;
-constexpr uint32_t kIdSpan = 900000000u;
+// Minting shape: ten digits beginning with 35, matching the native account
+// identifiers this exact build normally displays.
+constexpr uint64_t kIdFirst = 3500000000ull;
+constexpr uint64_t kIdSpan = 100000000ull;
 
 // Accepting shape: any plausible account id, because an id that comes from the
 // game is not necessarily nine digits wide. The ids this build carries are ten
@@ -433,10 +433,10 @@ inline const char* player_id() {
              detail::get_locked("id_player_source", "minted").c_str());
         return detail::g_id;
     }
-    const uint32_t minted =
+    const uint64_t minted =
         detail::kIdFirst +
-        static_cast<uint32_t>(detail::whiten(detail::random64()) % detail::kIdSpan);
-    std::snprintf(detail::g_id, sizeof(detail::g_id), "%" PRIu32, minted);
+        (detail::whiten(detail::random64()) % detail::kIdSpan);
+    std::snprintf(detail::g_id, sizeof(detail::g_id), "%" PRIu64, minted);
     detail::set_locked("id_player", detail::g_id);
     detail::set_locked("id_player_source", "minted");
     LOGI("23.1.3-backend-store: minted the provisional account id %s; the"

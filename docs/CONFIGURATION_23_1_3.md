@@ -12,8 +12,8 @@ header has to be edited for ordinary component isolation.
 
 - `startup`: APK signature compatibility, startup/version traces and guards,
   loading watchdog, and OBB provisioning.
-- `network`: local backend, backend emulator, Photon route/plugin/trace,
-  network-stall guard, and forced-online state.
+- `network`: local backend, TechnicalWorks suppression, backend emulator,
+  Photon route/plugin/trace, network-stall guard, and forced-online state.
 - `progression`: the progression driver, currency, XP, fast level-road
   animation, inventory pumps, crafting, catalogue, live-content, modules,
   hidden items, and Pixel Pass.

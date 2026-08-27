@@ -65,6 +65,8 @@ namespace detail {
 using MethodInfo = void;
 using InstanceVoidFn = void (*)(void* self, const MethodInfo* method);
 using InstanceBoolFn = bool (*)(void* self, const MethodInfo* method);
+using InstanceStateFn = void (*)(void* self, int32_t state,
+                                 const MethodInfo* method);
 using IteratorFactoryFn = void* (*)(void* self, const MethodInfo* method);
 using StartCoroutineFn = void* (*)(void* self, void* iterator,
                                    const MethodInfo* method);
@@ -98,6 +100,12 @@ inline constexpr const char* kLocalSessionGateMethod =
 
 inline constexpr int32_t kFullySynchronized = 3;
 inline constexpr int32_t kEmpty = 4;
+inline constexpr int32_t kTechnicalWorks = 15;
+// AuthSceneController state dispatcher. Passing TechnicalWorks here creates
+// the maintenance window immediately, so guarding only the stored state on a
+// later Update tick is too late.
+inline constexpr const char* kStateDispatcherMethod =
+    u8"丙丟不丗丑下丌丁专"; // void(AuthSceneState), 0x3DC2458
 
 // Frame budget of one local auth transaction, in Update ticks.
 inline constexpr uint32_t kScheduleGraceFrames = 60u;    // dispatcher grace
@@ -143,6 +151,7 @@ inline const MethodInfo* g_mi_completion_iterator = nullptr;
 inline StartCoroutineFn g_start_coroutine = nullptr;
 inline const MethodInfo* g_mi_start_coroutine = nullptr;
 inline InstanceBoolFn g_completion_blocker = nullptr;
+inline InstanceStateFn g_state_dispatcher = nullptr;
 inline StaticGetBoolFn g_local_session_gate = nullptr;
 inline StaticGetIntFn g_get_state = nullptr;
 inline const MethodInfo* g_mi_get_state = nullptr;
@@ -163,6 +172,8 @@ inline std::atomic<bool> g_local_gate_logged{false};
 inline std::atomic<bool> g_published{false};
 inline std::atomic<bool> g_scheduled_by_hand{false};
 inline std::atomic<bool> g_continuation_done{false};
+inline std::atomic<bool> g_technical_works_suppressed{false};
+inline bool g_suppress_technical_works = true;
 inline std::atomic<uint32_t> g_transaction_frames{0u};
 
 // Diagnostics for the auth-scene restart loop.
@@ -493,6 +504,31 @@ bool hook_completion_blocker(void* self, const MethodInfo* method) {
                : true;
 }
 
+// TechnicalWorks is a retired-backend failure state, not a meaningful state
+// for an in-process backend. Intercept it before the stock dispatcher creates
+// the maintenance modal, publish the local session through the game's own
+// setters, and continue along the synchronized route.
+void hook_state_dispatcher(void* self, int32_t state, const MethodInfo* method) {
+    if (state == kTechnicalWorks && g_suppress_technical_works) {
+        if (!g_technical_works_suppressed.exchange(true,
+                                                    std::memory_order_relaxed)) {
+            LOGW("23.1.3-local-backend: suppressed TechnicalWorks before its "
+                 "maintenance UI was created; continuing as FullySynchronized");
+        }
+        if (g_set_session_ready != nullptr &&
+            g_mi_set_session_ready != nullptr) {
+            g_set_session_ready(true, g_mi_set_session_ready);
+        }
+        if (g_set_state != nullptr && g_mi_set_state != nullptr) {
+            g_set_state(kFullySynchronized, g_mi_set_state);
+        }
+        g_runtime_ready.store(true, std::memory_order_release);
+        g_local_transaction.store(false, std::memory_order_release);
+        state = kFullySynchronized;
+    }
+    if (g_state_dispatcher != nullptr) g_state_dispatcher(self, state, method);
+}
+
 // Captures the iterator the stock dispatcher creates, so introspection keeps
 // working without this module scheduling anything itself.
 void* hook_completion_factory(void* self, const MethodInfo* method) {
@@ -538,6 +574,7 @@ void hook_auth_start(void* self, const MethodInfo* method) {
     g_published.store(false, std::memory_order_relaxed);
     g_scheduled_by_hand.store(false, std::memory_order_relaxed);
     g_continuation_done.store(false, std::memory_order_relaxed);
+    g_technical_works_suppressed.store(false, std::memory_order_relaxed);
     g_traced_state.store(INT32_MIN, std::memory_order_relaxed);
     g_traced_ready.store(-1, std::memory_order_relaxed);
     g_completion_object.store(nullptr, std::memory_order_release);
@@ -674,7 +711,8 @@ inline bool runtime_ready() {
     return detail::g_runtime_ready.load(std::memory_order_acquire);
 }
 
-inline bool install_hooks() {
+inline bool install_hooks(bool suppress_technical_works) {
+    detail::g_suppress_technical_works = suppress_technical_works;
 #if defined(__ANDROID__)
     static_assert(sizeof(void*) == 8,
                   "PG3D 23.1.3 target must be arm64-v8a");
@@ -745,7 +783,11 @@ inline bool install_hooks() {
         {"", "AuthSceneController", detail::kCompletionBlockerMethod, 0},
         detail::replacement(&detail::hook_completion_blocker),
         detail::original_slot(&detail::g_completion_blocker), true);
-    const bool update = blocker && hook::install(
+    const bool dispatcher = blocker && hook::install(
+        {"", "AuthSceneController", detail::kStateDispatcherMethod, 1},
+        detail::replacement(&detail::hook_state_dispatcher),
+        detail::original_slot(&detail::g_state_dispatcher), true);
+    const bool update = dispatcher && hook::install(
         {"", "AuthSceneController", "Update", 0},
         detail::replacement(&detail::hook_auth_update),
         detail::original_slot(&detail::g_auth_update), true);
@@ -758,10 +800,11 @@ inline bool install_hooks() {
         {"", "AuthSceneController", "Start", 0},
         detail::replacement(&detail::hook_auth_start),
         detail::original_slot(&detail::g_auth_start), true);
-    if (!factory || !blocker || !update || !destroy || !start) {
+    if (!factory || !blocker || !dispatcher || !update || !destroy || !start) {
         LOGE("23.1.3-local-backend: hooks incomplete (factory=%d blocker=%d "
-             "update=%d destroy=%d start=%d)", factory ? 1 : 0,
-             blocker ? 1 : 0, update ? 1 : 0, destroy ? 1 : 0, start ? 1 : 0);
+             "dispatcher=%d update=%d destroy=%d start=%d)", factory ? 1 : 0,
+             blocker ? 1 : 0, dispatcher ? 1 : 0, update ? 1 : 0,
+             destroy ? 1 : 0, start ? 1 : 0);
         return false;
     }
 
