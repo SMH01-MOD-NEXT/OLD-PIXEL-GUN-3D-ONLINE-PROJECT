@@ -159,6 +159,8 @@ inline void* g_banner_wipe_orig = nullptr;
 inline void* g_banner_kick_orig = nullptr;
 inline void* g_progress_road_enable_orig = nullptr;
 inline bool g_progress_road_logged = false;
+inline bool g_inventory_gate_open_logged = false;
+inline bool g_inventory_gate_wait_logged = false;
 inline bool g_installed = false;
 inline bool g_keys_ready = false;
 inline bool g_level_grant_done = false;
@@ -481,14 +483,31 @@ inline void progress_road_enable_hook(void* self, void* method) {
 inline void menu_update_hook(void* self, void* method) {
     reinterpret_cast<InstanceVoidFn>(g_menu_update_orig)(self, method);
     maybe_grant();
-    // The module inventory grant runs stock managed transactions, so it
-    // needs a game thread and a live main menu: this Update slot is the
-    // only such point this port already owns.
-    weapon_modules_2313::pump_from_main_menu();
-    // Same slot, same reason for the hidden weapon / wear / gadget grant.
-    // It warms up later than the module sweep on purpose, so the two never
-    // drive the stock item inventory on the same frame.
-    hidden_items_2313::pump_from_main_menu();
+    // Inventory grants are intentionally held until the persisted profile
+    // itself reports level 65. g_level_grant_done is not sufficient: it also
+    // becomes true after a bounded failure, while the live getter is the
+    // authoritative confirmation that the stock level-up path completed.
+    const int32_t confirmed_level = current_level();
+    if (confirmed_level >= kLevelCap) {
+        if (!g_inventory_gate_open_logged) {
+            g_inventory_gate_open_logged = true;
+            LOGI("23.1.3-progression: level %" PRId32
+                 " confirmed; weapon and item inventory grants are now enabled",
+                 confirmed_level);
+        }
+        // These grants run stock managed transactions, so they need a game
+        // thread and a live main menu: this Update slot is the shared driver.
+        weapon_modules_2313::pump_from_main_menu();
+        // Hidden weapons, wear and gadgets use the same gate. Their own warmup
+        // counters start only now, so no inventory transaction can precede the
+        // confirmed level.
+        hidden_items_2313::pump_from_main_menu();
+    } else if (!g_inventory_gate_wait_logged && confirmed_level >= 0) {
+        g_inventory_gate_wait_logged = true;
+        LOGI("23.1.3-progression: level %" PRId32
+             " is not yet 65; weapon and item inventory grants remain paused",
+             confirmed_level);
+    }
     // Same slot again, read-only: the content gate reports which live
     // content the offline ExpOpenSystem table still keeps closed.
     live_content_2313::pump_from_main_menu();

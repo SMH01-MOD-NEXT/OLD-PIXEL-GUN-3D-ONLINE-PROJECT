@@ -437,3 +437,15 @@ can leave the road running for minutes. The address-verified
 sets the threshold to zero and applies high local speed values before stock
 initialization. This affects only the level-road presentation; the persisted
 level and XP grant remain unchanged.
+
+
+## Inventory grant gate (August 27, 2026)
+
+The module and hidden-item pumps no longer start from menu warmup alone. After
+the progression attempt, every main-menu tick reads the authoritative persisted
+level through `ExperienceController.世丐丙丆业一丄丙丒()`. Weapon modules and the
+hidden weapon/wear/gadget inventory pumps run only when that live value is 65
+or higher. The internal one-shot latch is deliberately not used as proof,
+because it also settles after bounded failures; only the live level confirms
+that the stock grant path completed. Each inventory module's own warmup counter
+starts after this gate opens, so no item transaction can precede confirmation.
