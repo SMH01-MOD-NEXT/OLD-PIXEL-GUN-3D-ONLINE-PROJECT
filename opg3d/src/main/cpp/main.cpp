@@ -10,6 +10,7 @@
 #include "assets_data_2313.h"
 #include "backend_emu_2313.h"
 #include "backend_local_2313.h"
+#include "battle_flow_trace_2313.h"
 #include "battle_ui_2313.h"
 #include "bots_trace_2313.h"
 #include "config.h"
@@ -107,6 +108,9 @@ constexpr bool battle_ui = true;
 constexpr bool rank_ui = true;
 constexpr bool post_match = true;
 constexpr bool high_tier_bots = true;
+// Passive: traces the death -> respawn interface chain and the profile Stats
+// tab "receiving data" chain. Turn off to remove both traces entirely.
+constexpr bool battle_flow_trace = true;
 } // namespace gameplay
 
 } // namespace feature_config
@@ -316,13 +320,17 @@ void* init_thread(void*) {
     const bool bots_trace = install_component(
         "gameplay", "high-tier bots", feature_config::gameplay::high_tier_bots,
         []() { return bots_trace_2313::install_hooks(); });
+    const bool battle_flow = install_component(
+        "gameplay", "battle flow trace",
+        feature_config::gameplay::battle_flow_trace,
+        []() { return battle_flow_trace_2313::install_hooks(); });
     if (signature_compat && version_traces && startup_guards &&
         switcher_trace && stall_watchdog && local_backend && photon_online &&
         default_plugin && photon_trace && progression && crafting &&
         lobby_catalog && live_content && weapon_modules && hidden_items &&
         local_identity && assets_payload && net_stall && post_match &&
-        online_state && anomaly_trace && battle_ui && rank_ui && bots_trace && backend_emu &&
-        pixel_pass) {
+        online_state && anomaly_trace && battle_ui && rank_ui && bots_trace &&
+        battle_flow && backend_emu && pixel_pass) {
         LOGI("init: all enabled 23.1.3 components installed; "
              "disabled components were intentionally skipped");
     } else {
@@ -334,7 +342,7 @@ void* init_thread(void*) {
              "hidden-items=%d pixel-pass=%d "
              "identity=%d assets-data=%d net-stall=%d "
              "post-match=%d online-state=%d anomaly-trace=%d battle-ui=%d rank-ui=%d "
-             "bots=%d backend-emu=%d",
+             "bots=%d battle-flow=%d backend-emu=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              startup_guards ? 1 : 0, switcher_trace ? 1 : 0,
              stall_watchdog ? 1 : 0, local_backend ? 1 : 0,
@@ -347,7 +355,8 @@ void* init_thread(void*) {
              net_stall ? 1 : 0, post_match ? 1 : 0,
              online_state ? 1 : 0, anomaly_trace ? 1 : 0,
              battle_ui ? 1 : 0, rank_ui ? 1 : 0,
-             bots_trace ? 1 : 0, backend_emu ? 1 : 0);
+             bots_trace ? 1 : 0, battle_flow ? 1 : 0,
+             backend_emu ? 1 : 0);
     }
 
     if (il2cpp::thread_detach != nullptr) il2cpp::thread_detach(attached_thread);
