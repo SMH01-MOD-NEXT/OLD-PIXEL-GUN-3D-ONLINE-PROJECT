@@ -326,7 +326,7 @@ The module lives in `player_boost.h` (namespace `player_boost::lobby`) because i
 12. **Verifiable builds.** `OPG3D_BUILD_TAG` in `config.h` plus the compiler timestamp are logged before any hook is installed, so a report can always be tied to a specific library.
 13. **ARM32 ABI correctness.** This IL2CPP build gives static generated methods a hidden `null` context in `r0`; managed arguments begin in `r1`, followed by `MethodInfo*`. Instance methods take the object in `r0` instead. A `long` return such as server time uses the `r0:r1` pair, a 64-bit argument occupies an aligned register pair, and a struct return such as `KeyValuePair<string, long>` is written through a hidden result pointer in `r0`, which pushes the context to `r1`. Every hook and stock-call signature models the layout of its own call site explicitly.
 14. **Unwinder compatibility.** The native library is compiled with `-fno-exceptions -funwind-tables`. This lets managed exceptions unwind through hook frames without mixing the game's GNU-compatible ARM EHABI context with the statically linked LLVM unwinder.
-15. **Single native artifact.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
+15. **Single runtime native library.** ShadowHook v2.0.1 is built from source, patched for this ARMv7 environment, and linked statically into `libopg3d.so`.
 
 ## Building
 
@@ -334,7 +334,7 @@ The Photon AppID is a credential and must not be stored in the repository.
 
 ### GitHub Actions
 
-Create the repository Actions secret `PHOTON_APP_ID`. The workflow exposes it as `ORG_GRADLE_PROJECT_PHOTON_APP_ID`, builds the selected maintained branch, and publishes one `libopg3d.so` artifact:
+Create the repository Actions secret `PHOTON_APP_ID`. The workflow exposes it as `ORG_GRADLE_PROJECT_PHOTON_APP_ID`, builds the selected maintained branch, and publishes the stripped runtime library plus its unstripped symbol copy in one ARMv7 artifact:
 
 - `13.2.1` — PG3D 13.2.1, including the release progression and legacy gameplay compatibility described above.
 - `12.5.0` — the older PG3D 12.5.0 target.
@@ -349,6 +349,16 @@ Requirements: JDK 17, Android SDK, NDK `29.0.14206865`, and CMake `4.4.3`.
 gradle :opg3d:assembleRelease \
   -PPHOTON_APP_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
+
+This branch remains strictly `armeabi-v7a`, matching the original 16.1.0
+release. A successful build exports the installable stripped library and its
+symbol-rich unstripped copy, using the same layout as 23.1.3:
+
+- `lib/armeabi-v7a/libopg3d.so`;
+- `lib/armeabi-v7a/libopg3d.unstripped.so`.
+
+`gradle :opg3d:exportReleaseLibrary` can also build and export both standalone
+files directly.
 
 A build without the AppID is allowed for diagnostics, but the AppID hook runs in passthrough mode and logs a warning.
 

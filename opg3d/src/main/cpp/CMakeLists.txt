@@ -20,11 +20,11 @@ set(SHADOWHOOK_TAG "v2.0.1" CACHE STRING "ShadowHook version (git tag bytedance/
 # by our own elf_sym/.dynsym resolver; shadowhook is used ONLY for the inline
 # hook itself at an absolute address (shadowhook_hook_func_addr).
 #
-# We build shadowhook statically ourselves and link it into the single
-# libopg3d.so artifact (CI requires exactly one .so). Why NOT the upstream
-# prefab/AAR:
+# We build shadowhook statically ourselves and link it into one self-contained
+# runtime library. The release export also keeps an unstripped symbol copy of
+# that same libopg3d.so. Why NOT the upstream prefab/AAR:
 #   1) prefab pulls in separate libshadowhook.so + libshadowhook_nothing.so
-#      and breaks the "one .so in the artifact" requirement;
+#      and breaks the "one self-contained runtime library" requirement;
 #   2) on 32-bit armeabi-v7a the official bytesig installs a SIGSEGV handler
 #      with the SA_EXPOSE_TAGBITS flag, which the kernel rejects (EINVAL) —
 #      that's why shadowhook_init() used to fail with error 8 (INIT_SIGSEGV);

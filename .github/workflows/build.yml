@@ -58,16 +58,19 @@ jobs:
           fi
           echo "ok: no generic-model personality in our frames"
 
-      - name: Collect libopg3d.so
+      - name: Verify exported ARMv7 libraries
         run: |
-          mkdir -p out
-          find opg3d/build/intermediates -path "*armeabi-v7a*" -name "libopg3d.so" -exec cp -v {} out/ \;
-          test "$(find out -maxdepth 1 -type f | wc -l)" -eq 1
-          ls -la out/
+          test -f lib/armeabi-v7a/libopg3d.so
+          test -f lib/armeabi-v7a/libopg3d.unstripped.so
+          file lib/armeabi-v7a/libopg3d.so
+          file lib/armeabi-v7a/libopg3d.unstripped.so
+          ls -la lib/armeabi-v7a/
 
-      - name: Upload libopg3d.so
+      - name: Upload ARMv7 libraries
         uses: actions/upload-artifact@v4
         with:
           name: libopg3d-armeabi-v7a
-          path: out/libopg3d.so
+          path: |
+            lib/armeabi-v7a/libopg3d.so
+            lib/armeabi-v7a/libopg3d.unstripped.so
           if-no-files-found: error

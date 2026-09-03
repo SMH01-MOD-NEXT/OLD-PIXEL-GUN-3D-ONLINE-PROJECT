@@ -37,3 +37,53 @@ android {
         }
     }
 }
+
+// PG3D 16.1.0 shipped only as ARMv7. Export both the installable stripped
+// library and its unstripped symbol copy, matching the 23.1.3 layout.
+def releaseAbi = 'armeabi-v7a'
+def releaseAar = layout.buildDirectory.file('outputs/aar/opg3d-release.aar')
+def unstrippedReleaseLibrary = layout.buildDirectory.file(
+        "intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib/${releaseAbi}/libopg3d.so")
+def exportedReleaseDir = rootProject.layout.projectDirectory.dir("lib/${releaseAbi}")
+
+def exportReleaseLibrary = tasks.register('exportReleaseLibrary', Sync) {
+    group = 'build'
+    description = 'Exports stripped and unstripped ARMv7 release libraries.'
+    dependsOn 'bundleReleaseAar'
+
+    from({ zipTree(releaseAar.get().asFile) }) {
+        include "jni/${releaseAbi}/libopg3d.so"
+        eachFile { details -> details.path = 'libopg3d.so' }
+        includeEmptyDirs = false
+    }
+    from(unstrippedReleaseLibrary) {
+        rename { 'libopg3d.unstripped.so' }
+    }
+    into exportedReleaseDir
+
+    doFirst {
+        if (!releaseAar.get().asFile.isFile()) {
+            throw new GradleException("Release AAR was not produced: ${releaseAar.get().asFile}")
+        }
+        if (!unstrippedReleaseLibrary.get().asFile.isFile()) {
+            throw new GradleException(
+                    "Unstripped release library was not produced: ${unstrippedReleaseLibrary.get().asFile}")
+        }
+    }
+    doLast {
+        ['libopg3d.so', 'libopg3d.unstripped.so'].each { name ->
+            def exported = exportedReleaseDir.file(name).asFile
+            if (!exported.isFile()) {
+                throw new GradleException("Release export is missing: ${exported}")
+            }
+        }
+    }
+}
+
+tasks.matching { it.name == 'assembleRelease' }.configureEach {
+    finalizedBy exportReleaseLibrary
+}
+
+tasks.matching { it.name == 'clean' }.configureEach {
+    delete exportedReleaseDir
+}
