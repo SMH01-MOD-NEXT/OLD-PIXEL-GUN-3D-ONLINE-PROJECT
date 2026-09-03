@@ -14,7 +14,7 @@ def photonPort = providers.gradleProperty('PHOTON_SERVER_PORT').orElse('5055').g
 android {
     namespace 'com.opg3d.redirect'
     compileSdk 35
-    ndkVersion '27.3.13750724'   // default NDK on GHA runners
+    ndkVersion '29.0.14206865'   // newest NDK available in the local SDK
 
     defaultConfig {
         minSdk 21
@@ -33,7 +33,7 @@ android {
     externalNativeBuild {
         cmake {
             path file('src/main/cpp/CMakeLists.txt')
-            version '3.31.5'   // preinstalled in the SDK on GHA runners
+            version '4.4.3'    // newest CMake available on this build host
         }
     }
 }

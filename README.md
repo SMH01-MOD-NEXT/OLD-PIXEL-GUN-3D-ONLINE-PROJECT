@@ -343,7 +343,7 @@ When starting the workflow manually, select the branch explicitly: the default b
 
 ### Local build
 
-Requirements: JDK 17, Android SDK, NDK `27.3.13750724`, and CMake `3.31.5`.
+Requirements: JDK 17, Android SDK, NDK `29.0.14206865`, and CMake `4.4.3`.
 
 ```bash
 gradle :opg3d:assembleRelease \
