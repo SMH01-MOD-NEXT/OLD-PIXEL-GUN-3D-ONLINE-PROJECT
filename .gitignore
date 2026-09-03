@@ -17,6 +17,9 @@ cmake-*/
 *.d
 compile_commands.json
 
+# cuz I dunno
+TASK_PLAN.md
+
 # IDE
 .idea/
 .vscode/
