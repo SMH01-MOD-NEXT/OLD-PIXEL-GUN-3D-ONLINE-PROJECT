@@ -22,6 +22,53 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
+      # The branch intentionally follows the newest native toolchain used by
+      # the development host. ubuntu-latest can lag behind, so provision the
+      # exact pinned versions instead of relying on the runner image.
+      - name: Provision CMake 4.4.3 and NDK r29
+        env:
+          CMAKE_VERSION: "4.4.3"
+          NDK_VERSION: "29.0.14206865"
+        run: |
+          set -euo pipefail
+
+          CMAKE_LINE="$(cmake --version 2>/dev/null | sed -n '1p' || true)"
+          if [ "$CMAKE_LINE" = "cmake version ${CMAKE_VERSION}" ]; then
+            CMAKE_BIN="$(dirname "$(command -v cmake)")"
+          else
+            CMAKE_ARCHIVE="$RUNNER_TEMP/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"
+            CMAKE_HOME="$RUNNER_TEMP/cmake-${CMAKE_VERSION}-linux-x86_64"
+            rm -rf "$CMAKE_HOME"
+            curl --fail --location --retry 3 \
+              --output "$CMAKE_ARCHIVE" \
+              "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"
+            tar -xzf "$CMAKE_ARCHIVE" -C "$RUNNER_TEMP"
+            CMAKE_BIN="$CMAKE_HOME/bin"
+          fi
+          test -x "$CMAKE_BIN/cmake"
+          echo "$CMAKE_BIN" >> "$GITHUB_PATH"
+          test "$("$CMAKE_BIN/cmake" --version | sed -n '1p')" = \
+            "cmake version ${CMAKE_VERSION}"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK_ROOT"
+          NDK_HOME="$SDK_ROOT/ndk/${NDK_VERSION}"
+          if [ ! -f "$NDK_HOME/source.properties" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+            if [ -z "$SDKMANAGER" ]; then
+              SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f \
+                -path '*/bin/sdkmanager' -print 2>/dev/null | sort -V | tail -n 1 || true)"
+            fi
+            test -x "$SDKMANAGER"
+            yes | "$SDKMANAGER" --licenses >/dev/null || true
+            "$SDKMANAGER" "ndk;${NDK_VERSION}"
+          fi
+          grep -q "^Pkg.Revision = ${NDK_VERSION}$" \
+            "$NDK_HOME/source.properties"
+          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "CMake ${CMAKE_VERSION} and NDK ${NDK_VERSION} are ready"
+
       - name: Build PR (assembleRelease, armeabi-v7a, no Photon AppID)
         if: github.event_name == 'pull_request'
         run: gradle :opg3d:assembleRelease --no-daemon --stacktrace

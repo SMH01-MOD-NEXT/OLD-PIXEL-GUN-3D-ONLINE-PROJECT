@@ -336,6 +336,10 @@ The Photon AppID is a credential and must not be stored in the repository.
 
 Create the repository Actions secret `PHOTON_APP_ID`. The workflow exposes it as `ORG_GRADLE_PROJECT_PHOTON_APP_ID`, builds the selected maintained branch, and publishes the stripped runtime library plus its unstripped symbol copy in one ARMv7 artifact:
 
+The job provisions CMake `4.4.3` and NDK `29.0.14206865` explicitly;
+it does not depend on whichever native-tool versions happen to be preinstalled
+on `ubuntu-latest`.
+
 - `13.2.1` — PG3D 13.2.1, including the release progression and legacy gameplay compatibility described above.
 - `12.5.0` — the older PG3D 12.5.0 target.
 
