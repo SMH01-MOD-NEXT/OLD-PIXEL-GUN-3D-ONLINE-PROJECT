@@ -11,6 +11,7 @@
 #include "battle_click_debounce_1610.h"
 #include "config.h"
 #include "crafting_1610.h"
+#include "custom_rooms_1610.h"
 #include "elf_sym.h"
 #include "il2cpp.h"
 #include "lobby_catalog_1610.h"
@@ -122,6 +123,7 @@ void* init_thread(void*) {
     const bool photon_online = photon_1610::install_hooks();
     const bool default_plugin =
         photon_default_plugin_1610::install_hooks();
+    const bool custom_rooms = custom_rooms_1610::install_hooks();
     const bool photon_trace = photon_trace_1610::install_hooks();
     const bool battle_ui = battle_ui_1610::install_hooks();
     const bool progression = progression_1610::install_hooks();
@@ -130,19 +132,20 @@ void* init_thread(void*) {
     const bool click_debounce = battle_ui &&
         battle_click_debounce_1610::install();
     if (signature_compat && version_traces && local_backend && photon_online &&
-        default_plugin && photon_trace && battle_ui && progression && crafting &&
-        lobby_catalog && click_debounce) {
+        default_plugin && custom_rooms && photon_trace && battle_ui &&
+        progression && crafting && lobby_catalog && click_debounce) {
         LOGI("init: 16.1.0 online + local progression/crafting port ready — "
+             "named Custom rooms are isolated from random matchmaking, "
              "upgrades use local monotonic UTC, detail/clan recipes are local, "
              "and lobby ownership uses stock save paths");
     } else {
         LOGE("init: 16.1.0 port incomplete: signature=%d traces=%d "
-             "local-backend=%d photon=%d plugin=%d trace=%d battle-ui=%d "
-             "progression=%d crafting=%d lobby=%d debounce=%d",
+             "local-backend=%d photon=%d plugin=%d custom-rooms=%d trace=%d "
+             "battle-ui=%d progression=%d crafting=%d lobby=%d debounce=%d",
              signature_compat ? 1 : 0, version_traces ? 1 : 0,
              local_backend ? 1 : 0, photon_online ? 1 : 0,
-             default_plugin ? 1 : 0, photon_trace ? 1 : 0,
-             battle_ui ? 1 : 0, progression ? 1 : 0,
+             default_plugin ? 1 : 0, custom_rooms ? 1 : 0,
+             photon_trace ? 1 : 0, battle_ui ? 1 : 0, progression ? 1 : 0,
              crafting ? 1 : 0, lobby_catalog ? 1 : 0,
              click_debounce ? 1 : 0);
     }

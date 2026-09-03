@@ -89,6 +89,7 @@ bool resolve() {
     ok &= bind(class_get_method_from_name,"il2cpp_class_get_method_from_name");
     ok &= bind(class_get_field_from_name, "il2cpp_class_get_field_from_name");
     ok &= bind(object_get_class,          "il2cpp_object_get_class");
+    bind(value_box,                       "il2cpp_value_box");
     ok &= bind(field_get_value,           "il2cpp_field_get_value");
     ok &= bind(field_set_value.raw,       "il2cpp_field_set_value");
     ok &= bind(field_static_get_value,    "il2cpp_field_static_get_value");

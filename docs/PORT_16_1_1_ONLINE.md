@@ -79,6 +79,37 @@ This is intentionally a backend **session emulator**, not a fake Cubic Games API
 
 The existing Photon module still clears PUN's own `offlineMode` defensively, applies the configured Photon AppID / EU route, omits the retired custom plugin only while room options are serialized, and leaves matchmaking, RPCs and room callbacks stock.
 
+## Custom / Private Games isolation
+
+The stock Custom Games UI remains unchanged. Both the regular and mini-game
+create buttons eventually use the same `GameConnect` room builder, which
+publishes the complete stock property set to
+`TypedLobby("PixelGun3D", LobbyType.SqlLobby)`.
+
+Public matchmaking and Custom Games share that SQL lobby. Their stock
+separation rules are:
+
+- ordinary random matchmaking requires `C1 = ""` and the device platform in
+  `C2` (`1` or `2`);
+- password Custom rooms already use a non-empty `C1` and `C2 = 3`;
+- the Custom Games list accepts both the local platform and the special
+  `PlatformConnect.custom` value `C2 = 3`.
+
+`custom_rooms_1610.h` intercepts the final `GameConnect` helper and replaces
+only `C2` with `3` for rooms with an explicit name. Auto-match rooms reach the
+same helper without an explicit name and remain byte-for-byte stock. This
+keeps open and password-protected Custom rooms visible in Custom Games while
+making both fail the normal random-match predicate. The existing
+Default-plugin compatibility hook still removes only the obsolete plugin
+parameter during serialization.
+
+The legacy password is not server-side authentication: it is visible as the
+`C1` lobby property and the stock client compares it before calling
+`JoinRoom(roomName)`. The isolation prevents accidental joins from the normal
+UI, including password-room joins, but a deliberately modified client can
+still bypass that check. Strong password enforcement requires a trusted
+Photon server plugin or another server-side admission service.
+
 ## Build and device validation
 
 Build with the repository `PHOTON_APP_ID` Actions secret, install the resulting `libopg3d.so`, and capture:
@@ -112,6 +143,13 @@ A successful gameplay test must verify all of the following on two devices:
 4. both players see movement, damage and RPC-driven actions;
 5. leaving the match returns to a usable menu;
 6. a second consecutive match works;
-7. locally changed settings/progression survive a restart.
+7. locally changed settings/progression survive a restart;
+8. an open named Custom room appears on the second device's Custom Games list
+   but is never selected by the normal **В бой** route;
+9. a password Custom room prompts in Custom Games, rejects a wrong password,
+   accepts the correct one, and is never selected by normal matchmaking.
 
-Any `local-backend: stock completion did not publish a usable session`, `PHOTON_APP_ID is empty`, `route verification failed`, `PluginMismatch`, or `online port incomplete` line is a failed test, not a condition to hide with another global getter override.
+Any `custom-room: BLOCKED`, `local-backend: stock completion did not publish a
+usable session`, `PHOTON_APP_ID is empty`, `route verification failed`,
+`PluginMismatch`, or `online port incomplete` line is a failed test, not a
+condition to hide with another global getter override.

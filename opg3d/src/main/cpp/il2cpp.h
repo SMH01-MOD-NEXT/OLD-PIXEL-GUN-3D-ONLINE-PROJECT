@@ -34,6 +34,10 @@ inline void*       (*class_get_nested_types)(void* klass, void** iter) = nullptr
 inline const char* (*class_get_name)(void* klass) = nullptr;
 
 inline void*       (*object_get_class)(void* object) = nullptr;
+// Optional allocation helper used by narrow runtime adapters that need to
+// add a value-type entry to an existing managed collection. It is resolved
+// opportunistically; each consumer must still fail closed when unavailable.
+inline void*       (*value_box)(void* klass, void* value) = nullptr;
 inline void        (*field_get_value)(void* object, void* field, void* value) = nullptr;
 
 // In the old embedding IL2CPP API the third argument of
